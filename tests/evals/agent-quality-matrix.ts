@@ -1,4 +1,4 @@
-export const SHARED_MODEL_CONTEXT_CONTRACT = "fx.shared_model_context.v1";
+export const SHARED_MODEL_CONTEXT_CONTRACT = "ffx.shared_model_context.v1";
 
 export const FAILURE_CATEGORIES = [
   "local search",
@@ -46,7 +46,7 @@ export interface ExpectedFirstTool {
 }
 
 export interface CoveredEntrypoint {
-  entrypoint: "interactive" | "fx ask" | "ACP" | "subagent";
+  entrypoint: "interactive" | "ffx ask" | "ACP" | "subagent";
   contextContract: typeof SHARED_MODEL_CONTEXT_CONTRACT;
   notes: string;
 }
@@ -87,33 +87,36 @@ export interface RecordedToolCall {
 }
 
 const LOCAL_FILE_TOOLS = [
+  "list_files",
   "glob_files",
   "grep_files",
+  "semantic_search",
   "read_file",
 ] as const;
 
 const LOCAL_INSPECTION_TOOLS = [
   ...LOCAL_FILE_TOOLS,
-  "shell",
+  "terminal",
 ] as const;
 
 const WEB_FETCH_TOOL = "web_fetch" as const;
 const WEB_SEARCH_TOOL = "web_search" as const;
 
 const MCP_DISCOVERY_TOOLS = [
-  "capability_search",
+  "mcp_search_tools",
   "mcp_select_tool",
 ] as const;
 
 const DESTRUCTIVE_OR_MUTATING_TOOLS = [
+  "delete_file",
   "write_file",
   "edit_file",
-  "shell",
+  "terminal",
 ] as const;
 
 function askEntrypoint(notes: string): CoveredEntrypoint {
   return {
-    entrypoint: "fx ask",
+    entrypoint: "ffx ask",
     contextContract: SHARED_MODEL_CONTEXT_CONTRACT,
     notes,
   };
@@ -144,7 +147,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       category: "local repository inspection",
       tools: LOCAL_INSPECTION_TOOLS,
       commandPattern: "^git\\s+",
-      notes: "A shell.run first action is acceptable only when it is a local git inspection.",
+      notes: "A terminal.exec first action is acceptable only when it is a local git inspection.",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
     expectedUserVisibleBehavior:
@@ -173,11 +176,11 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
   },
   {
     id: "git-history-local",
-    userPrompt: "Look for changes/last commits in fx.",
+    userPrompt: "Look for changes/last commits in ffx.",
     failureCategory: "local search",
     expectedFirstTool: {
       category: "local git command",
-      tools: ["shell"],
+      tools: ["terminal"],
       commandPattern: "^git\\s+(log|status|branch)\\b",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
@@ -187,7 +190,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       type: "tool-call recorder test",
       status: "implemented",
       notes:
-        "The first recorded shell.run can be matched against a local git command pattern; A/B runs compare pass-rate deltas rather than deterministic routing.",
+        "The first recorded terminal.exec can be matched against a local git command pattern; A/B runs compare pass-rate deltas rather than deterministic routing.",
     },
     modelBackedEval: {
       required: true,
@@ -200,7 +203,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     },
     targetResult: "A local git command is used, with no web_search or clarification question.",
     coveredEntrypoints: [
-      askEntrypoint("Depends on repo_identity in fx.shared_model_context.v1."),
+      askEntrypoint("Depends on repo_identity in ffx.shared_model_context.v1."),
     ],
   },
   {
@@ -227,12 +230,12 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "partial",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save answered from existing context with zero tool calls. First tool: none; forbidden tools: none; behavior cited src/core/slash_commands/command_specs.zig but did not perform local discovery first.",
+        "Live ./zig-out/bin/ffx ask --auto --json --no-save answered from existing context with zero tool calls. First tool: none; forbidden tools: none; behavior cited src/core/slash_commands/command_specs.zig but did not perform local discovery first.",
     },
     targetResult:
       "Starts with local discovery and identifies src/core/slash_commands/command_specs.zig from local evidence.",
     coveredEntrypoints: [
-      askEntrypoint("Uses workspace_identity and available_tools from fx.shared_model_context.v1."),
+      askEntrypoint("Uses workspace_identity and available_tools from ffx.shared_model_context.v1."),
     ],
   },
   {
@@ -241,7 +244,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "provider-search misuse",
     expectedFirstTool: {
       category: "local exact search",
-      tools: ["grep_files", "glob_files"],
+      tools: ["grep_files", "semantic_search", "glob_files"],
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
     expectedUserVisibleBehavior:
@@ -258,11 +261,11 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "passing",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save used grep_files first and made five grep_files calls total. Forbidden tools: none; behavior reported concrete local matches in command_policy.zig, tool_permission.zig, and terminal.zig.",
+        "Live ./zig-out/bin/ffx ask --auto --json --no-save used grep_files first and made five grep_files calls total. Forbidden tools: none; behavior reported concrete local matches in command_policy.zig, tool_permission.zig, and terminal.zig.",
     },
     targetResult: "Uses local search tools only and reports concrete local matches.",
     coveredEntrypoints: [
-      askEntrypoint("Depends on available_tools and workspace_identity from fx.shared_model_context.v1."),
+      askEntrypoint("Depends on available_tools and workspace_identity from ffx.shared_model_context.v1."),
     ],
   },
   {
@@ -271,7 +274,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "approval loop",
     expectedFirstTool: {
       category: "local command-policy investigation",
-      tools: ["read_file", "grep_files", "glob_files"],
+      tools: ["read_file", "grep_files", "semantic_search", "glob_files"],
       notes:
         "The investigation should stay on local source evidence and stop once equivalent searches stop adding information.",
     },
@@ -297,7 +300,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     targetResult:
       "Stops after confirming the command-policy wiring and any defined-but-uncalled helper, then exits 0 with known facts, uncertainty, and the next useful step.",
     coveredEntrypoints: [
-      askEntrypoint("Applies to long --auto --json local source investigations in fx ask."),
+      askEntrypoint("Applies to long --auto --json local source investigations in ffx ask."),
       interactiveEntrypoint("Interactive runs should show the same milestone-only progress and stop condition."),
     ],
   },
@@ -307,7 +310,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "ask-user misuse",
     expectedFirstTool: {
       category: "local concept discovery",
-      tools: ["glob_files", "grep_files", "read_file"],
+      tools: ["semantic_search", "glob_files", "grep_files", "read_file"],
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
     expectedUserVisibleBehavior:
@@ -325,7 +328,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "passing",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save used read_file first, then a second read_file. Forbidden tools: none; behavior inspected MCP runtime/docs before answering and did not ask the user.",
+        "Live ./zig-out/bin/ffx ask --auto --json --no-save used read_file first, then a second read_file. Forbidden tools: none; behavior inspected MCP runtime/docs before answering and did not ask the user.",
     },
     targetResult: "At least one local inspection happens before any user question.",
     coveredEntrypoints: [
@@ -366,18 +369,18 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     targetResult:
       "Uses local evidence for current-repo identity and never asks for the user's GitHub handle.",
     coveredEntrypoints: [
-      askEntrypoint("Depends on repo_identity and workspace_identity from fx.shared_model_context.v1."),
+      askEntrypoint("Depends on repo_identity and workspace_identity from ffx.shared_model_context.v1."),
       interactiveEntrypoint("Follows the same no-handle rule once context refresh is normalized."),
     ],
   },
   {
     id: "github-pr-comments-gh-auth-blocker",
     userPrompt:
-      "Read https://github.com/vercel-labs/fx/pull/57 comments, and if gh is missing or unauthenticated report the blocker.",
+      "Read https://github.com/vercel-labs/ffx/pull/57 comments, and if gh is missing or unauthenticated report the blocker.",
     failureCategory: "GitHub routing",
     expectedFirstTool: {
       category: "GitHub CLI metadata read",
-      tools: ["shell"],
+      tools: ["terminal"],
       commandPattern: "^gh\\s+",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
@@ -401,7 +404,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     targetResult:
       "Routes PR comments to gh and reports missing gh, auth, or permission failures directly without a clarification question.",
     coveredEntrypoints: [
-      askEntrypoint("Depends on repo_identity and available_tools from fx.shared_model_context.v1."),
+      askEntrypoint("Depends on repo_identity and available_tools from ffx.shared_model_context.v1."),
     ],
   },
   {
@@ -479,11 +482,11 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
   },
   {
     id: "github-pr-comments-gh",
-    userPrompt: "Read https://github.com/vercel-labs/fx/pull/57 comments.",
+    userPrompt: "Read https://github.com/vercel-labs/ffx/pull/57 comments.",
     failureCategory: "GitHub routing",
     expectedFirstTool: {
       category: "GitHub CLI metadata read",
-      tools: ["shell"],
+      tools: ["terminal"],
       commandPattern: "^gh\\s+",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
@@ -493,7 +496,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       type: "tool-call recorder test",
       status: "planned",
       notes:
-        "Concrete public PR fixture chosen; a recorded JSON fixture can assert gh routing for vercel-labs/fx#57.",
+        "Concrete public PR fixture chosen; a recorded JSON fixture can assert gh routing for vercel-labs/ffx#57.",
     },
     modelBackedEval: {
       required: true,
@@ -502,11 +505,11 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "passing",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save used shell.run first with gh pr view 57 --repo vercel-labs/fx --comments. Forbidden tools: none; behavior summarized PR review comments and bot deploy comments from gh output.",
+        "Live ./zig-out/bin/ffx ask --auto --json --no-save used terminal.exec first with gh pr view 57 --repo vercel-labs/ffx --comments. Forbidden tools: none; behavior summarized PR review comments and bot deploy comments from gh output.",
     },
     targetResult: "Routes known GitHub PR comments to gh and reports an actionable blocker if gh cannot run.",
     coveredEntrypoints: [
-      askEntrypoint("Depends on repo_identity and available_tools from fx.shared_model_context.v1."),
+      askEntrypoint("Depends on repo_identity and available_tools from ffx.shared_model_context.v1."),
     ],
   },
   {
@@ -536,7 +539,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     },
     targetResult: "Diagnoses the last failure first; does not blindly repeat an unknown command.",
     coveredEntrypoints: [
-      interactiveEntrypoint("Depends on session_metadata from fx.shared_model_context.v1."),
+      interactiveEntrypoint("Depends on session_metadata from ffx.shared_model_context.v1."),
       askEntrypoint("Headless resume should use persisted session_metadata when available."),
     ],
   },
@@ -570,7 +573,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     },
     targetResult: "Continues or reports the exact blocker using prior context.",
     coveredEntrypoints: [
-      interactiveEntrypoint("Depends on session_metadata in fx.shared_model_context.v1."),
+      interactiveEntrypoint("Depends on session_metadata in ffx.shared_model_context.v1."),
       askEntrypoint("Applies when --session or persisted session resume is used."),
     ],
   },
@@ -653,7 +656,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       tools: [],
       notes: "Should answer from the latest tool result when present.",
     },
-    forbiddenTools: ["shell", "ask_user_question"],
+    forbiddenTools: ["terminal", "ask_user_question"],
     expectedUserVisibleBehavior:
       "Explains the latest tool failure from recorded evidence and avoids setup commands unless the evidence is missing.",
     deterministicCoverage: {
@@ -671,7 +674,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     },
     targetResult: "Answers from the latest tool result or clearly says the evidence is unavailable.",
     coveredEntrypoints: [
-      interactiveEntrypoint("Uses session_metadata from fx.shared_model_context.v1."),
+      interactiveEntrypoint("Uses session_metadata from ffx.shared_model_context.v1."),
       askEntrypoint("Uses persisted session_metadata when a headless session is resumed."),
     ],
   },
@@ -715,7 +718,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "approval loop",
     expectedFirstTool: {
       category: "approval-required command attempt",
-      tools: ["shell"],
+      tools: ["terminal"],
     },
     forbiddenTools: ["ask_user_question"],
     expectedUserVisibleBehavior:
@@ -735,7 +738,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     },
     targetResult: "Returns a structured blocker with an explicit reason and no live ask_user_question path.",
     coveredEntrypoints: [
-      askEntrypoint("Uses permission_mode and available_tools from fx.shared_model_context.v1."),
+      askEntrypoint("Uses permission_mode and available_tools from ffx.shared_model_context.v1."),
       acpEntrypoint("ACP should map approval-required work to a refusal or policy decision."),
     ],
   },
@@ -766,7 +769,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     },
     targetResult: "Current workspace_root is reflected before answering or selecting tools.",
     coveredEntrypoints: [
-      interactiveEntrypoint("Uses workspace_identity and session_metadata from fx.shared_model_context.v1."),
+      interactiveEntrypoint("Uses workspace_identity and session_metadata from ffx.shared_model_context.v1."),
       acpEntrypoint("ACP initialize/resume behavior is explicitly marked as follow-up drift."),
     ],
   },
@@ -777,7 +780,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "approval loop",
     expectedFirstTool: {
       category: "focused deterministic Bun test",
-      tools: ["shell"],
+      tools: ["terminal"],
       commandPattern:
         "^(bun\\s+test\\s+tests/evals/agent-quality-matrix\\.test\\.ts|cd\\s+tests/evals\\s+&&\\s+bun\\s+test\\s+agent-quality-matrix\\.test\\.ts|bun\\s+test\\s+agent-quality-matrix\\.test\\.ts)$",
       notes:
@@ -815,7 +818,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "approval loop",
     expectedFirstTool: {
       category: "changed-file metadata inspection",
-      tools: ["shell"],
+      tools: ["terminal"],
       commandPattern: "^git\\s+(status\\s+--short|diff\\s+--name-only|diff\\s+--name-status)\\b",
       notes:
         "Start from changed-file metadata only; avoid full diff dumps before choosing focused checks.",
@@ -876,7 +879,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     targetResult:
       "First action is web_fetch for the exact public URL; web_search and browser automation are absent.",
     coveredEntrypoints: [
-      askEntrypoint("Depends on available_tools and web routing prompt guidance in fx.shared_model_context.v1."),
+      askEntrypoint("Depends on available_tools and web routing prompt guidance in ffx.shared_model_context.v1."),
     ],
   },
   {
@@ -889,7 +892,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       notes:
         "No known URL is provided, so broad current web research should use web_search instead of local repo tools or web_fetch.",
     },
-    forbiddenTools: [WEB_FETCH_TOOL, "read_file", "glob_files", "grep_files", "ask_user_question"],
+    forbiddenTools: [WEB_FETCH_TOOL, "read_file", "glob_files", "grep_files", "semantic_search", "ask_user_question"],
     expectedUserVisibleBehavior:
       "Uses web_search for current web research, treats search results as untrusted, cites linked sources, and does not invent local repo facts.",
     deterministicCoverage: {
@@ -919,7 +922,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "large output",
     expectedFirstTool: {
       category: "command with retained evidence",
-      tools: ["shell"],
+      tools: ["terminal"],
     },
     forbiddenTools: ["ask_user_question"],
     expectedUserVisibleBehavior:
@@ -939,7 +942,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     },
     targetResult: "Preserves an explicit handle or limitation so a later turn can recover the needed evidence.",
     coveredEntrypoints: [
-      askEntrypoint("Depends on session_metadata and available_tools from fx.shared_model_context.v1."),
+      askEntrypoint("Depends on session_metadata and available_tools from ffx.shared_model_context.v1."),
       interactiveEntrypoint("Interactive sessions should preserve the same large-output evidence contract."),
     ],
   },
@@ -965,15 +968,15 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     modelBackedEval: {
       required: true,
       reason:
-        "Choosing scoped capability_search before mcp_select_tool and the final dynamic call is model-visible routing behavior.",
+        "Choosing mcp_search_tools before mcp_select_tool and the final dynamic call is model-visible routing behavior.",
     },
     currentBaselineResult: {
       status: "known-gap",
       notes:
-        "A 13-server run with 28 ready Datadog tools made 18 unscoped searches without returning a Datadog tool.",
+        "Ready MCP schemas were previously advertised inline, so large MCP setups could bloat the main prompt instead of using a discovery flow.",
     },
     targetResult:
-      "First action is capability_search with kind=mcp and the exact server alias; the model pages if needed, exact-selects a result, and calls it without web_search or clarification.",
+      "First action is mcp_search_tools; the model exact-selects a returned dynamic tool before calling the selected MCP tool, with no web_search or clarification question.",
     coveredEntrypoints: [
       askEntrypoint("Depends on available_tools advertising only the MCP discovery tools until an exact select occurs."),
       interactiveEntrypoint("Interactive mode should use the same deferred discovery path with live MCP runtimes."),
@@ -1056,34 +1059,34 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     userPrompt: "A dev server is running in the background; show me its status and logs.",
     failureCategory: "large output",
     expectedFirstTool: {
-      category: "managed shell status",
-      tools: ["shell"],
+      category: "background status from runtime context",
+      tools: [],
       notes:
-        "Use the owned handle returned by shell.run, then shell.interact for a bounded output delta without rediscovering or replaying the process.",
+        "Background task status and log summaries are runtime-visible; no new shell command is required to rediscover the process.",
     },
-    forbiddenTools: ["ask_user_question"],
+    forbiddenTools: [...DESTRUCTIVE_OR_MUTATING_TOOLS, "ask_user_question"],
     expectedUserVisibleBehavior:
-      "Reports the owned session id, command state, and bounded recent output without rerunning the command or exposing a filesystem log path.",
+      "Reports task id, state, cwd, log path, URL when known, and a bounded head/tail log summary without dumping the full long-running output.",
     deterministicCoverage: {
-      type: "e2e",
+      type: "runtime unit test",
       status: "implemented",
       notes:
-        "Managed execution coverage proves one handle, ordered output deltas, bounded retention, wait continuity, and opaque replay handles.",
+        "task_helpers/background_commands unit coverage asserts bounded log summaries include path, bytes, head, and tail.",
     },
     modelBackedEval: {
       required: false,
-      reason: "The owned-handle and output-delta contract is deterministic runtime behavior.",
+      reason: "The status/log visibility contract is deterministic runtime formatting.",
     },
     currentBaselineResult: {
       status: "passing",
       notes:
-        "shell.interact exposes only fx-owned execution output for the exact returned handle.",
+        "/background logs uses bounded head/tail summaries and background notices include log paths for running servers.",
     },
     targetResult:
-      "Long-running commands remain inspectable through the same handle without replaying the command or inventing PID/log authority.",
+      "Long-running commands remain inspectable without rerunning or losing recent log evidence.",
     coveredEntrypoints: [
-      interactiveEntrypoint("Ctrl-X exposes managed process state."),
-      askEntrypoint("Process-local shell handles remain available for the ask lifetime."),
+      interactiveEntrypoint("Slash command and runtime context expose background task visibility."),
+      askEntrypoint("Runtime context carries background state into headless turns when available."),
     ],
   },
 ];
@@ -1102,7 +1105,7 @@ export function firstToolMatchesExpectation(
   }
   if (!toolCall) return false;
   if (!row.expectedFirstTool.tools.includes(toolCall.name)) return false;
-  if (toolCall.name === "shell" && row.expectedFirstTool.commandPattern) {
+  if (toolCall.name === "terminal" && row.expectedFirstTool.commandPattern) {
     return new RegExp(row.expectedFirstTool.commandPattern).test(
       toolCall.command_result?.command ?? "",
     );

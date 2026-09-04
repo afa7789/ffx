@@ -27,17 +27,21 @@ try {
       fetchStartedResolve();
       return fetch(input, init);
     },
-    apiKey: "native-core-cancel-key",
-    gatewayChatUrl: `http://127.0.0.1:${port}/stall`,
-    model: "native/test-model",
+    env: {
+      AI_GATEWAY_API_KEY: "native-core-cancel-key",
+      FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${port}/stall`,
+      FX_MODEL: "native/test-model",
+    },
   });
-  const turn = agent.prompt("stall");
+  const session = await agent.createSession();
+  const turn = session.prompt("stall");
   await Promise.race([fetchStarted, timeout("stalled gateway fetch")]);
   turn.cancel();
   const result = await Promise.race([turn.result, timeout("native cancellation")]);
   assert.equal(result.stopReason, "cancelled");
   assert.equal(aborted, true, "turn cancellation must abort Node fetch");
-  assert.equal(await agent.close(), undefined);
+  await session.close();
+  assert.equal(await agent.close(), 0);
   console.log("native core cancellation passed: stalled request cancelled and runtime closed");
 } finally {
   server.closeAllConnections();

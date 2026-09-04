@@ -4,7 +4,7 @@ const builtin_gateway = @import("../builtins/gateway.zig");
 
 const Allocator = std.mem.Allocator;
 
-extern "fx" fn fx_http_request(
+extern "ffx" fn fx_http_request(
     method_ptr: [*]const u8,
     method_len: usize,
     url_ptr: [*]const u8,

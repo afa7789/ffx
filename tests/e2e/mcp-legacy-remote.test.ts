@@ -70,19 +70,19 @@ function createRoot(
   remoteOverrides: Record<string, unknown> = {},
 ) {
   const root = realpathSync(
-    mkdtempSync(join(tmpdir(), `fx-mcp-legacy-${label}-`)),
+    mkdtempSync(join(tmpdir(), `ffx-mcp-legacy-${label}-`)),
   );
   cleanupRoot = root;
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
-    join(home, ".fx", "settings.json"),
-    JSON.stringify({}),
+    join(home, ".ffx", "settings.json"),
+    JSON.stringify({ maxxing_mode: "minimal" }),
   );
   writeFileSync(
-    join(home, ".fx", "mcp.json"),
+    join(home, ".ffx", "mcp.json"),
     JSON.stringify({
       mcp: {
         fixture: {
@@ -96,7 +96,7 @@ function createRoot(
       },
     }),
   );
-  return { root, home, workspace, traceLogPath: join(root, "fx-trace.log") };
+  return { root, home, workspace, traceLogPath: join(root, "ffx-trace.log") };
 }
 
 function fixtureEnv(
@@ -105,16 +105,16 @@ function fixtureEnv(
 ) {
   return {
     HOME: root.home,
-    AI_GATEWAY_API_KEY: "fake-mcp-legacy-key",
+    FFX_PROVIDER_API_KEY: "fake-mcp-legacy-key",
     VERCEL_OIDC_TOKEN: undefined,
-    FX_AUTO_UPGRADE: "0",
-    FX_PERMISSION_MODE: "auto",
-    FX_GATEWAY_BASE_URL: activeGateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: activeGateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: activeGateway.chatUrl,
-    FX_MODEL: MODEL,
-    FX_TRACE_LOG: root.traceLogPath,
-    FX_TRACE_SCOPES: "mcp",
+    FFX_AUTO_UPGRADE: "0",
+    FFX_PERMISSION_MODE: "auto",
+    FFX_GATEWAY_BASE_URL: activeGateway.baseUrl,
+    FFX_GATEWAY_CHAT_URL: activeGateway.chatUrl,
+    FFX_E2E_GATEWAY_CHAT_URL: activeGateway.chatUrl,
+    FFX_MODEL: MODEL,
+    FFX_TRACE_LOG: root.traceLogPath,
+    FFX_TRACE_SCOPES: "mcp",
   };
 }
 
@@ -155,8 +155,8 @@ function preserveLegacyFailure(
   activeGateway: ReturnType<typeof startFakeGateway>,
 ): void {
   cleanupRoot = null;
-  writeFileSync(join(root.root, "fx-stdout.log"), result.stdout);
-  writeFileSync(join(root.root, "fx-stderr.log"), result.stderr);
+  writeFileSync(join(root.root, "ffx-stdout.log"), result.stdout);
+  writeFileSync(join(root.root, "ffx-stderr.log"), result.stderr);
   writeFileSync(
     join(root.root, "failure.json"),
     JSON.stringify({
@@ -169,14 +169,13 @@ function preserveLegacyFailure(
       gatewayRequests: activeGateway.requests.map((request) => request.body),
     }, null, 2),
   );
-  throw new Error(`fx ${label} failed; retained artifacts: ${root.root}`);
+  throw new Error(`ffx ${label} failed; retained artifacts: ${root.root}`);
 }
 
 describe("version-scoped legacy MCP remote transports", () => {
   for (const sdkDiscoveryError of [
     "uninitialized",
     "unsupported-version",
-    "unsupported-version-string-id",
   ] as const) {
     test(`stock SDK ${sdkDiscoveryError} discovery error falls back to Streamable HTTP initialization`, async () => {
       streamable = startLegacyStreamableHttpFixture("2025-11-25", {
@@ -309,12 +308,12 @@ describe("version-scoped legacy MCP remote transports", () => {
       const root = createRoot(`list-changed-${version}`, "http", streamable.url);
       const freshTool = "mcp_fixture_fresh";
       gateway = startFakeGateway([
-        fakeGatewayToolCall("activate_listener", "capability_search", {
+        fakeGatewayToolCall("activate_listener", "mcp_search_tools", {
           query: "echo",
         }),
         async () => {
           await Bun.sleep(100);
-          return fakeGatewayToolCall("search_fresh", "capability_search", {
+          return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
             query: "fresh",
           });
         },
@@ -370,12 +369,12 @@ describe("version-scoped legacy MCP remote transports", () => {
     const root = createRoot("sse-list-changed", "sse", legacySse.url);
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_sse_reader", "capability_search", {
+      fakeGatewayToolCall("activate_sse_reader", "mcp_search_tools", {
         query: "echo",
       }),
       async () => {
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_fresh", "capability_search", {
+        return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
           query: "fresh",
         });
       },
@@ -412,7 +411,7 @@ describe("version-scoped legacy MCP remote transports", () => {
   }, 30_000);
 
   for (const version of VERSIONS) {
-    test(`fresh fx ask calls Streamable HTTP ${version} with its lifecycle headers`, async () => {
+    test(`fresh ffx ask calls Streamable HTTP ${version} with its lifecycle headers`, async () => {
       streamable = startLegacyStreamableHttpFixture(version);
       const root = createRoot(`ask-${version}`, "http", streamable.url);
       gateway = startToolGateway(`${version} complete.`);
@@ -497,31 +496,6 @@ describe("version-scoped legacy MCP remote transports", () => {
     const result = await runAsk(root, gateway, "Call the no-session fixture.");
 
     expect(result.code).toBe(0);
-    expect(streamable.deleteCalls).toBe(0);
-    for (const entry of streamable.requests) {
-      expect(entry.headers["mcp-session-id"]).toBeUndefined();
-    }
-  }, 30_000);
-
-  test("Clerk-like SSE initialization without a session remains searchable", async () => {
-    streamable = startLegacyStreamableHttpFixture("2025-11-25", {
-      initializeSse: true,
-      sdkDiscoveryError: "unsupported-version",
-      session: false,
-    });
-    const root = createRoot("clerk-like-sse-no-session", "http", streamable.url);
-    gateway = startToolGateway("Clerk-like search complete.");
-
-    const result = await runAsk(
-      root,
-      gateway,
-      "Find and call the legacy MCP tool.",
-    );
-
-    expect(result.code).toBe(0);
-    expect(streamable.initializeCalls).toBe(1);
-    expect(streamable.toolsListCalls).toBe(1);
-    expect(streamable.toolCallCalls).toBe(1);
     expect(streamable.deleteCalls).toBe(0);
     for (const entry of streamable.requests) {
       expect(entry.headers["mcp-session-id"]).toBeUndefined();
@@ -621,7 +595,7 @@ describe("version-scoped legacy MCP remote transports", () => {
             const openPath = join(fakeBin, name);
             writeFileSync(
               openPath,
-              "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$FX_E2E_OPEN_LOG\"\nexit 0\n",
+              "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$FFX_E2E_OPEN_LOG\"\nexit 0\n",
             );
             chmodSync(openPath, 0o755);
           }
@@ -659,7 +633,7 @@ describe("version-scoped legacy MCP remote transports", () => {
           ], {
             models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
           });
-          const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+          const binary = join(REPO_ROOT, "zig-out", "bin", "ffx");
           tui = await TmuxSession.create({
             isolated: true,
             cwd: root.workspace,
@@ -670,7 +644,7 @@ describe("version-scoped legacy MCP remote transports", () => {
             env: {
               ...fixtureEnv(root, gateway),
               PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
-              FX_E2E_OPEN_LOG: openLog,
+              FFX_E2E_OPEN_LOG: openLog,
             },
           });
 
@@ -908,7 +882,7 @@ describe("version-scoped legacy MCP remote transports", () => {
     expect(gateway.requests[2]?.body).toContain("McpAuthenticationRequired");
   }, 30_000);
 
-  test("fresh fx ask uses explicit HTTP+SSE endpoint discovery and message routing", async () => {
+  test("fresh ffx ask uses explicit HTTP+SSE endpoint discovery and message routing", async () => {
     legacySse = startLegacyHttpSseFixture();
     const root = createRoot(
       "sse-ask",
@@ -1025,7 +999,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       });
       const root = createRoot(`sse-version-${label}`, "sse", legacySse.url);
       gateway = startFakeGateway([
-        fakeGatewayToolCall("inspect_invalid_sse", "capability_search", {
+        fakeGatewayToolCall("inspect_invalid_sse", "mcp_search_tools", {
           query: "echo",
         }),
         fakeGatewayFinalText("Invalid SSE version isolated."),
@@ -1062,7 +1036,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       legacySse.url,
     );
     gateway = startFakeGateway([
-      fakeGatewayToolCall("inspect_malformed_sse", "capability_search", {
+      fakeGatewayToolCall("inspect_malformed_sse", "mcp_search_tools", {
         query: "echo",
       }),
       fakeGatewayFinalText("Malformed SSE startup isolated."),

@@ -3,12 +3,11 @@ import {
   createFxTerminal as createWasmTerminal,
   encodeXtermKeyEvent,
   fxSdkApiVersion,
-  listModels,
   supportsJspi,
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
+export { encodeXtermKeyEvent, fxSdkApiVersion, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
 
 const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url).href;

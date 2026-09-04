@@ -1,6 +1,7 @@
 const std = @import("std");
 const display_width = @import("display_width.zig");
 const text_utils = @import("text_utils.zig");
+const account_status = @import("../auth/account_status.zig");
 
 const Allocator = std.mem.Allocator;
 const max_published_error_bytes: usize = 1024;
@@ -63,10 +64,12 @@ pub fn formatSchemaDiagnostic(alloc: Allocator, detail: []const u8) !?[]u8 {
 
 pub fn formatHttpErrorMessage(alloc: Allocator, status: std.http.Status, detail: []const u8) ![]u8 {
     const status_code = @intFromEnum(status);
-    const title = if (status_code == 401 or status_code == 403)
-        "API access denied"
-    else
-        "API request failed";
+    const title = switch (account_status.classifyHttpStatus(status_code)) {
+        .authentication => "API access denied",
+        .plan_exhausted => "Plan limit reached; check billing or switch provider",
+        .rate_limited => "Rate limit reached; wait or switch model",
+        else => "API request failed",
+    };
     return formatHttpDiagnostic(alloc, status, detail, title, max_published_error_bytes);
 }
 
@@ -398,6 +401,24 @@ test "formatHttpErrorMessage renders API key and credits setup bodies" {
         "API access denied · HTTP 403 · credit_card_required: Buy credits to use AI Gateway.",
         credits_line,
     );
+}
+
+test "formatHttpErrorMessage names plan and rate limits with a next step" {
+    const plan = try formatHttpErrorMessage(
+        std.testing.allocator,
+        .payment_required,
+        "{\"error\":{\"code\":\"insufficient_quota\",\"message\":\"Quota exhausted\"}}",
+    );
+    defer std.testing.allocator.free(plan);
+    try std.testing.expect(std.mem.startsWith(u8, plan, "Plan limit reached; check billing or switch provider · HTTP 402"));
+
+    const rate = try formatHttpErrorMessage(
+        std.testing.allocator,
+        .too_many_requests,
+        "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Try again later\"}}",
+    );
+    defer std.testing.allocator.free(rate);
+    try std.testing.expect(std.mem.startsWith(u8, rate, "Rate limit reached; wait or switch model · HTTP 429"));
 }
 
 test "formatHttpErrorMessage masks structured and fallback secrets" {

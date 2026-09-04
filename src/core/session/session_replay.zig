@@ -67,18 +67,6 @@ pub fn readLineAt(
 }
 
 pub fn readFirstGeneration(alloc: Allocator, file: std.Io.File) !Identifier {
-    var envelope = try readSessionStarted(alloc, file);
-    defer envelope.deinit(alloc);
-    return envelope.log_generation;
-}
-
-pub fn readSubagentChildIdentity(alloc: Allocator, file: std.Io.File) !bool {
-    var envelope = try readSessionStarted(alloc, file);
-    defer envelope.deinit(alloc);
-    return envelope.event.session_started.subagent_child;
-}
-
-fn readSessionStarted(alloc: Allocator, file: std.Io.File) !session_event.Envelope {
     const length = try file.length(io_mod.getIo());
     const first = try readLineAt(alloc, file, 0, length) orelse
         return error.InvalidSessionFormat;
@@ -88,11 +76,11 @@ fn readSessionStarted(alloc: Allocator, file: std.Io.File) !session_event.Envelo
         error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
         else => return error.InvalidSessionFormat,
     };
-    errdefer envelope.deinit(alloc);
+    defer envelope.deinit(alloc);
     if (envelope.seq != 1 or envelope.kind() != .session_started) {
         return error.InvalidSessionFormat;
     }
-    return envelope;
+    return envelope.log_generation;
 }
 
 pub fn scanCommitPosition(
@@ -167,26 +155,6 @@ pub const ExactReplay = struct {
     }
 };
 
-inline fn failExactReplay(err: anytype) @TypeOf(err)!ExactReplay {
-    return @errorCast(failExactReplayDynamic(err));
-}
-
-noinline fn failExactReplayDynamic(err: anyerror) anyerror!ExactReplay {
-    return err;
-}
-
-test "exact replay failures preserve exact error types and identities" {
-    const invalid = failExactReplay(error.InvalidSessionFormat);
-    try std.testing.expect(
-        @TypeOf(invalid) == error{InvalidSessionFormat}!ExactReplay,
-    );
-    try std.testing.expectError(error.InvalidSessionFormat, invalid);
-    try std.testing.expectError(
-        error.UnsupportedSessionSchema,
-        failExactReplay(error.UnsupportedSessionSchema),
-    );
-}
-
 pub fn replayExactPosition(
     alloc: Allocator,
     file: std.Io.File,
@@ -197,7 +165,7 @@ pub fn replayExactPosition(
     if (expected_bytes == 0 or
         try file.length(io_mod.getIo()) != expected_bytes)
     {
-        return failExactReplay(error.InvalidSessionFormat);
+        return error.InvalidSessionFormat;
     }
     var file_buffer: [8192]u8 = undefined;
     var file_reader = file.reader(io_mod.getIo(), &file_buffer);
@@ -212,18 +180,18 @@ pub fn replayExactPosition(
         null,
     ) catch |err| switch (err) {
         error.OutOfMemory, error.ReadFailed => return err,
-        error.UnsupportedEventSchema => return failExactReplay(error.UnsupportedSessionSchema),
-        else => return failExactReplay(error.InvalidSessionFormat),
+        error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
+        else => return error.InvalidSessionFormat,
     };
     errdefer reduction.deinit(alloc);
-    const through = reduction.through orelse return failExactReplay(error.InvalidSessionFormat);
+    const through = reduction.through orelse return error.InvalidSessionFormat;
     if (reduction.truncate_from != null or
         reduction.bytes_consumed != expected_bytes or
         through.byte_offset != expected_bytes or
         through.seq != expected_seq or
         !std.mem.eql(u8, &through.log_generation, &expected_generation))
     {
-        return failExactReplay(error.InvalidSessionFormat);
+        return error.InvalidSessionFormat;
     }
     const state = reduction.state;
     reduction.state = undefined;

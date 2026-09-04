@@ -14,13 +14,13 @@ import {
 } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FFX_BIN } from "../evals/eval-helpers";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
-  fakeShellRun,
+  fakeGatewayToolCall,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -29,7 +29,8 @@ import {
 const TIMEOUT = 30_000;
 const INPUT_SANITY_BUDGET_MS = 5_000;
 const BURST_NAVIGATION_EVENTS = 2_048;
-const FULL_FOOTER = "Full detail · ctrl o close";
+const REVIEW_FOOTER = "Review · ←/→ switch · ctrl o close";
+const FULL_FOOTER = "Full detail · ←/→ switch · ctrl o close";
 const HISTORY_DONE = "CTRL_O_BRUTAL_HISTORY_DONE";
 const LIVE_START = "CTRL_O_BRUTAL_LIVE_0001";
 const LIVE_DONE = "CTRL_O_BRUTAL_LIVE_DONE";
@@ -64,7 +65,7 @@ type StressConfig = {
   profileSeconds?: number;
 };
 
-type TransitionKind = "full" | "scroll" | "close" | "resize" | "ready";
+type TransitionKind = "review" | "full" | "scroll" | "close" | "resize";
 
 type StressMetrics = {
   transitions: Record<TransitionKind, number[]>;
@@ -129,7 +130,7 @@ function countOccurrences(text: string, needle: string): number {
 }
 
 function committedAssistantOccurrences(home: string, assistant: string): number {
-  const sessionsRoot = join(home, ".fx", "sessions");
+  const sessionsRoot = join(home, ".ffx", "sessions");
   let count = 0;
   for (const entry of readdirSync(sessionsRoot, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.name === "latest") continue;
@@ -162,7 +163,6 @@ function summarize(values: number[]) {
   return {
     count: values.length,
     p50Ms: Number(percentile(values, 0.5).toFixed(3)),
-    p90Ms: Number(percentile(values, 0.9).toFixed(3)),
     p95Ms: Number(percentile(values, 0.95).toFixed(3)),
     p99Ms: Number(percentile(values, 0.99).toFixed(3)),
     maxMs: Number(Math.max(0, ...values).toFixed(3)),
@@ -173,7 +173,6 @@ function summarizeBytes(values: number[]) {
   return {
     count: values.length,
     p50Bytes: percentile(values, 0.5),
-    p90Bytes: percentile(values, 0.9),
     p95Bytes: percentile(values, 0.95),
     p99Bytes: percentile(values, 0.99),
     maxBytes: Math.max(0, ...values),
@@ -195,18 +194,18 @@ function gatewayEnv(
 ) {
   return {
     HOME: home,
-    AI_GATEWAY_API_KEY: "fake-full-transcript-brutal-key",
+    FFX_PROVIDER_API_KEY: "fake-full-transcript-brutal-key",
     VERCEL_OIDC_TOKEN: undefined,
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: FAKE_GATEWAY_MODEL,
-    FX_AUTO_UPGRADE: "0",
+    FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_MODEL: FAKE_GATEWAY_MODEL,
+    FFX_AUTO_UPGRADE: "0",
     NO_COLOR: "1",
   };
 }
 
 function makeRoot(label: string): StressRoot {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-ctrl-o-${label}-`)));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), `ffx-ctrl-o-${label}-`)));
   return {
     root,
     home: join(root, "home"),
@@ -341,18 +340,19 @@ function prepareFixture(config: StressConfig): {
   totalTools: number;
 } {
   const paths = makeRoot(config.label);
-  mkdirSync(join(paths.home, ".fx"), { recursive: true });
+  mkdirSync(join(paths.home, ".ffx"), { recursive: true });
   mkdirSync(paths.workspace);
   writeFileSync(paths.stderrPath, "");
   writeFileSync(paths.resumedStderrPath, "");
   writeFileSync(paths.tracePath, "");
   writeFileSync(paths.resumedTracePath, "");
   writeFileSync(
-    join(paths.home, ".fx", "settings.json"),
+    join(paths.home, ".ffx", "settings.json"),
     JSON.stringify({
       sandbox: "none",
       permission_mode: "auto",
       permission: {},
+      maxxing_mode: "legacy",
       max_agent_steps: config.batches + 12,
       max_tool_result_bytes: 2 * 1024 * 1024,
     }),
@@ -389,8 +389,10 @@ done
     responses.push(batchResponse(batch, config));
   }
   responses.push(fakeGatewayFinalText(`${HISTORY_DONE}\n${TAIL_SENTINEL}`));
-  responses.push(fakeShellRun("ctrl-o-brutal-live", "./ctrl-o-live.sh", {
+  responses.push(fakeGatewayToolCall("ctrl-o-brutal-live", "terminal", {
+    action: "exec",
     timeout_ms: 600_000,
+    command: "./ctrl-o-live.sh",
   }));
   responses.push(fakeGatewayFinalText(LIVE_DONE));
 
@@ -414,12 +416,14 @@ async function waitForScrollback(
 
 async function waitForMode(
   session: TmuxSession,
-  mode: "full" | "main",
+  mode: "review" | "full" | "main",
   draft: string,
 ): Promise<string> {
   return session.waitForPane((pane) => {
+    if (mode === "review") return pane.includes(REVIEW_FOOTER);
     if (mode === "full") return pane.includes(FULL_FOOTER);
     return composerContains(pane, draft) &&
+      !pane.includes(REVIEW_FOOTER) &&
       !pane.includes(FULL_FOOTER);
   }, TIMEOUT);
 }
@@ -445,22 +449,6 @@ async function waitForTraceAfter(
   );
 }
 
-async function waitForAnyTraceAfter(
-  tracePath: string,
-  startByte: number,
-  needles: readonly string[],
-  timeoutMs = TIMEOUT,
-): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const appended = readFileSync(tracePath).subarray(startByte).toString("utf8");
-    const matched = needles.find((needle) => appended.includes(needle));
-    if (matched) return matched;
-    await sleep(25);
-  }
-  throw new Error(`Timed out waiting for any trace marker ${JSON.stringify(needles)}.`);
-}
-
 function projectionWindows(text: string): ProjectionWindowTrace[] {
   return [...text.matchAll(
     /\[full_transcript_cache\] window cols=(\d+) offset=(\d+)/g,
@@ -479,21 +467,6 @@ function latestProjectionWindow(tracePath: string): ProjectionWindowTrace {
   return latest;
 }
 
-async function waitForScrollableProjection(
-  tracePath: string,
-): Promise<ProjectionWindowTrace> {
-  const deadline = Date.now() + TIMEOUT;
-  let latest = latestProjectionWindow(tracePath);
-  while (Date.now() < deadline) {
-    latest = latestProjectionWindow(tracePath);
-    if (latest.offset > 0) return latest;
-    await sleep(10);
-  }
-  throw new Error(
-    `Timed out waiting for a scrollable Ctrl-O page. Last offset: ${latest.offset}.`,
-  );
-}
-
 async function waitForScrolledViewport(
   tracePath: string,
   startByte: number,
@@ -505,41 +478,14 @@ async function waitForScrolledViewport(
     appended = readFileSync(tracePath).subarray(startByte).toString("utf8");
     const scrollIndex = appended.indexOf("[full_transcript_cache] scroll ");
     if (scrollIndex >= 0) {
-      const afterScroll = appended.slice(scrollIndex);
-      const windows = projectionWindows(afterScroll);
+      const windows = projectionWindows(appended.slice(scrollIndex));
       if (windows.some((window) => window.offset !== previousOffset)) return;
-      const after = afterScroll.match(/ after=(\d+)/)?.[1];
-      if (
-        after !== undefined &&
-        Number(after) !== previousOffset &&
-        /frame_plan\] build [^\n]*body=transcript transcript_body=paint/.test(afterScroll)
-      ) return;
     }
     await sleep(10);
   }
   throw new Error(
     `Timed out waiting for a rendered Ctrl-O scroll from offset ${previousOffset}.\n` +
     `Trace appended after action:\n${appended}`,
-  );
-}
-
-async function waitForRenderedViewportAfter(
-  tracePath: string,
-  startByte: number,
-): Promise<void> {
-  const deadline = Date.now() + TIMEOUT;
-  let appended = "";
-  while (Date.now() < deadline) {
-    appended = readFileSync(tracePath).subarray(startByte).toString("utf8");
-    if (
-      projectionWindows(appended).length > 0 ||
-      /attempt_end outcome=committed reasons=[^\n]*modal/.test(appended) ||
-      /frame_plan\] build [^\n]*body=transcript transcript_body=paint/.test(appended)
-    ) return;
-    await sleep(10);
-  }
-  throw new Error(
-    `Timed out waiting for a rendered Ctrl-O frame.\nTrace appended after action:\n${appended}`,
   );
 }
 
@@ -589,7 +535,7 @@ function fxProcessId(session: TmuxSession): number {
   }).trim().split("\n");
   const pid = findFxProcessId(rows);
   if (pid !== undefined) return pid;
-  throw new Error(`Unable to find fx on ${tty}. Processes:\n${rows.join("\n")}`);
+  throw new Error(`Unable to find Fx on ${tty}. Processes:\n${rows.join("\n")}`);
 }
 
 function findFxProcessId(rows: readonly string[]): number | undefined {
@@ -597,16 +543,16 @@ function findFxProcessId(rows: readonly string[]): number | undefined {
     const match = row.trim().match(/^(\d+)\s+(.+)$/);
     if (!match) continue;
     const command = match[2]!;
-    if (command === "fx" || command === FX_BIN || command.endsWith("/fx")) {
+    if (command === "ffx" || command === FFX_BIN || command.endsWith("/ffx")) {
       return Number(match[1]);
     }
   }
   return undefined;
 }
 
-test("fx process discovery accepts basename and path process names", () => {
-  expect(findFxProcessId(["11361 fx"])).toBe(11361);
-  expect(findFxProcessId(["11362 /workspace/zig-out/bin/fx"])).toBe(11362);
+test("Fx process discovery accepts basename and path process names", () => {
+  expect(findFxProcessId(["11361 ffx"])).toBe(11361);
+  expect(findFxProcessId(["11362 /workspace/zig-out/bin/ffx"])).toBe(11362);
 });
 
 function residentKib(pid: number): number {
@@ -646,39 +592,54 @@ async function thrashViewer(
   for (let cycle = 0; cycle < cycles; cycle += 1) {
     await timeTransition(
       metrics,
-      "full",
+      "review",
       () => session.sendHexBytes(CTRL_O),
-      () => waitForMode(session, "full", draft),
+      () => waitForMode(session, "review", draft),
       tapePath,
     );
 
-    const scrollWindow = await waitForScrollableProjection(tracePath);
-    const scrollTraceStart = traceSize(tracePath);
+    const reviewScrollWindow = latestProjectionWindow(tracePath);
+    const reviewScrollTraceStart = traceSize(tracePath);
     await timeTransition(
       metrics,
       "scroll",
       () => session.sendHexBytes(cycle % 2 === 0 ? PAGE_UP : WHEEL_UP),
       async () => {
-        await waitForMode(session, "full", draft);
-        await waitForRenderedViewportAfter(tracePath, scrollTraceStart);
-      },
-      tapePath,
-    );
-    await timeTransition(
-      metrics,
-      "ready",
-      async () => {},
-      async () => {
+        await waitForMode(session, "review", draft);
         await waitForScrolledViewport(
           tracePath,
-          scrollTraceStart,
-          scrollWindow.offset,
+          reviewScrollTraceStart,
+          reviewScrollWindow.offset,
         );
       },
       tapePath,
     );
 
+    await timeTransition(
+      metrics,
+      "full",
+      () => session.sendKeys("Right"),
+      () => waitForMode(session, "full", draft),
+      tapePath,
+    );
+
     if (cycle % 4 === 0) {
+      const fullUpWindow = latestProjectionWindow(tracePath);
+      const fullUpTraceStart = traceSize(tracePath);
+      await timeTransition(
+        metrics,
+        "scroll",
+        () => session.sendHexBytes(PAGE_UP),
+        async () => {
+          await waitForMode(session, "full", draft);
+          await waitForScrolledViewport(
+            tracePath,
+            fullUpTraceStart,
+            fullUpWindow.offset,
+          );
+        },
+        tapePath,
+      );
       const fullDownWindow = latestProjectionWindow(tracePath);
       const fullDownTraceStart = traceSize(tracePath);
       await timeTransition(
@@ -687,19 +648,27 @@ async function thrashViewer(
         () => session.sendHexBytes(PAGE_DOWN),
         async () => {
           await waitForMode(session, "full", draft);
-          await waitForRenderedViewportAfter(tracePath, fullDownTraceStart);
-        },
-        tapePath,
-      );
-      await timeTransition(
-        metrics,
-        "ready",
-        async () => {},
-        async () => {
           await waitForScrolledViewport(
             tracePath,
             fullDownTraceStart,
             fullDownWindow.offset,
+          );
+        },
+        tapePath,
+      );
+    } else {
+      const fullScrollWindow = latestProjectionWindow(tracePath);
+      const fullScrollTraceStart = traceSize(tracePath);
+      await timeTransition(
+        metrics,
+        "scroll",
+        () => session.sendHexBytes(cycle % 2 === 0 ? PAGE_UP : WHEEL_UP),
+        async () => {
+          await waitForMode(session, "full", draft);
+          await waitForScrolledViewport(
+            tracePath,
+            fullScrollTraceStart,
+            fullScrollWindow.offset,
           );
         },
         tapePath,
@@ -720,15 +689,6 @@ async function thrashViewer(
       () => session.resizeWindow(cols, rows),
       async () => {
         await waitForMode(session, "full", draft);
-        await waitForRenderedViewportAfter(tracePath, resizeTraceStart);
-      },
-      tapePath,
-    );
-    await timeTransition(
-      metrics,
-      "ready",
-      async () => {},
-      async () => {
         await waitForResizedViewport(tracePath, resizeTraceStart, cols);
       },
       tapePath,
@@ -747,10 +707,14 @@ async function thrashViewer(
   }
 }
 
-async function verifyTailSurvivesFull(
+async function verifyTailSurvivesReviewToFull(
   session: TmuxSession,
 ): Promise<void> {
   await session.sendHexBytes(CTRL_O);
+  const review = await waitForMode(session, "review", "");
+  expect(review).toContain(TAIL_SENTINEL);
+
+  await session.sendKeys("Right");
   const full = await waitForMode(session, "full", "");
   expect(full).toContain(TAIL_SENTINEL);
   expect(session.paneStatus().dead).toBe(false);
@@ -765,9 +729,9 @@ async function verifyOldestTranscriptEntrySurvives(
   config: StressConfig,
 ): Promise<void> {
   await session.sendHexBytes(CTRL_O);
-  const newest = await waitForMode(session, "full", draft);
+  const newest = await waitForMode(session, "review", draft);
   expect(newest).toContain(LIVE_DONE);
-  const pageCount = config.oldestPageCount ?? 1_024;
+  const pageCount = config.oldestPageCount ?? 512;
   const pageChunk = 64;
   for (let sent = 0; sent < pageCount; sent += pageChunk) {
     await sendRepeatedKey(
@@ -777,12 +741,16 @@ async function verifyOldestTranscriptEntrySurvives(
       pageChunk,
       300,
     );
-    const pane = await waitForMode(session, "full", draft);
+    const pane = await waitForMode(session, "review", draft);
     if (pane.includes(firstChatMarker(config))) break;
   }
   const oldestMarker = firstChatMarker(config);
   const oldest = await session.waitForText(oldestMarker, TIMEOUT * 4);
   expect(oldest).toContain(oldestMarker);
+
+  await session.sendKeys("Right");
+  const full = await waitForMode(session, "full", draft);
+  expect(full).toContain(oldestMarker);
 
   await session.sendHexBytes(CTRL_O);
   await waitForMode(session, "main", draft);
@@ -811,30 +779,30 @@ async function verifyResumedTranscriptNavigation(
   totalTools: number,
 ): Promise<void> {
   await session.sendHexBytes(CTRL_O);
-  const newest = await waitForMode(session, "full", draft);
+  const newest = await waitForMode(session, "review", draft);
   expect(newest).toContain(LIVE_DONE);
 
   // Resume reconstructs the compact transcript under the product's 256 KiB
   // retention cap, so the original first line is not expected to survive.
-  let older = newest;
-  for (let sent = 0; sent < 512; sent += 64) {
-    await sendRepeatedKey(session, "PPage", 64, 64, 300);
-    older = await waitForMode(session, "full", draft);
-    if (
-      olderRetainedChatMarker(older, config) !== undefined ||
-      [...older.matchAll(/CTRL_O_BRUTAL_TOOL_(\d{4})/g)]
-        .some((match) => Number(match[1]) < totalTools - 1)
-    ) break;
-  }
-  expect(older).toContain(FULL_FOOTER);
+  await sendRepeatedKey(session, "PPage", 64, 64, 500);
+  const older = await session.waitForPane(
+    (pane) =>
+      olderRetainedChatMarker(pane, config) !== undefined ||
+      [...pane.matchAll(/CTRL_O_BRUTAL_TOOL_(\d{4})/g)]
+        .some((match) => Number(match[1]) < totalTools - 1),
+    TIMEOUT * 4,
+  );
+  expect(older).toContain(REVIEW_FOOTER);
   const retainedChat = olderRetainedChatMarker(older, config);
   const retainedTool = [...older.matchAll(/CTRL_O_BRUTAL_TOOL_(\d{4})/g)]
     .map((match) => Number(match[1]))
     .find((index) => index < totalTools - 1);
   expect(retainedChat ?? retainedTool).toBeDefined();
-  const retainedMarker = retainedChat ?? toolMarker(retainedTool!);
+  const retainedMarker = retainedChat ?? compactToolMarker(retainedTool!);
 
-  expect(older).toContain(retainedMarker);
+  await session.sendKeys("Right");
+  const full = await waitForMode(session, "full", draft);
+  expect(full).toContain(retainedMarker);
 
   await session.sendHexBytes(CTRL_O);
   await waitForMode(session, "main", draft);
@@ -862,12 +830,12 @@ function alternateScreenStats(tape: Buffer) {
 async function runStress(config: StressConfig): Promise<StressRoot> {
   const { paths, gateway, totalTools } = prepareFixture(config);
   const metrics: StressMetrics = {
-    transitions: { full: [], scroll: [], close: [], resize: [], ready: [] },
-    terminalBytes: { full: [], scroll: [], close: [], resize: [], ready: [] },
+    transitions: { review: [], full: [], scroll: [], close: [], resize: [] },
+    terminalBytes: { review: [], full: [], scroll: [], close: [], resize: [] },
   };
   const settledMetrics: StressMetrics = {
-    transitions: { full: [], scroll: [], close: [], resize: [], ready: [] },
-    terminalBytes: { full: [], scroll: [], close: [], resize: [], ready: [] },
+    transitions: { review: [], full: [], scroll: [], close: [], resize: [] },
+    terminalBytes: { review: [], full: [], scroll: [], close: [], resize: [] },
   };
   const primaryRssKib: number[] = [];
   const resumedRssKib: number[] = [];
@@ -877,15 +845,15 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
   let passed = false;
   try {
     session = await TmuxSession.create({
-      cmd: FX_BIN,
+      cmd: FFX_BIN,
       cwd: realpathSync(paths.workspace),
       env: {
         ...gatewayEnv(paths.home, gateway),
-        FX_RECORD: paths.tapePath,
-        FX_RECORD_INPUT: "1",
-        FX_TRACE_LOG: paths.tracePath,
-        FX_TRACE_SCOPES:
-          "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_schedule,frame_plan",
+        FFX_RECORD: paths.tapePath,
+        FFX_RECORD_INPUT: "1",
+        FFX_TRACE_LOG: paths.tracePath,
+        FFX_TRACE_SCOPES:
+          "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_schedule",
       },
       stderrPath: paths.stderrPath,
       width: 104,
@@ -913,11 +881,11 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     expect(history).toContain(lastChatMarker(config));
     expect(history).toContain(compactToolMarker(0));
 
-    await verifyTailSurvivesFull(session);
+    await verifyTailSurvivesReviewToFull(session);
     expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
 
     await session.sendText("Run the prepared live command while I inspect the transcript.");
-    await session.waitForText("Running ./ctrl-o-live.sh", TIMEOUT);
+    await session.waitForText(LIVE_START, TIMEOUT);
     await session.sendLiteralText(DRAFT);
     await waitForMode(session, "main", DRAFT);
     const pid = fxProcessId(session);
@@ -926,53 +894,41 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
 
     const immediateTraceStart = traceSize(paths.tracePath);
     const escapeStarted = performance.now();
-    session.sendKeysImmediate(["C-o"]);
-    await waitForAnyTraceAfter(
-      paths.tracePath,
-      immediateTraceStart,
-      [
-        "open_request state=pending",
-        "depth_transition from=inline to=full route=root trigger=ctrl_o",
-      ],
-    );
-    session.sendKeysImmediate(["Escape"]);
-    await waitForAnyTraceAfter(paths.tracePath, immediateTraceStart, [
-      "open_request state=cancelled",
-      "depth_transition from=full to=inline route=root trigger=escape",
+    session.sendKeysImmediate(["C-o", "Escape"]);
+    await waitForTraceAfter(paths.tracePath, immediateTraceStart, [
+      "attempt_restore outcome=input_pending",
+      "depth_transition from=review to=inline route=root trigger=escape",
     ]);
     await waitForMode(session, "main", DRAFT);
     expect(performance.now() - escapeStarted).toBeLessThan(INPUT_SANITY_BUDGET_MS);
 
-    const repeatedOpenTraceStart = traceSize(paths.tracePath);
-    const repeatedOpenStarted = performance.now();
-    session.sendKeysImmediate(["C-o"]);
-    await waitForTraceAfter(paths.tracePath, repeatedOpenTraceStart, [
-      "depth_transition from=inline to=full route=root trigger=ctrl_o",
+    const repeatedToggleTraceStart = traceSize(paths.tracePath);
+    const repeatedToggleStarted = performance.now();
+    session.sendKeysImmediate(["C-o", "Right"]);
+    await waitForTraceAfter(paths.tracePath, repeatedToggleTraceStart, [
+      "depth_transition from=review to=full route=root trigger=right",
     ]);
     await waitForMode(session, "full", DRAFT);
-    expect(performance.now() - repeatedOpenStarted).toBeLessThan(
+    expect(performance.now() - repeatedToggleStarted).toBeLessThan(
       INPUT_SANITY_BUDGET_MS,
     );
     await session.sendKeys("Escape");
     await waitForMode(session, "main", DRAFT);
 
     await session.sendKeys("C-o");
-    await waitForMode(session, "full", DRAFT);
-    const burstScrollWindow = await waitForScrollableProjection(paths.tracePath);
-    const burstScrollTraceStart = traceSize(paths.tracePath);
-    const burstScrollStarted = performance.now();
+    await waitForMode(session, "review", DRAFT);
+    const burstToggleTraceStart = traceSize(paths.tracePath);
+    const burstToggleStarted = performance.now();
     session.sendRepeatedKeyThenImmediate(
       "PPage",
       BURST_NAVIGATION_EVENTS,
-      "PPage",
+      "Right",
     );
+    await waitForTraceAfter(paths.tracePath, burstToggleTraceStart, [
+      "depth_transition from=review to=full route=root trigger=right",
+    ]);
     await waitForMode(session, "full", DRAFT);
-    await waitForScrolledViewport(
-      paths.tracePath,
-      burstScrollTraceStart,
-      burstScrollWindow.offset,
-    );
-    expect(performance.now() - burstScrollStarted).toBeLessThan(
+    expect(performance.now() - burstToggleStarted).toBeLessThan(
       INPUT_SANITY_BUDGET_MS,
     );
 
@@ -1017,32 +973,32 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       const summary = {
         config,
         transitions: {
+          review: summarize(metrics.transitions.review),
           full: summarize(metrics.transitions.full),
           scroll: summarize(metrics.transitions.scroll),
           close: summarize(metrics.transitions.close),
           resize: summarize(metrics.transitions.resize),
-          ready: summarize(metrics.transitions.ready),
         },
         settledTransitions: {
+          review: summarize(settledMetrics.transitions.review),
           full: summarize(settledMetrics.transitions.full),
           scroll: summarize(settledMetrics.transitions.scroll),
           close: summarize(settledMetrics.transitions.close),
           resize: summarize(settledMetrics.transitions.resize),
-          ready: summarize(settledMetrics.transitions.ready),
         },
         terminalBytes: {
+          review: summarizeBytes(metrics.terminalBytes.review),
           full: summarizeBytes(metrics.terminalBytes.full),
           scroll: summarizeBytes(metrics.terminalBytes.scroll),
           close: summarizeBytes(metrics.terminalBytes.close),
           resize: summarizeBytes(metrics.terminalBytes.resize),
-          ready: summarizeBytes(metrics.terminalBytes.ready),
         },
         settledTerminalBytes: {
+          review: summarizeBytes(settledMetrics.terminalBytes.review),
           full: summarizeBytes(settledMetrics.terminalBytes.full),
           scroll: summarizeBytes(settledMetrics.terminalBytes.scroll),
           close: summarizeBytes(settledMetrics.terminalBytes.close),
           resize: summarizeBytes(settledMetrics.terminalBytes.resize),
-          ready: summarizeBytes(settledMetrics.terminalBytes.ready),
         },
         memory: summarizeMemory(primaryRssKib),
         resumedMemory: resumedRssKib.length > 0
@@ -1090,25 +1046,24 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
 
     const summary = writeMetrics();
+    expect(summary.transitions.review.p95Ms).toBeLessThan(5_000);
     expect(summary.transitions.full.p95Ms).toBeLessThan(5_000);
-    expect(summary.transitions.scroll.p95Ms).toBeLessThan(5_000);
     expect(summary.transitions.close.p95Ms).toBeLessThan(5_000);
     expect(summary.transitions.resize.p95Ms).toBeLessThan(5_000);
-    expect(summary.transitions.ready.maxMs).toBeLessThan(30_000);
     const budgetTransitions = (config.settledCycles ?? 0) > 0
       ? summary.settledTransitions
       : summary.transitions;
     // The budget includes terminal backpressure and host jitter.
-    expect(budgetTransitions.full.p95Ms).toBeLessThan(3_500);
-    expect(budgetTransitions.scroll.p95Ms).toBeLessThan(3_500);
-    expect(budgetTransitions.close.p95Ms).toBeLessThan(2_500);
+    expect(budgetTransitions.review.p95Ms).toBeLessThan(3_500);
+    expect(budgetTransitions.full.p95Ms).toBeLessThan(3_000);
+    expect(budgetTransitions.close.p95Ms).toBeLessThan(1_500);
     expect(budgetTransitions.resize.p95Ms).toBeLessThan(3_000);
     if ((config.settledCycles ?? 0) > 0) {
-      // Opening after a resize may emit one repair frame and the Full viewport.
-      expect(summary.settledTerminalBytes.full.maxBytes).toBeLessThan(64 * 1024);
+      // A resized close may emit the repair frame and next Review viewport only.
+      expect(summary.settledTerminalBytes.review.maxBytes).toBeLessThan(64 * 1024);
     }
-    // Full-open cost must remain independent of total chat size.
-    expect(summary.terminalBytes.full.maxBytes).toBeLessThan(128 * 1024);
+    // Review-open cost must remain independent of total chat size.
+    expect(summary.terminalBytes.review.maxBytes).toBeLessThan(128 * 1024);
     expect(summary.terminalBytes.close.maxBytes).toBeLessThan(256 * 1024);
     expect(summary.memory.growthRssKib).toBeLessThan(256 * 1024);
 
@@ -1122,13 +1077,13 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     if (config.resumeCycles > 0) {
       resumedGateway = startFakeGateway([]);
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FFX_BIN} --resume-last`,
         cwd: realpathSync(paths.workspace),
         env: {
           ...gatewayEnv(paths.home, resumedGateway),
-          FX_TRACE_LOG: paths.resumedTracePath,
-          FX_TRACE_SCOPES:
-            "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_plan",
+          FFX_TRACE_LOG: paths.resumedTracePath,
+          FFX_TRACE_SCOPES:
+            "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff",
         },
         stderrPath: paths.resumedStderrPath,
         width: 96,
@@ -1146,13 +1101,13 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
         paths.resumedTracePath,
         resumeTraceStart,
         [
-          "depth_transition from=inline to=full route=root trigger=ctrl_o",
+          "depth_transition from=inline to=review route=root trigger=ctrl_o",
         ],
       );
       expect(resumeInputTrace).not.toContain(
         "transcript_transition_commit state=stable",
       );
-      await waitForMode(session, "full", RESUME_DRAFT);
+      await waitForMode(session, "review", RESUME_DRAFT);
       expect(performance.now() - resumeInputStarted).toBeLessThan(
         INPUT_SANITY_BUDGET_MS,
       );
@@ -1208,56 +1163,6 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
 }
 
 test.skipIf(!tmuxAvailable())(
-  "Ctrl-O fills a viewport taller than the prepared overscan cache",
-  async () => {
-    const paths = makeRoot("tall-viewport");
-    mkdirSync(join(paths.home, ".fx"), { recursive: true });
-    mkdirSync(paths.workspace);
-    writeFileSync(paths.stderrPath, "");
-    const tallTail = "TALL_TRANSCRIPT_TAIL";
-    const response = Array.from(
-      { length: 500 },
-      (_, index) => index === 499
-        ? tallTail
-        : `TALL_TRANSCRIPT_ROW_${String(index).padStart(3, "0")}`,
-    ).join("\n");
-    const tallGateway = startFakeGateway([fakeGatewayFinalText(response)]);
-    let active: TmuxSession | null = null;
-    try {
-      active = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: realpathSync(paths.workspace),
-        env: gatewayEnv(paths.home, tallGateway),
-        stderrPath: paths.stderrPath,
-        width: 80,
-        height: 220,
-        minimumHistoryLines: 2_000,
-      });
-      await active.waitForComposer(TIMEOUT);
-      await active.sendText("Build a tall transcript.");
-      await active.waitForText(tallTail, TIMEOUT);
-      await active.sendHexBytes(CTRL_O);
-      const full = await active.waitForText(FULL_FOOTER, TIMEOUT);
-      const rows = full.split("\n");
-      const tail_row = rows.findIndex((row) => row.includes(tallTail));
-      const footer_row = rows.findIndex((row) => row.includes(FULL_FOOTER));
-      expect(tail_row).toBeGreaterThanOrEqual(0);
-      expect(footer_row).toBeGreaterThan(tail_row);
-      expect(footer_row - tail_row).toBeLessThanOrEqual(6);
-
-      await active.sendHexBytes(CTRL_O);
-      await active.waitForComposer(TIMEOUT);
-      expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
-    } finally {
-      await active?.kill();
-      tallGateway.stop();
-      rmSync(paths.root, { recursive: true, force: true });
-    }
-  },
-  60_000,
-);
-
-test.skipIf(!tmuxAvailable())(
   "Ctrl-O repeatedly survives mixed long chats, dense tool batches, live output, resize storms, and resume",
   async () => {
     await runStress({
@@ -1267,14 +1172,14 @@ test.skipIf(!tmuxAvailable())(
       chatLinesPerBatch: 250,
       fileLines: 120,
       liveLines: 500,
-      cycles: 20,
+      cycles: 12,
       resumeCycles: 4,
     });
   },
-  240_000,
+  180_000,
 );
 
-test.skipIf(!tmuxAvailable() || process.env.FX_CTRL_O_BRUTAL !== "1")(
+test.skipIf(!tmuxAvailable() || process.env.FFX_CTRL_O_BRUTAL !== "1")(
   "Ctrl-O extended brutal soak holds under four thousand chat lines and ninety six tools",
   async () => {
     await runStress({
@@ -1293,7 +1198,7 @@ test.skipIf(!tmuxAvailable() || process.env.FX_CTRL_O_BRUTAL !== "1")(
 
 test.skipIf(
   !tmuxAvailable() ||
-    process.env.FX_CTRL_O_PROFILE !== "1" ||
+    process.env.FFX_CTRL_O_PROFILE !== "1" ||
     platform() !== "darwin" ||
     !existsSync("/usr/bin/sample"),
 )(
@@ -1316,10 +1221,10 @@ test.skipIf(
   600_000,
 );
 
-test.skipIf(!tmuxAvailable() || process.env.FX_CTRL_O_50K !== "1")(
+test.skipIf(!tmuxAvailable() || process.env.FFX_CTRL_O_50K !== "1")(
   "Ctrl-O load test survives a realistic fifty-thousand-line session with large tool sidecars",
   async () => {
-    const profileSeconds = process.env.FX_CTRL_O_PROFILE === "1" &&
+    const profileSeconds = process.env.FFX_CTRL_O_PROFILE === "1" &&
         platform() === "darwin" &&
         existsSync("/usr/bin/sample")
       ? 30

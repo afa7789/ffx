@@ -1,7 +1,7 @@
 const std = @import("std");
 const host = @import("host.zig");
 
-extern "fx" fn fx_open_url(url_ptr: [*]const u8, url_len: usize) i32;
+extern "ffx" fn fx_open_url(url_ptr: [*]const u8, url_len: usize) i32;
 
 pub const opener: host.UrlOpener = .{ .open_fn = open };
 

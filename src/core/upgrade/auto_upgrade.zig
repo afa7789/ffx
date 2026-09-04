@@ -21,16 +21,9 @@ pub const State = enum(u8) {
 pub const RelaunchRequest = struct {
     executable_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     executable_path_len: usize = 0,
-    previous_revision_buf: [update_target.max_revision_bytes]u8 = undefined,
-    previous_revision_len: u8 = 0,
 
     pub fn executablePath(self: *const RelaunchRequest) []const u8 {
         return self.executable_path_buf[0..self.executable_path_len];
-    }
-
-    pub fn previousRevision(self: *const RelaunchRequest) ?[]const u8 {
-        if (self.previous_revision_len == 0) return null;
-        return self.previous_revision_buf[0..self.previous_revision_len];
     }
 };
 
@@ -54,8 +47,6 @@ pub const AutoUpgrade = struct {
     version_mutex: std.Io.Mutex = .init,
     latest_version_buf: [64]u8 = undefined,
     latest_version_len: u8 = 0,
-    previous_revision_buf: [update_target.max_revision_bytes]u8 = undefined,
-    previous_revision_len: u8 = 0,
 
     selected_channel: update_target.Channel = .stable,
 
@@ -74,7 +65,6 @@ pub const AutoUpgrade = struct {
         alloc: Allocator,
         current: update_target.CurrentBuild,
     ) void {
-        self.setPreviousRevision(current.revision);
         self.thread = std.Thread.spawn(.{}, runLoop, .{ self, alloc, current }) catch return;
     }
 
@@ -99,15 +89,6 @@ pub const AutoUpgrade = struct {
             request.executable_path_buf[0..executable_path.len],
             executable_path,
         );
-        self.version_mutex.lockUncancelable(io_mod.getIo());
-        defer self.version_mutex.unlock(io_mod.getIo());
-        if (self.selected_channel == .dev and self.previous_revision_len > 0) {
-            @memcpy(
-                request.previous_revision_buf[0..self.previous_revision_len],
-                self.previous_revision_buf[0..self.previous_revision_len],
-            );
-            request.previous_revision_len = self.previous_revision_len;
-        }
         self.relaunch_request = request;
     }
 
@@ -125,7 +106,7 @@ pub const AutoUpgrade = struct {
                 const ver = self.getLatestVersion(&ver_buf);
                 return std.fmt.bufPrint(buf, "upgrading to {s}...", .{ver}) catch "";
             },
-            .ready => return "update ready: ctrl+g to reload",
+            .ready => return "Update installed: ctrl+g to reload",
             .failed => return "upgrade failed",
             else => return "",
         }
@@ -149,15 +130,6 @@ pub const AutoUpgrade = struct {
         const next = @intFromEnum(state);
         const previous = self.state.swap(next, .acq_rel);
         if (previous != next) self.markRenderDirty();
-    }
-
-    fn setPreviousRevision(self: *AutoUpgrade, revision: []const u8) void {
-        const valid = update_target.isValidRevision(revision);
-        const len: u8 = if (valid) @intCast(revision.len) else 0;
-        self.version_mutex.lockUncancelable(io_mod.getIo());
-        defer self.version_mutex.unlock(io_mod.getIo());
-        if (len > 0) @memcpy(self.previous_revision_buf[0..len], revision);
-        self.previous_revision_len = len;
     }
 
     fn setLatestVersion(self: *AutoUpgrade, version: []const u8) void {
@@ -240,23 +212,23 @@ pub const AutoUpgrade = struct {
         var rand_buf: [8]u8 = undefined;
         io_mod.getIo().random(&rand_buf);
         const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);
-        const tmp_dir = std.fmt.allocPrint(alloc, "{s}/fx-auto-upgrade-{s}", .{ tmp_base, rand_hex }) catch return error.AllocFailed;
+        const tmp_dir = std.fmt.allocPrint(alloc, "{s}/ffx-auto-upgrade-{s}", .{ tmp_base, rand_hex }) catch return error.AllocFailed;
         defer alloc.free(tmp_dir);
         defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), tmp_dir) catch {};
 
         std.Io.Dir.createDirAbsolute(io_mod.getIo(), tmp_dir, .default_dir) catch return error.ExtractionFailed;
 
-        const archive_path = std.fmt.allocPrint(alloc, "{s}/fx.tar.gz", .{tmp_dir}) catch return error.AllocFailed;
+        const archive_path = std.fmt.allocPrint(alloc, "{s}/ffx.tar.gz", .{tmp_dir}) catch return error.AllocFailed;
         defer alloc.free(archive_path);
 
-        const archive_url = std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
+        const archive_url = std.fmt.allocPrint(alloc, "{s}/{s}/ffx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
         defer alloc.free(archive_url);
 
         helpers.downloadFileStreaming(&client, archive_url, archive_path) catch return error.DownloadFailed;
 
         if (self.should_stop.load(.acquire)) return error.Cancelled;
 
-        const checksum_url = std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
+        const checksum_url = std.fmt.allocPrint(alloc, "{s}/{s}/ffx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
         defer alloc.free(checksum_url);
 
         helpers.verifyChecksum(&client, archive_path, checksum_url) catch return error.ChecksumFailed;
@@ -267,7 +239,7 @@ pub const AutoUpgrade = struct {
 
         if (self.should_stop.load(.acquire)) return error.Cancelled;
 
-        const extracted_bin = std.fmt.allocPrint(alloc, "{s}/fx", .{tmp_dir}) catch return error.AllocFailed;
+        const extracted_bin = std.fmt.allocPrint(alloc, "{s}/ffx", .{tmp_dir}) catch return error.AllocFailed;
         defer alloc.free(extracted_bin);
 
         var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -301,9 +273,9 @@ test "selected release channel is owned by the upgrade runtime" {
 }
 
 test "development build paths disable auto upgrade" {
-    try std.testing.expect(isDevelopmentBuildPath("/repo/zig-out/bin/fx"));
-    try std.testing.expect(isDevelopmentBuildPath("C:\\repo\\zig-out\\bin\\fx.exe"));
-    try std.testing.expect(!isDevelopmentBuildPath("/Users/me/.local/bin/fx"));
+    try std.testing.expect(isDevelopmentBuildPath("/repo/zig-out/bin/ffx"));
+    try std.testing.expect(isDevelopmentBuildPath("C:\\repo\\zig-out\\bin\\ffx.exe"));
+    try std.testing.expect(!isDevelopmentBuildPath("/Users/me/.local/bin/ffx"));
 }
 
 test "statusLabel downloading shows ellipsis" {
@@ -320,7 +292,7 @@ test "statusLabel ready explains ctrl+g reload" {
     au.setState(.ready);
     var buf: [64]u8 = undefined;
     const label = au.statusLabel(&buf);
-    try std.testing.expectEqualStrings("update ready: ctrl+g to reload", label);
+    try std.testing.expectEqualStrings("Update installed: ctrl+g to reload", label);
 }
 
 test "setLatestVersion stores normalized version" {
@@ -332,23 +304,15 @@ test "setLatestVersion stores normalized version" {
     try std.testing.expect(au.takeRenderDirty());
 }
 
-test "relaunch request owns its path and previous revision and is consumed once" {
+test "relaunch request owns the executable path and is consumed once" {
     var au = AutoUpgrade{};
-    var path = [_]u8{ '/', 't', 'm', 'p', '/', 'f', 'x' };
-    var revision = [_]u8{'1'} ** 40;
-    au.configure_channel(.dev);
-    au.setPreviousRevision(&revision);
-    try au.requestRelaunch(&path);
-    path[1] = 'x';
-    revision[0] = '2';
+    var source = [_]u8{ '/', 't', 'm', 'p', '/', 'f', 'f', 'x' };
+    try au.requestRelaunch(&source);
+    source[1] = 'x';
 
     const request = au.takeRelaunchRequest() orelse
         return error.TestExpectedRelaunchRequest;
-    try std.testing.expectEqualStrings("/tmp/fx", request.executablePath());
-    try std.testing.expectEqualStrings(
-        "1111111111111111111111111111111111111111",
-        request.previousRevision().?,
-    );
+    try std.testing.expectEqualStrings("/tmp/ffx", request.executablePath());
     try std.testing.expect(au.takeRelaunchRequest() == null);
 }
 

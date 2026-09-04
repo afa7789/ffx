@@ -14,7 +14,7 @@ The oracle is byte replay plus terminal-owned text/grid capture.
 Render Lab is designed to answer these questions:
 
 - Did the freshly built Fx binary emit coherent terminal bytes?
-- Did replaying those bytes through `fx replay` produce the expected model?
+- Did replaying those bytes through `ffx replay` produce the expected model?
 - Did the real terminal-owned text/grid settle after each user-visible event?
 - Did old shell scrollback stay outside Fx-owned viewport rows?
 - Did quit, relaunch, resize, and native clear-scrollback actions preserve the intended boundaries?
@@ -48,7 +48,7 @@ Zig VT tests
 tmux Render Lab
   Deterministic real PTY coverage. Good for resize, scrollback, cursor, ANSI, relaunch.
 
-FX_RECORD tape and fx replay
+FFX_RECORD tape and ffx replay
   Byte-level recording of what Fx wrote plus replay through the built-in virtual terminal.
 
 Native Render Lab
@@ -66,7 +66,7 @@ It drives one tmux shell through this shape:
 
 1. Start a shell with temp `HOME`, `ZDOTDIR`, history, and workdir.
 2. Print shell markers and wrapped lines before Fx starts.
-3. Launch the freshly built `zig-out/bin/fx`.
+3. Launch the freshly built `zig-out/bin/ffx`.
 4. Run no-key slash commands such as `/status`.
 5. Quit Fx.
 6. Print more shell markers in the same shell.
@@ -78,16 +78,16 @@ It drives one tmux shell through this shape:
 Command:
 
 ```bash
-cd /Users/example/Developer/Fx/fx-worktree-rendering
+cd /Users/example/Developer/Fx/ffx-worktree-rendering
 zig build
 cd tests/e2e
-bun run render-lab -- --scenario same-shell-relaunch --runs 1 --out /private/tmp/fx-render-lab
+bun run render-lab -- --scenario same-shell-relaunch --runs 1 --out /private/tmp/ffx-render-lab
 ```
 
 Default test wrapper:
 
 ```bash
-cd /Users/example/Developer/Fx/fx-worktree-rendering/tests/e2e
+cd /Users/example/Developer/Fx/ffx-worktree-rendering/tests/e2e
 bun test tui-render-lab.test.ts
 ```
 
@@ -98,7 +98,7 @@ This wrapper is CI-safe apart from requiring tmux. It does not require `AI_GATEW
 List available scenarios:
 
 ```bash
-cd /Users/example/Developer/Fx/fx-worktree-rendering/tests/e2e
+cd /Users/example/Developer/Fx/ffx-worktree-rendering/tests/e2e
 bun run render-lab -- --list-scenarios
 ```
 
@@ -116,21 +116,21 @@ Native scenarios are opt-in because they open and control real terminal applicat
 Common gate:
 
 ```bash
-FX_RENDER_LAB_NATIVE=1 bun run render-lab -- --scenario native-terminal-app-relaunch --runs 1 --out /private/tmp/fx-native
+FFX_RENDER_LAB_NATIVE=1 bun run render-lab -- --scenario native-terminal-app-relaunch --runs 1 --out /private/tmp/ffx-native
 ```
 
 Ghostty and Warp use clipboard-based selected-text capture, so they require an extra explicit gate:
 
 ```bash
-FX_RENDER_LAB_NATIVE=1 FX_RENDER_LAB_NATIVE_ALLOW_CLIPBOARD=1 \
-  bun run render-lab -- --scenario native-ghostty-relaunch --runs 1 --out /private/tmp/fx-native-ghostty
+FFX_RENDER_LAB_NATIVE=1 FFX_RENDER_LAB_NATIVE_ALLOW_CLIPBOARD=1 \
+  bun run render-lab -- --scenario native-ghostty-relaunch --runs 1 --out /private/tmp/ffx-native-ghostty
 ```
 
 The Command-K scenario requires a second gate because it triggers real terminal clear-scrollback behavior:
 
 ```bash
-FX_RENDER_LAB_NATIVE=1 FX_RENDER_LAB_NATIVE_COMMAND_K=1 \
-  bun run render-lab -- --scenario native-terminal-app-command-k --runs 1 --out /private/tmp/fx-native-command-k
+FFX_RENDER_LAB_NATIVE=1 FFX_RENDER_LAB_NATIVE_COMMAND_K=1 \
+  bun run render-lab -- --scenario native-terminal-app-command-k --runs 1 --out /private/tmp/ffx-native-command-k
 ```
 
 Do not treat tmux clear-history as proof for Terminal.app or Ghostty Command-K. Tmux can approximate a clear, but Command-K is a UI-level terminal action.
@@ -204,7 +204,7 @@ Important files:
 - `runtime-evidence.json`: compact witness summary for every frame.
 - `trace.log`: Fx debug trace for repaint, resize, footer, input, and related scopes.
 - `render.fxtape`: byte-level replay tape produced by the freshly built Fx binary.
-- `replay-summary.json`: structured `fx replay` output.
+- `replay-summary.json`: structured `ffx replay` output.
 - `final-grid.txt`: replay golden output for the final tape state.
 - `failure.md`: short human-readable failure list.
 - `repro.sh`: command to recreate the scenario.
@@ -252,7 +252,7 @@ zig build
 
 ```bash
 cd tests/e2e
-bun run render-lab -- --scenario same-shell-relaunch --runs 1 --out /private/tmp/fx-render-lab
+bun run render-lab -- --scenario same-shell-relaunch --runs 1 --out /private/tmp/ffx-render-lab
 ```
 
 3. Open `failure.md`. If it has failures, inspect the first one.
@@ -298,7 +298,7 @@ More than one footer block is visible. Usually points to footer cleanup, viewpor
 
 A marker appeared in a footer-owned row. This usually means transcript and footer row ownership overlapped.
 
-`shell-marker-in-fx-band`
+`shell-marker-in-ffx-band`
 
 A shell marker was found inside the active Fx viewport band. This is the primary old-scrollback-replayed-as-Fx-content failure.
 
@@ -332,21 +332,21 @@ Terminal.app:
 
 - Uses AppleScript `contents` from a native Terminal window.
 - Does not require clipboard capture for the relaunch scenario.
-- Command-K requires System Events and the explicit `FX_RENDER_LAB_NATIVE_COMMAND_K=1` gate.
+- Command-K requires System Events and the explicit `FFX_RENDER_LAB_NATIVE_COMMAND_K=1` gate.
 - Current native smoke exposed an Apple Terminal path where the first shell marker was missing by final relaunch. Keep that failure visible until the product behavior is fixed or the invariant is intentionally revised.
 
 Ghostty:
 
 - Uses real Ghostty app launch.
 - Uses selected-text clipboard capture.
-- Requires `FX_RENDER_LAB_NATIVE_ALLOW_CLIPBOARD=1`.
+- Requires `FFX_RENDER_LAB_NATIVE_ALLOW_CLIPBOARD=1`.
 - Useful when Ghostty scrollback, resize, or terminal-specific behavior diverges from tmux.
 
 Warp:
 
 - Uses real Warp app launch.
 - Uses selected-text clipboard capture.
-- Requires `FX_RENDER_LAB_NATIVE_ALLOW_CLIPBOARD=1`.
+- Requires `FFX_RENDER_LAB_NATIVE_ALLOW_CLIPBOARD=1`.
 - Warp private OSC/DCS behavior should be metadata only unless a future adapter can expose a stable byte/text contract for it.
 
 ## Adding A Scenario
@@ -383,12 +383,12 @@ zig build test
 zig fmt src/
 cd tests/e2e
 bun test tui-render-lab.test.ts
-bun run render-lab -- --scenario same-shell-relaunch --runs 1 --out /private/tmp/fx-render-lab
-../../zig-out/bin/fx status --json
+bun run render-lab -- --scenario same-shell-relaunch --runs 1 --out /private/tmp/ffx-render-lab
+../../zig-out/bin/ffx status --json
 git diff --check
 ```
 
-Use the exact freshly built binary from this checkout. Do not run bare `fx`.
+Use the exact freshly built binary from this checkout. Do not run bare `ffx`.
 
 If the bug was reported in a native terminal, also run the matching native scenario and include the artifact path in the run notes.
 

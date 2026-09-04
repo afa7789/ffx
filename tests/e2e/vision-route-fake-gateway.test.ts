@@ -17,13 +17,12 @@ import {
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { FFX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
 const GLM_MODEL = "zai/glm-5.2-fast";
 const GEMINI_MODEL = "google/gemini-2.5-flash";
-const KIMI_MODEL = "moonshotai/kimi-k3";
 const IMAGE_PATH = join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png");
 
 type CapturedRequest = {
@@ -202,7 +201,6 @@ function expectVisionResponseFormat(body: string, imageCount: number) {
 function startImageGateway(
   responses: Response[],
   onChatRequest?: (index: number, body: string) => void,
-  catalogResponse?: Response,
 ) {
   const chatRequests: CapturedRequest[] = [];
   let catalogRequests = 0;
@@ -212,16 +210,10 @@ function startImageGateway(
       const url = new URL(req.url);
       if (url.pathname === "/coding-agent/v1/models") {
         catalogRequests += 1;
-        if (catalogResponse) return catalogResponse.clone();
         return Response.json({
           data: [
             {
               id: GEMINI_MODEL,
-              type: "language",
-              tags: ["vision", "file-input", "tool-use"],
-            },
-            {
-              id: KIMI_MODEL,
               type: "language",
               tags: ["vision", "file-input", "tool-use"],
             },
@@ -255,12 +247,12 @@ function startImageGateway(
 }
 
 function createIsolatedRoot() {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-vision-route-e2e-")));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-vision-route-e2e-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ permission: {} }));
+  writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({ permission: {} }));
   return { root, home, workspace: realpathSync(workspace) };
 }
 
@@ -295,7 +287,7 @@ function writeLegacyZeroImageSession(
   sessionId: string,
   imagePaths: [string, string, string, string],
 ) {
-  const sessionDir = join(root.home, ".fx", "sessions", sessionId);
+  const sessionDir = join(root.home, ".ffx", "sessions", sessionId);
   mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
   writeFileSync(
     join(sessionDir, "session.json"),
@@ -365,11 +357,11 @@ function fakeGatewayEnv(
 ) {
   return {
     HOME: root.home,
-    AI_GATEWAY_API_KEY: "fake-vision-route-key",
+    FFX_PROVIDER_API_KEY: "fake-vision-route-key",
     VERCEL_OIDC_TOKEN: undefined,
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: model,
+    FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_MODEL: model,
   };
 }
 
@@ -391,12 +383,12 @@ async function expectNonRegularVisionPathFailure(
   let session: TmuxSession | null = null;
   try {
     session = await TmuxSession.create({
-      cmd: FX_BIN,
+      cmd: FFX_BIN,
       cwd: root.workspace,
       env: {
         ...fakeGatewayEnv(root, gateway, GLM_MODEL),
-        FX_PERMISSION_MODE: "ask",
-        FX_AUTO_UPGRADE: "0",
+        FFX_PERMISSION_MODE: "ask",
+        FFX_AUTO_UPGRADE: "0",
         NO_COLOR: "1",
       },
       stderrPath,
@@ -436,7 +428,7 @@ async function expectChangedCanonicalVisionPathFailure(
   writeMarkedImage(targetPath, "TMUX_APPROVED_TARGET_A");
   symlinkSync(targetPath, approvedPath);
   writeFileSync(
-    join(root.home, ".fx", "settings.json"),
+    join(root.home, ".ffx", "settings.json"),
     JSON.stringify({ permission_mode: "ask", permission: {} }),
   );
   const gateway = startImageGateway([
@@ -452,12 +444,12 @@ async function expectChangedCanonicalVisionPathFailure(
   let session: TmuxSession | null = null;
   try {
     session = await TmuxSession.create({
-      cmd: FX_BIN,
+      cmd: FFX_BIN,
       cwd: root.workspace,
       env: {
         ...fakeGatewayEnv(root, gateway, GLM_MODEL),
-        FX_PERMISSION_MODE: "ask",
-        FX_AUTO_UPGRADE: "0",
+        FFX_PERMISSION_MODE: "ask",
+        FFX_AUTO_UPGRADE: "0",
         NO_COLOR: "1",
       },
       stderrPath,
@@ -563,7 +555,7 @@ function toolResultText(body: string, toolCallId: string): string {
 
 describe("Vision route fake Gateway", () => {
   test(
-    "fx ask rejects missing images before Gateway startup in text and JSON modes",
+    "ffx ask rejects missing images before Gateway startup in text and JSON modes",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startImageGateway([]);
@@ -634,11 +626,11 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(0);
 
         session = await TmuxSession.create({
-          cmd: FX_BIN,
+          cmd: FFX_BIN,
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway, GLM_MODEL),
-            FX_AUTO_UPGRADE: "0",
+            FFX_AUTO_UPGRADE: "0",
             NO_COLOR: "1",
           },
           stderrPath,
@@ -665,7 +657,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask gates GLM images through Vision without leaking paths",
+    "ffx ask gates GLM images through Vision without leaking paths",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
@@ -724,7 +716,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask recovers when the model rejects the post-Vision prompt as assistant prefill",
+    "ffx ask recovers when the model rejects the post-Vision prompt as assistant prefill",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
@@ -788,13 +780,13 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask executes path-source Vision and cleans transient snapshots without failure telemetry",
+    "ffx ask executes path-source Vision and cleans transient snapshots without failure telemetry",
     async () => {
       const root = createIsolatedRoot();
       const imagePath = join(root.workspace, "path-source.png");
       const tracePath = join(root.root, "trace.log");
       const snapshotsBefore = readdirSync("/tmp")
-        .filter((name) => name.startsWith("fx-image-snapshots-"))
+        .filter((name) => name.startsWith("ffx-image-snapshots-"))
         .sort();
       writeMarkedImage(imagePath, "HEADLESS_PATH_SOURCE");
       const gateway = startImageGateway([
@@ -819,8 +811,8 @@ describe("Vision route fake Gateway", () => {
             cwd: root.workspace,
             env: {
               ...fakeGatewayEnv(root, gateway, GLM_MODEL),
-              FX_TRACE_LOG: tracePath,
-              FX_TRACE_SCOPES: "images",
+              FFX_TRACE_LOG: tracePath,
+              FFX_TRACE_SCOPES: "images",
             },
             timeoutMs: TIMEOUT,
           },
@@ -838,7 +830,7 @@ describe("Vision route fake Gateway", () => {
         expect(readFileSync(tracePath, "utf8")).not.toContain("snapshot_cleanup_failed");
         expect(
           readdirSync("/tmp")
-            .filter((name) => name.startsWith("fx-image-snapshots-"))
+            .filter((name) => name.startsWith("ffx-image-snapshots-"))
             .sort(),
         ).toEqual(snapshotsBefore);
       } finally {
@@ -959,8 +951,8 @@ describe("Vision route fake Gateway", () => {
           for (const request of gateway.chatRequests) {
             for (const imagePath of fixture.paths) expect(request.body).not.toContain(imagePath);
             expect(request.body).not.toContain("data:image");
-            expect(request.body).not.toContain("fx-image-snapshots");
-            expect(request.body).not.toContain(".fx/sessions");
+            expect(request.body).not.toContain("ffx-image-snapshots");
+            expect(request.body).not.toContain(".ffx/sessions");
           }
         } finally {
           gateway.stop();
@@ -1029,7 +1021,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask preserves native image parts for Gemini",
+    "ffx ask preserves native image parts for Gemini",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
@@ -1059,7 +1051,6 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(1);
         expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
         expect(gateway.chatRequests[0].body).toContain('"type":"file"');
-        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
         expectScopedImageContext(gateway.chatRequests[0].body, fixture);
         expect(gateway.chatRequests[0].body).not.toContain(fixture.imagePath);
       } finally {
@@ -1071,49 +1062,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask uses Kimi native vision without Vision tool",
-    async () => {
-      const root = createIsolatedRoot();
-      const fixture = createScopedImageFixture(root);
-      const gateway = startImageGateway([sseText("Kimi native image answer")]);
-      try {
-        const result = await runFx(
-          [
-            "ask",
-            "--json",
-            "--no-save",
-            "--no-color",
-            "--image",
-            fixture.imagePath,
-            "Describe the attached image.",
-          ],
-          {
-            cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, KIMI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-
-        const json = parseFxJson(result);
-        expect(json.exit_code).toBe(0);
-        expect(json.output).toContain("Kimi native image answer");
-        expect(gateway.catalogRequests).toBe(1);
-        expect(gateway.chatRequests).toHaveLength(1);
-        expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(KIMI_MODEL);
-        expect(gateway.chatRequests[0].body).toContain('"type":"file"');
-        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
-        expectScopedImageContext(gateway.chatRequests[0].body, fixture);
-        expect(gateway.chatRequests[0].body).not.toContain(fixture.imagePath);
-      } finally {
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx ask normalizes encoded-oversized native images on macOS and rejects elsewhere",
+    "ffx ask normalizes encoded-oversized native images on macOS and rejects elsewhere",
     async () => {
       const root = createIsolatedRoot();
       const oversizedPath = join(root.workspace, "encoded-oversized.png");
@@ -1187,7 +1136,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "saved unadvertised native Vision rejection recovers and is filtered after resume",
+    "saved native ID rejection recovers immediately and is filtered after resume",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
@@ -1221,7 +1170,8 @@ describe("Vision route fake Gateway", () => {
         expect(first.stderr).not.toContain("Inspecting images");
         expect(first.stderr).not.toContain("Vision is unavailable right now");
         expect(gateway.chatRequests).toHaveLength(2);
-        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
+        expect(gateway.chatRequests[0].body).toContain('"name":"vision"');
+        expect(gateway.chatRequests[0].body).toContain('"paths":{"type":"array"');
         expect(gateway.chatRequests[0].body).not.toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[0].body).toContain('"type":"file"');
 
@@ -1276,7 +1226,8 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(3);
         const resumedRequest = gateway.chatRequests[2];
         expect(filePartCount(resumedRequest.body)).toBe(1);
-        expect(resumedRequest.body).not.toContain('"name":"vision"');
+        expect(resumedRequest.body).toContain('"name":"vision"');
+        expect(resumedRequest.body).toContain('"paths":{"type":"array"');
         expect(resumedRequest.body).not.toContain('"toolChoice":{"type":"required"}');
         expect(resumedRequest.body).not.toContain('"toolName":"vision"');
         expect(resumedRequest.body).not.toContain("native_vision");
@@ -1363,7 +1314,7 @@ describe("Vision route fake Gateway", () => {
           expect(savedJson.output).toContain(`saved ${entry.name}`);
           expect(gateway.chatRequests).toHaveLength(1);
 
-          const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
+          const imageDir = join(root.home, ".ffx", "sessions", savedJson.session_id, "images");
           const snapshotNames = readdirSync(imageDir).filter((name) => name.endsWith(".bin"));
           expect(snapshotNames).toHaveLength(1);
           entry.damage(join(imageDir, snapshotNames[0]));
@@ -1422,7 +1373,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask applies image_adapter_output_bytes to Vision provider capture",
+    "ffx ask applies image_adapter_output_bytes to Vision provider capture",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
@@ -1482,7 +1433,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "text-only GLM ask resolves context capacity and exposes Vision without Vision IO",
+    "text-only GLM ask skips image capability and Vision IO",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startImageGateway([sseText("text only answer")]);
@@ -1499,150 +1450,10 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.exit_code).toBe(0);
         expect(json.output).toContain("text only answer");
-        expect(gateway.catalogRequests).toBe(1);
+        expect(gateway.catalogRequests).toBe(0);
         expect(gateway.chatRequests).toHaveLength(1);
         expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GLM_MODEL);
         expect(gateway.chatRequests[0].body).not.toContain('"type":"file"');
-        expect(gateway.chatRequests[0].body).toContain('"name":"vision"');
-      } finally {
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "text-only Kimi ask resolves capability and hides Vision",
-    async () => {
-      const root = createIsolatedRoot();
-      const gateway = startImageGateway([sseText("Kimi text only answer")]);
-      try {
-        const result = await runFx(
-          ["ask", "--json", "--no-save", "--no-color", "Reply exactly OK."],
-          {
-            cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, KIMI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-
-        const json = parseFxJson(result);
-        expect(json.exit_code).toBe(0);
-        expect(json.output).toContain("Kimi text only answer");
-        expect(gateway.catalogRequests).toBe(1);
-        expect(gateway.chatRequests).toHaveLength(1);
-        expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(KIMI_MODEL);
-        expect(gateway.chatRequests[0].body).not.toContain('"type":"file"');
-        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
-      } finally {
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "catalog failure hides Vision and rejects unresolved image input",
-    async () => {
-      const textRoot = createIsolatedRoot();
-      const textGateway = startImageGateway(
-        [sseText("text answer without Vision")],
-        undefined,
-        new Response("catalog unavailable", { status: 503 }),
-      );
-      try {
-        const textResult = await runFx(
-          ["ask", "--json", "--no-save", "--no-color", "Reply exactly OK."],
-          {
-            cwd: textRoot.workspace,
-            env: fakeGatewayEnv(textRoot, textGateway, KIMI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-        const textJson = parseFxJson(textResult);
-        expect(textJson.exit_code).toBe(0);
-        expect(textJson.output).toContain("text answer without Vision");
-        expect(textGateway.catalogRequests).toBe(1);
-        expect(textGateway.chatRequests).toHaveLength(1);
-        expect(textGateway.chatRequests[0].body).not.toContain('"name":"vision"');
-      } finally {
-        textGateway.stop();
-        rmSync(textRoot.root, { recursive: true, force: true });
-      }
-
-      const imageRoot = createIsolatedRoot();
-      const fixture = createScopedImageFixture(imageRoot);
-      const imageGateway = startImageGateway(
-        [],
-        undefined,
-        new Response("catalog unavailable", { status: 503 }),
-      );
-      try {
-        const imageResult = await runFx(
-          [
-            "ask",
-            "--json",
-            "--no-save",
-            "--no-color",
-            "--image",
-            fixture.imagePath,
-            "Describe the attached image.",
-          ],
-          {
-            cwd: imageRoot.workspace,
-            env: fakeGatewayEnv(imageRoot, imageGateway, KIMI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-        const imageJson = parseFxErrorJson(imageResult);
-        expect(imageJson.error).toContain("ModelImageCapabilityUnavailable");
-        expect(imageGateway.catalogRequests).toBe(1);
-        expect(imageGateway.chatRequests).toHaveLength(0);
-      } finally {
-        imageGateway.stop();
-        rmSync(imageRoot.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "catalog failure explains unresolved image capability in text mode",
-    async () => {
-      const root = createIsolatedRoot();
-      const fixture = createScopedImageFixture(root);
-      const gateway = startImageGateway(
-        [],
-        undefined,
-        new Response("catalog unavailable", { status: 503 }),
-      );
-      try {
-        const result = await runFx(
-          [
-            "ask",
-            "--no-save",
-            "--no-color",
-            "--image",
-            fixture.imagePath,
-            "Describe the attached image.",
-          ],
-          {
-            cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, KIMI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-
-        expect(result.code).toBe(1);
-        expect(result.stdout).toBe("");
-        expect(result.stderr).toBe(
-          "fx ask: Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.\n",
-        );
-        expect(result.stderr).not.toContain("ModelImageCapabilityUnavailable");
-        expect(gateway.catalogRequests).toBe(1);
-        expect(gateway.chatRequests).toHaveLength(0);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1802,7 +1613,8 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests[0].body).toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[0].body).toContain("[Image #1]");
         expect(gateway.chatRequests[3].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
-        expect(gateway.chatRequests[3].body).not.toContain('"name":"vision"');
+        expect(gateway.chatRequests[3].body).toContain('"name":"vision"');
+        expect(gateway.chatRequests[3].body).toContain('"paths":{"type":"array"');
         expect(gateway.chatRequests[3].body).not.toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[3].body).not.toContain('"toolName":"vision"');
         expect(gateway.chatRequests[3].body).not.toContain("first image evidence");
@@ -1899,7 +1711,8 @@ describe("Vision route fake Gateway", () => {
         expect(nativeJson.tool_calls).toHaveLength(0);
         expect(gateway.chatRequests).toHaveLength(1);
         expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
-        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
+        expect(gateway.chatRequests[0].body).toContain('"name":"vision"');
+        expect(gateway.chatRequests[0].body).toContain('"paths":{"type":"array"');
         expect(gateway.chatRequests[0].body).not.toContain('"toolChoice":{"type":"required"}');
         expect(filePartCount(gateway.chatRequests[0].body)).toBe(5);
         expect(gateway.chatRequests[0].body).toContain("Legacy first image: [Image #1]");
@@ -2253,7 +2066,7 @@ describe("Vision route fake Gateway", () => {
           },
         );
         const savedJson = parseFxJson(saved);
-        const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
+        const imageDir = join(root.home, ".ffx", "sessions", savedJson.session_id, "images");
         const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
         expect(firstSnapshot).toBeDefined();
         writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
@@ -2339,7 +2152,7 @@ describe("Vision route fake Gateway", () => {
           },
         );
         const savedJson = parseFxJson(saved);
-        const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
+        const imageDir = join(root.home, ".ffx", "sessions", savedJson.session_id, "images");
         const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
         expect(firstSnapshot).toBeDefined();
         writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
@@ -2471,7 +2284,7 @@ describe("Vision route fake Gateway", () => {
       const imagePath = join(desktop, "test.png");
       writeMarkedImage(imagePath, "TMUX_AT_HOME_IMAGE");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const gateway = startImageGateway([
@@ -2484,12 +2297,12 @@ describe("Vision route fake Gateway", () => {
       let session: TmuxSession | null = null;
       try {
         session = await TmuxSession.create({
-          cmd: FX_BIN,
+          cmd: FFX_BIN,
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway, GLM_MODEL),
-            FX_PERMISSION_MODE: "ask",
-            FX_AUTO_UPGRADE: "0",
+            FFX_PERMISSION_MODE: "ask",
+            FFX_AUTO_UPGRADE: "0",
             NO_COLOR: "1",
           },
           stderrPath,
@@ -2542,11 +2355,11 @@ describe("Vision route fake Gateway", () => {
       let session: TmuxSession | null = null;
       try {
         session = await TmuxSession.create({
-          cmd: FX_BIN,
+          cmd: FFX_BIN,
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway, GLM_MODEL),
-            FX_AUTO_UPGRADE: "0",
+            FFX_AUTO_UPGRADE: "0",
             NO_COLOR: "1",
           },
           stderrPath,
@@ -2586,7 +2399,7 @@ describe("Vision route fake Gateway", () => {
       const imagePath = join(desktop, "test.png");
       writeMarkedImage(imagePath, "TMUX_PATH_SOURCE_APPROVAL");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const gateway = startImageGateway([
@@ -2603,12 +2416,12 @@ describe("Vision route fake Gateway", () => {
       let session: TmuxSession | null = null;
       try {
         session = await TmuxSession.create({
-          cmd: FX_BIN,
+          cmd: FFX_BIN,
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway, GLM_MODEL),
-            FX_PERMISSION_MODE: "ask",
-            FX_AUTO_UPGRADE: "0",
+            FFX_PERMISSION_MODE: "ask",
+            FFX_AUTO_UPGRADE: "0",
             NO_COLOR: "1",
           },
           stderrPath,
@@ -2655,7 +2468,7 @@ describe("Vision route fake Gateway", () => {
       const payload = writeMarkedImage(sourcePath, "TMUX_HARD_LINKED_IMAGE");
       linkSync(sourcePath, approvedPath);
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const gateway = startImageGateway([
@@ -2672,12 +2485,12 @@ describe("Vision route fake Gateway", () => {
       let session: TmuxSession | null = null;
       try {
         session = await TmuxSession.create({
-          cmd: FX_BIN,
+          cmd: FFX_BIN,
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway, GLM_MODEL),
-            FX_PERMISSION_MODE: "ask",
-            FX_AUTO_UPGRADE: "0",
+            FFX_PERMISSION_MODE: "ask",
+            FFX_AUTO_UPGRADE: "0",
             NO_COLOR: "1",
           },
           stderrPath,
@@ -2726,7 +2539,7 @@ describe("Vision route fake Gateway", () => {
       const payloadB = writeMarkedImage(targetB, "TMUX_RETARGETED_TARGET_B");
       symlinkSync(targetA, approvedPath);
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const gateway = startImageGateway([
@@ -2743,12 +2556,12 @@ describe("Vision route fake Gateway", () => {
       let session: TmuxSession | null = null;
       try {
         session = await TmuxSession.create({
-          cmd: FX_BIN,
+          cmd: FFX_BIN,
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway, GLM_MODEL),
-            FX_PERMISSION_MODE: "ask",
-            FX_AUTO_UPGRADE: "0",
+            FFX_PERMISSION_MODE: "ask",
+            FFX_AUTO_UPGRADE: "0",
             NO_COLOR: "1",
           },
           stderrPath,
@@ -2926,7 +2739,7 @@ describe("Vision route fake Gateway", () => {
       const imagePath = join(root.workspace, "feedback.png");
       writeMarkedImage(imagePath, "TMUX_PERMISSION_FEEDBACK");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const feedback = "Do not modify any more files.";
@@ -2941,12 +2754,12 @@ describe("Vision route fake Gateway", () => {
       let session: TmuxSession | null = null;
       try {
         session = await TmuxSession.create({
-          cmd: FX_BIN,
+          cmd: FFX_BIN,
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway, GLM_MODEL),
-            FX_PERMISSION_MODE: "ask",
-            FX_AUTO_UPGRADE: "0",
+            FFX_PERMISSION_MODE: "ask",
+            FFX_AUTO_UPGRADE: "0",
             NO_COLOR: "1",
           },
           stderrPath,
@@ -2959,7 +2772,7 @@ describe("Vision route fake Gateway", () => {
         await session.sendText(rootRequest);
         await session.waitForText("Would you like to allow this action?", TIMEOUT);
         await session.sendKeys("Tab");
-        await session.waitForText("Yes, and tell fx what to do next", TIMEOUT);
+        await session.waitForText("Yes, and tell ffx what to do next", TIMEOUT);
         await session.sendLiteralText(feedback);
         await session.waitForText(`Yes, ${feedback}`, TIMEOUT);
         await session.sendKeys("Enter");
@@ -2972,7 +2785,7 @@ describe("Vision route fake Gateway", () => {
         expect(selectedFollowup).toContain(rootRequest);
         expect(selectedFollowup).not.toContain(imagePath);
 
-        const sessionsRoot = join(root.home, ".fx", "sessions");
+        const sessionsRoot = join(root.home, ".ffx", "sessions");
         const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
           .filter((entry) => entry.isDirectory() && entry.name !== "latest")
           .map((entry) => entry.name);
@@ -3004,7 +2817,7 @@ describe("Vision route fake Gateway", () => {
       const firstMutatedPayload = writeMarkedImage(firstMutatedPath, "TMUX_PERMISSION_B");
       writeMarkedImage(secondImagePath, "TMUX_OUTAGE_A");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const gateway = startImageGateway([
@@ -3022,12 +2835,12 @@ describe("Vision route fake Gateway", () => {
       let session: TmuxSession | null = null;
       try {
         session = await TmuxSession.create({
-          cmd: FX_BIN,
+          cmd: FFX_BIN,
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway, GLM_MODEL),
-            FX_PERMISSION_MODE: "ask",
-            FX_AUTO_UPGRADE: "0",
+            FFX_PERMISSION_MODE: "ask",
+            FFX_AUTO_UPGRADE: "0",
             NO_COLOR: "1",
           },
           stderrPath,

@@ -113,13 +113,13 @@ async function startFakeGateway(responses: Response[]) {
 }
 
 function createIsolatedRoot(domains = ["example.com"]) {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-web-fetch-live-")));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-web-fetch-live-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({
       model: OUTER_MODEL,
       permission: {
@@ -136,16 +136,16 @@ function fakeGatewayEnv(
 ) {
   return {
     HOME: root.home,
-    AI_GATEWAY_API_KEY: "fake-live-web-fetch-key",
+    FFX_PROVIDER_API_KEY: "fake-live-web-fetch-key",
     VERCEL_OIDC_TOKEN: undefined,
-    FX_AUTO_UPGRADE: "0",
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: OUTER_MODEL,
+    FFX_AUTO_UPGRADE: "0",
+    FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_MODEL: OUTER_MODEL,
   };
 }
 
-describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public URL", () => {
+describe.skipIf(process.env.FFX_WEB_FETCH_LIVE !== "1")("live web_fetch public URL", () => {
   // These mutable endpoints are operational probes, not deterministic HTTP
   // framing proof. The transport/framing contract is covered by Zig fixtures.
   for (const probe of [
@@ -168,8 +168,8 @@ describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public UR
               cwd: root.workspace,
               env: {
                 ...fakeGatewayEnv(root, gateway),
-                FX_TRACE_LOG: traceLog,
-                FX_TRACE_SCOPES: "tool",
+                FFX_TRACE_LOG: traceLog,
+                FFX_TRACE_SCOPES: "tool",
               },
               timeoutMs: TIMEOUT,
             },
@@ -177,7 +177,7 @@ describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public UR
 
           if (result.code !== 0) {
             throw new Error(
-              `fx exited ${result.code}\nstdout: ${result.stdout.slice(-4000)}\nstderr: ${result.stderr.slice(-4000)}`,
+              `ffx exited ${result.code}\nstdout: ${result.stdout.slice(-4000)}\nstderr: ${result.stderr.slice(-4000)}`,
             );
           }
           const json = JSON.parse(result.stdout.trim()) as {
@@ -248,7 +248,7 @@ describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public UR
 
         if (result.code !== 0) {
           throw new Error(
-            `fx exited ${result.code}\nstdout: ${result.stdout.slice(-4000)}\nstderr: ${result.stderr.slice(-4000)}`,
+            `ffx exited ${result.code}\nstdout: ${result.stdout.slice(-4000)}\nstderr: ${result.stderr.slice(-4000)}`,
           );
         }
         const json = JSON.parse(result.stdout.trim()) as {
@@ -314,7 +314,7 @@ describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public UR
 
         if (result.code !== 0) {
           throw new Error(
-            `fx exited ${result.code}\nstdout: ${result.stdout.slice(-4000)}\nstderr: ${result.stderr.slice(-4000)}`,
+            `ffx exited ${result.code}\nstdout: ${result.stdout.slice(-4000)}\nstderr: ${result.stderr.slice(-4000)}`,
           );
         }
         const json = JSON.parse(result.stdout.trim()) as {
@@ -340,7 +340,7 @@ describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public UR
         expect(fetch?.web_fetch?.cache_hit).toBe(false);
         expect(fetch?.web_fetch?.artifact).toBe("stored");
 
-        const sessionDir = join(root.home, ".fx", "sessions", json.session_id);
+        const sessionDir = join(root.home, ".ffx", "sessions", json.session_id);
         const artifactDir = join(sessionDir, "artifacts", "web-fetch");
         expect(existsSync(artifactDir)).toBe(true);
         const files = readdirSync(artifactDir).filter((name) => name.startsWith("artifact-"));

@@ -18,10 +18,10 @@ fn setRecvTimeout(conn: *std.http.Client.Connection) void {
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 }
 
-pub const cdn_base = "https://releases.fx.sh";
+pub const cdn_base = "https://releases.ffx.sh";
 
 pub fn resolveCdnBase() []const u8 {
-    if (io_mod.getenv("FX_E2E_UPGRADE_BASE_URL")) |url| {
+    if (io_mod.getenv("FFX_E2E_UPGRADE_BASE_URL")) |url| {
         if (isLoopbackE2eUpgradeBase(url)) return url;
     }
     return cdn_base;
@@ -329,12 +329,12 @@ test "E2E upgrade base accepts only explicit IPv4 loopback origins" {
     try std.testing.expect(!isLoopbackE2eUpgradeBase("http://localhost:1234"));
 }
 
-test "production upgrade base uses the fx release domain" {
-    try std.testing.expectEqualStrings("https://releases.fx.sh", resolveCdnBase());
+test "production upgrade base uses the ffx release domain" {
+    try std.testing.expectEqualStrings("https://releases.ffx.sh", resolveCdnBase());
 }
 
 test "extractChecksumHex parses sha256sum format" {
-    const with_filename = "abc123def456  fx-macos-aarch64.tar.gz\n";
+    const with_filename = "abc123def456  ffx-macos-aarch64.tar.gz\n";
     const hex = extractChecksumHex(with_filename).?;
     try std.testing.expectEqualStrings("abc123def456", hex);
 }
@@ -361,13 +361,13 @@ test "replaceBinary moves replacement over target path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeTempFile(tmp.dir, "fx-old", "old");
-    try writeTempFile(tmp.dir, "fx-new", "new");
+    try writeTempFile(tmp.dir, "ffx-old", "old");
+    try writeTempFile(tmp.dir, "ffx-new", "new");
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const new_path = try std.fs.path.join(alloc, &.{ root, "fx-new" });
+    const new_path = try std.fs.path.join(alloc, &.{ root, "ffx-new" });
     defer alloc.free(new_path);
-    const target_path = try std.fs.path.join(alloc, &.{ root, "fx-old" });
+    const target_path = try std.fs.path.join(alloc, &.{ root, "ffx-old" });
     defer alloc.free(target_path);
 
     try replaceBinary(new_path, target_path);

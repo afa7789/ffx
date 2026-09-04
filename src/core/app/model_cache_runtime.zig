@@ -20,7 +20,7 @@ else
     struct {};
 
 const Allocator = std.mem.Allocator;
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
+const e2e_gateway_models_url_env = "FFX_E2E_GATEWAY_MODELS_URL";
 
 const ModelCacheState = enum {
     idle,
@@ -39,7 +39,7 @@ const OwnedCatalogAccess = struct {
 
     fn init(alloc: Allocator, access: credentials.CatalogAccess) !OwnedCatalogAccess {
         return switch (access) {
-            .public_only, .host_managed => .{ .access = access },
+            .public_only => .{ .access = access },
             .authenticated => |authenticated| blk: {
                 const credential = try alloc.dupe(u8, authenticated.credential);
                 errdefer secret.zeroAndFree(alloc, credential);
@@ -72,7 +72,7 @@ const OwnedCatalogAccess = struct {
 
     fn deinit(self: *OwnedCatalogAccess, alloc: Allocator) void {
         switch (self.access) {
-            .public_only, .host_managed => {},
+            .public_only => {},
             .authenticated => |access| {
                 secret.zeroAndFree(alloc, @constCast(access.credential));
                 if (access.team_context) |team| alloc.free(@constCast(team));
@@ -182,26 +182,17 @@ pub const ModelMenu = struct {
     }
 
     pub fn moveProvider(self: *ModelMenu, delta: i32) bool {
-        if (!self.active or self.load_state != .ready or delta == 0) return false;
+        if (!self.active or self.load_state != .ready) return false;
         const filter_count = model_provider_filter_count;
         if (filter_count <= 1) return false;
 
-        const current = @min(self.provider_index, filter_count - 1);
-        const direction: i32 = if (delta < 0) -1 else 1;
-        var next: i32 = @intCast(current);
-        for (0..filter_count) |_| {
-            next += direction;
-            if (next < 0) next = @as(i32, @intCast(filter_count)) - 1;
-            if (next >= @as(i32, @intCast(filter_count))) next = 0;
-            const filter: ModelProviderFilter = @enumFromInt(@as(usize, @intCast(next)));
-            if (!modelProviderFilterAvailable(self.items.items, filter)) continue;
-            if (next == current) return false;
-            self.provider_index = @intCast(next);
-            self.selected_index = 0;
-            self.window_start = 0;
-            return true;
-        }
-        return false;
+        var next = @as(i32, @intCast(self.provider_index)) + delta;
+        if (next < 0) next = @as(i32, @intCast(filter_count)) - 1;
+        if (next >= @as(i32, @intCast(filter_count))) next = 0;
+        self.provider_index = @intCast(next);
+        self.selected_index = 0;
+        self.window_start = 0;
+        return true;
     }
 
     pub fn selectedModelAlloc(self: *const ModelMenu, alloc: Allocator) !?[]u8 {
@@ -259,8 +250,8 @@ fn modelMenuItemMatches(
         text_utils.containsIgnoreCase(item.provider, query_text);
 }
 
-fn providerFilter(provider: []const u8) ModelProviderFilter {
-    return if (std.ascii.eqlIgnoreCase(provider, "anthropic"))
+fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool {
+    const known_filter: ?ModelProviderFilter = if (std.ascii.eqlIgnoreCase(provider, "anthropic"))
         .anthropic
     else if (std.ascii.eqlIgnoreCase(provider, "openai"))
         .openai
@@ -269,21 +260,12 @@ fn providerFilter(provider: []const u8) ModelProviderFilter {
     else if (std.ascii.eqlIgnoreCase(provider, "zai"))
         .zai
     else
-        .others;
-}
-
-pub fn modelProviderFilterAvailable(items: []const ModelMenuItem, filter: ModelProviderFilter) bool {
-    if (filter == .all) return true;
-    var seen = [_]bool{false} ** model_provider_filter_count;
-    for (items) |item| seen[@intFromEnum(providerFilter(item.provider))] = true;
-
-    var specific_count: usize = 0;
-    for (seen[1..]) |available| specific_count += @intFromBool(available);
-    return specific_count > 1 and seen[@intFromEnum(filter)];
-}
-
-fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool {
-    return filter == .all or providerFilter(provider) == filter;
+        null;
+    return switch (filter) {
+        .all => true,
+        .anthropic, .openai, .xai, .zai => known_filter == filter,
+        .others => known_filter == null,
+    };
 }
 
 pub const Runtime = struct {
@@ -320,7 +302,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
-        if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
+        if (!self.beginLoad(access)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
             self.markFailed(.{
@@ -350,7 +332,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
-        if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
+        if (!self.beginLoad(access)) return;
 
         const result = model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
             .access = access,
@@ -393,7 +375,7 @@ pub const Runtime = struct {
         self.mutex.unlock(io_mod.getIo());
     }
 
-    fn beginLoad(self: *Self, access: credentials.CatalogAccess, refresh_interval_ms: ?i64) bool {
+    fn beginLoad(self: *Self, access: credentials.CatalogAccess) bool {
         self.finishThreadIfDone();
 
         const requested_access = model_catalog.AccessMetadata.init(access);
@@ -424,17 +406,13 @@ pub const Runtime = struct {
 
         const now = io_mod.milliTimestamp();
         self.mutex.lockUncancelable(io_mod.getIo());
-        const expired = if (refresh_interval_ms) |interval|
-            now < self.last_attempt_ms or now - self.last_attempt_ms >= interval
-        else
-            false;
         const should_load = switch (self.state) {
             .idle => true,
             .failed => now - self.last_attempt_ms >= 1000,
             .ready => if (self.outcome.last_failure) |failed|
-                expired or (failed.failure.retryable and now - self.last_attempt_ms >= 1000)
+                failed.failure.retryable and now - self.last_attempt_ms >= 1000
             else
-                expired,
+                false,
             .loading => false,
         };
         if (!should_load) {
@@ -469,16 +447,6 @@ pub const Runtime = struct {
         self.requested_access = null;
         self.mutex.unlock(io_mod.getIo());
         self.cancel_requested.store(false, .seq_cst);
-    }
-
-    pub fn resetForProviderChange(self: *Self) void {
-        debug_trace.logf("catalog", "model catalog reset reason=provider_changed", .{});
-        self.reset();
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        model_catalog.freeModelCatalog(self.alloc, &self.catalog);
-        self.catalog = .empty;
-        self.outcome = .{};
     }
 
     /// Installs a catalog that was completely fetched and validated before the
@@ -870,7 +838,7 @@ fn modelIdListContains(ids: []const []u8, needle: []const u8) bool {
 }
 
 fn authenticatedCatalogAccess(credential: []const u8, team_context: ?[]const u8) credentials.CatalogAccess {
-    return credentials.catalogAccessForCredential(.ai_gateway_api_key, credential, team_context);
+    return credentials.catalogAccessForCredential(.env_var, credential, team_context);
 }
 
 fn testCatalog(alloc: Allocator, model_id: []const u8) !std.ArrayList(model_catalog.ModelCatalogEntry) {
@@ -945,24 +913,6 @@ const StaleCatalog = struct {
     }
 };
 
-test "model cache expires successful catalogs only when the provider requests refresh" {
-    for ([_]bool{ false, true }) |expires| {
-        var runtime = Runtime.init(std.testing.allocator, "/v1/models");
-        defer runtime.deinit();
-        var source = AuthChangeCatalog{ .model_id = "first" };
-        var provider = source.provider();
-        provider.refresh_interval_ms = if (expires) 60_000 else null;
-        runtime.loadCooperative(provider, .{ .public_only = .no_credential });
-        source.model_id = "new-release";
-        runtime.loadCooperative(provider, .{ .public_only = .no_credential });
-        try std.testing.expectEqual(@as(usize, 1), source.calls);
-        runtime.last_attempt_ms -= 60_000;
-        runtime.loadCooperative(provider, .{ .public_only = .no_credential });
-        try std.testing.expectEqual(@as(usize, if (expires) 2 else 1), source.calls);
-        try std.testing.expectEqualStrings(if (expires) "new-release" else "first", runtime.catalog.items[0].id);
-    }
-}
-
 test "model cache clears an old failure after a clean empty refresh" {
     var runtime = Runtime.init(std.testing.allocator, "/v1/models");
     defer runtime.deinit();
@@ -1027,7 +977,7 @@ test "model cache projects anonymous fallback provenance for 401 and 403" {
 
         const provenance = runtime.outcome.loaded.?;
         try std.testing.expectEqual(model_catalog.AccessLevel.public_only, provenance.access.level);
-        try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, provenance.access.source.?);
+        try std.testing.expectEqual(credentials.Source.env_var, provenance.access.source.?);
         try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.authenticated_credential_rejected, provenance.access.public_only_reason.?);
         try std.testing.expect(provenance.access.private_models_may_be_hidden);
         try std.testing.expect(provenance.anonymous_fallback_used);
@@ -1107,7 +1057,7 @@ test "model cache refetches effective access across auth and team changes" {
     const public_access: credentials.CatalogAccess = .{ .public_only = .no_credential };
     const team_a_access = authenticatedCatalogAccess("team-key", "team_a");
     const team_b_access = authenticatedCatalogAccess("team-key", "team_b");
-    const fx_login_access = credentials.catalogAccessForCredential(.fx_login, "login-token", "ignored-team");
+    const fx_login_access = credentials.catalogAccessForCredential(.stored_key, "login-token", "ignored-team");
     const cases = [_]struct { access: credentials.CatalogAccess, model_id: []const u8 }{
         .{ .access = public_access, .model_id = "public/original" },
         .{ .access = team_a_access, .model_id = "private/team-a" },
@@ -1137,18 +1087,18 @@ test "model cache refetches effective access across auth and team changes" {
     try std.testing.expectEqual(@as(usize, cases.len), provider.calls);
 }
 
-test "model cache reloads a ready authenticated catalog after fx login access downgrades" {
+test "model cache reloads a ready authenticated catalog after Fx login access downgrades" {
     const cases = [_]struct {
         access: credentials.CatalogAccess,
         reason: credentials.CatalogPublicOnlyReason,
     }{
         .{
-            .access = .{ .public_only = .fx_login_refresh_required },
-            .reason = .fx_login_refresh_required,
+            .access = .{ .public_only = .no_credential },
+            .reason = .no_credential,
         },
         .{
-            .access = credentials.catalogAccessAfterRefreshFailure(.fx_login),
-            .reason = .credential_refresh_failed,
+            .access = .{ .public_only = .{ .authenticated_credential_rejected = .stored_key } },
+            .reason = .authenticated_credential_rejected,
         },
     };
 
@@ -1158,7 +1108,7 @@ test "model cache reloads a ready authenticated catalog after fx login access do
         var private_provider = AuthChangeCatalog{ .model_id = "private/team-model" };
         runtime.startWarmup(
             private_provider.provider(),
-            credentials.catalogAccessForCredential(.fx_login, "login-token", "team_123"),
+            credentials.catalogAccessForCredential(.stored_key, "login-token", "team_123"),
         );
         try waitForWarmup(&runtime);
 
@@ -1179,18 +1129,18 @@ test "model cache reuses a ready public catalog when only its public reason chan
     var runtime = Runtime.init(std.testing.allocator, "/v1/models");
     defer runtime.deinit();
     var initial_provider = AuthChangeCatalog{ .model_id = "public/base-model" };
-    runtime.startWarmup(initial_provider.provider(), .{ .public_only = .fx_login_refresh_required });
+    runtime.startWarmup(initial_provider.provider(), .{ .public_only = .no_credential });
     try waitForWarmup(&runtime);
 
     var unused_provider = AuthChangeCatalog{ .model_id = "public/redundant-model" };
     runtime.startWarmup(
         unused_provider.provider(),
-        credentials.catalogAccessAfterRefreshFailure(.fx_login),
+        .{ .public_only = .{ .authenticated_credential_rejected = .stored_key } },
     );
 
     try std.testing.expectEqual(@as(usize, 0), unused_provider.calls);
     try std.testing.expectEqual(
-        credentials.CatalogPublicOnlyReason.credential_refresh_failed,
+        credentials.CatalogPublicOnlyReason.authenticated_credential_rejected,
         runtime.outcome.loaded.?.access.public_only_reason.?,
     );
     try std.testing.expectEqualStrings("public/base-model", runtime.catalogModelCompletion("public/base-model").?);
@@ -1241,7 +1191,7 @@ test "model cache access copies clean up every induced allocation failure" {
 
 test "model cache access owns Grok account identity with its credential" {
     const access = credentials.catalogAccessForCredentialAndAccount(
-        .grok_subscription,
+        .stored_key,
         "copied-secret",
         null,
         "acct_grok",
@@ -1319,7 +1269,7 @@ test "model cache warmup publishes a snapshot and filtered completion" {
 
     const provenance = runtime.outcome.loaded.?;
     try std.testing.expectEqual(model_catalog.AccessLevel.authenticated, provenance.access.level);
-    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, provenance.access.source.?);
+    try std.testing.expectEqual(credentials.Source.env_var, provenance.access.source.?);
     try std.testing.expect(!provenance.access.private_models_may_be_hidden);
     try std.testing.expect(!provenance.anonymous_fallback_used);
     try std.testing.expect(provenance.fallback_failure == null);
@@ -1432,37 +1382,6 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expectEqualStrings("standalone", selected);
 }
 
-test "model menu provider navigation skips absent and redundant filters" {
-    const alloc = std.testing.allocator;
-    const mixed_entries = [_]model_catalog.ModelCatalogEntry{
-        .{ .id = @constCast("openai/gpt-5"), .model_type = @constCast("language") },
-        .{ .id = @constCast("xai/grok-4"), .model_type = @constCast("language") },
-    };
-    var mixed: ModelMenu = .{};
-    defer mixed.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries);
-    mixed.active = true;
-
-    try std.testing.expect(mixed.moveProvider(1));
-    try std.testing.expectEqual(ModelProviderFilter.openai, mixed.providerFilter());
-    try std.testing.expect(mixed.moveProvider(1));
-    try std.testing.expectEqual(ModelProviderFilter.xai, mixed.providerFilter());
-    try std.testing.expect(mixed.moveProvider(1));
-    try std.testing.expectEqual(ModelProviderFilter.all, mixed.providerFilter());
-
-    const codex_entries = [_]model_catalog.ModelCatalogEntry{
-        .{ .id = @constCast("gpt-5.6-sol"), .model_type = @constCast("language") },
-        .{ .id = @constCast("gpt-5.4-mini"), .model_type = @constCast("language") },
-    };
-    var codex: ModelMenu = .{};
-    defer codex.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &codex, &codex_entries);
-    codex.active = true;
-
-    try std.testing.expect(!codex.moveProvider(1));
-    try std.testing.expectEqual(ModelProviderFilter.all, codex.providerFilter());
-}
-
 test "model menu snapshot construction cleans every allocation failure" {
     const backing = std.testing.allocator;
     const entries = [_]model_catalog.ModelCatalogEntry{
@@ -1527,31 +1446,6 @@ test "model cache completion hydrates an open menu and reports once" {
     try std.testing.expect(!runtime.menu.active);
     try std.testing.expectEqual(ModelCacheState.idle, runtime.state);
     if (fixture.failure()) |err| return err;
-}
-
-test "provider changes discard public catalog fallback without changing ordinary reset" {
-    const alloc = std.testing.allocator;
-    var runtime = Runtime.init(alloc, "/v1/models");
-    defer runtime.deinit();
-    {
-        const id = try alloc.dupe(u8, "gateway-model");
-        errdefer alloc.free(id);
-        const model_type = try alloc.dupe(u8, "language");
-        errdefer alloc.free(model_type);
-        try runtime.catalog.append(alloc, .{ .id = id, .model_type = model_type });
-    }
-    runtime.outcome = .{ .loaded = .{
-        .access = model_catalog.AccessMetadata.init(.{ .public_only = .no_credential }),
-    } };
-    runtime.state = .ready;
-
-    runtime.reset();
-    try std.testing.expectEqual(@as(usize, 1), runtime.catalog.items.len);
-    try std.testing.expect(runtime.outcome.loaded != null);
-    runtime.resetForProviderChange();
-    try std.testing.expectEqual(@as(usize, 0), runtime.catalog.items.len);
-    try std.testing.expect(runtime.outcome.loaded == null);
-    try std.testing.expectEqual(ModelCacheState.idle, runtime.state);
 }
 
 test "model cache reset replaces ready public catalog with team catalog" {

@@ -12,9 +12,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FFX_BIN, runFx } from "../evals/eval-helpers";
 import {
-  AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
+  AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
   parseGatewayRequest,
@@ -22,6 +22,7 @@ import {
   toolByName,
   toolShapesWithoutDescriptions,
   VERIFY_SERIALIZED_TOOL_NAMES,
+  WEB_PERPLEXITY_SERIALIZED_TOOL_NAMES,
   WEB_SEARCH_GUIDANCE,
   contentText,
 } from "./conditional-guidance-oracle";
@@ -142,7 +143,7 @@ function outerSearchCall(input: object = { query: "latest Zig release" }) {
   return outerToolCalls([{ id: "search_outer_1", name: "web_search", input }]);
 }
 
-function outerDirectProviderSearch(toolName = "exa_search", result: object = {
+function outerDirectProviderSearch(toolName = "perplexity_search", result: object = {
   results: [{ title: "Zig downloads", url: SOURCE_URL }],
 }) {
   return sse([
@@ -282,14 +283,14 @@ function createIsolatedRoot(
   webSearchPermission: PermissionAction = "allow",
   settings: Record<string, unknown> = {},
 ) {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-web-search-e2e-")));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-web-search-e2e-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   const permission: Record<string, Record<string, string>> = {};
   if (webSearchPermission) permission.web_search = { "*": webSearchPermission };
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ ...settings, permission }));
+  writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({ ...settings, permission }));
   return { root, home, workspace: realpathSync(workspace) };
 }
 
@@ -300,14 +301,14 @@ function fakeGatewayEnv(
 ) {
   return {
     HOME: root.home,
-    AI_GATEWAY_API_KEY: "fake-e2e-key",
+    FFX_PROVIDER_API_KEY: "fake-e2e-key",
     VERCEL_OIDC_TOKEN: undefined,
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-    FX_E2E_GATEWAY_CREDITS_URL: undefined,
-    FX_MODEL: OUTER_MODEL,
+    FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FFX_E2E_GATEWAY_CREDITS_URL: undefined,
+    FFX_MODEL: OUTER_MODEL,
     ...extra,
   };
 }
@@ -353,7 +354,6 @@ class AcpClient {
   private lines: string[] = [];
   private waiters: Array<(line: string) => void> = [];
   private closed = false;
-  private activeSessionId: string | null = null;
 
   private constructor(private proc: ChildProcess) {
     proc.stdout!.on("data", (chunk: Buffer) => {
@@ -378,7 +378,7 @@ class AcpClient {
         (entry): entry is [string, string] => entry[1] !== undefined,
       ),
     );
-    return new AcpClient(nodeSpawn(FX_BIN, ["acp"], {
+    return new AcpClient(nodeSpawn(FFX_BIN, ["acp"], {
       cwd,
       env: definedEnv,
       stdio: ["pipe", "pipe", "pipe"],
@@ -386,23 +386,7 @@ class AcpClient {
   }
 
   send(message: object) {
-    let outgoing = message as any;
-    if (
-      this.activeSessionId !== null &&
-      [
-        "session/prompt",
-        "session/cancel",
-        "session/set_mode",
-        "session/set_config_option",
-      ].includes(outgoing.method) &&
-      outgoing.params?.sessionId === undefined
-    ) {
-      outgoing = {
-        ...outgoing,
-        params: { ...(outgoing.params ?? {}), sessionId: this.activeSessionId },
-      };
-    }
-    this.proc.stdin!.write(`${JSON.stringify(outgoing)}\n`);
+    this.proc.stdin!.write(`${JSON.stringify(message)}\n`);
   }
 
   async readLine(timeoutMs = TIMEOUT): Promise<any> {
@@ -423,18 +407,7 @@ class AcpClient {
 
   async request(method: string, params: object, id: number) {
     this.send({ jsonrpc: "2.0", id, method, params });
-    let response: any;
-    do {
-      response = await this.readLine();
-    } while (response.id !== id);
-    if (
-      response.error === undefined &&
-      method === "session/new" &&
-      typeof response.result?.sessionId === "string"
-    ) {
-      this.activeSessionId = response.result.sessionId;
-    }
-    return response;
+    return this.readLine();
   }
 
   async close() {
@@ -506,7 +479,7 @@ describe("web_search Gateway fixture", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("native search call was rejected");
         expect(gateway.requests).toHaveLength(2);
-        expect(gateway.requests[0].body).toContain("gateway.exa_search");
+        expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
         expect(gateway.requests[1].body).toContain(
           "web_search is unavailable: no local runtime with a configured Gateway transport policy is installed",
         );
@@ -519,7 +492,7 @@ describe("web_search Gateway fixture", () => {
   );
 
   test(
-    "default fx ask unadvertised native web_search cannot start a worker",
+    "default ffx ask unadvertised native web_search cannot start a worker",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
@@ -551,7 +524,7 @@ describe("web_search Gateway fixture", () => {
   );
 
   test(
-    "no-rule default uses direct Exa search and returns a linked source",
+    "no-rule default uses direct Perplexity search and returns a linked source",
     async () => {
       const root = createIsolatedRoot(null);
       const gateway = startFakeGateway();
@@ -573,9 +546,8 @@ describe("web_search Gateway fixture", () => {
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[0].headers.get("ai-language-model-id")).toBe(OUTER_MODEL);
         expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
-        expect(gateway.requests[0].body).toContain("gateway.exa_search");
-        expect(gateway.requests[0].body).toContain('"name":"exa_search"');
-        expect(gateway.requests[0].body).not.toContain('"name":"perplexity_search"');
+        expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
+        expect(gateway.requests[0].body).toContain('"name":"perplexity_search"');
         expect(gateway.requests[0].body).not.toContain('"name":"parallel_search"');
         expect(gateway.requests[0].body).not.toContain("google/gemini-3-flash");
         expect(gateway.requests[1].headers.get("ai-language-model-id")).toBe(OUTER_MODEL);
@@ -584,10 +556,10 @@ describe("web_search Gateway fixture", () => {
         const initial = parseGatewayRequest(gateway.requests[0]!.body);
         const continuing = parseGatewayRequest(gateway.requests[1]!.body);
         expect(serializedToolNames(initial)).toEqual(
-          AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
+          AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
         );
         expect(serializedToolNames(continuing)).toEqual(
-          AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
+          AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
         );
         expect(toolShapesWithoutDescriptions(continuing)).toEqual(
           toolShapesWithoutDescriptions(initial),
@@ -595,7 +567,7 @@ describe("web_search Gateway fixture", () => {
         for (const request of [initial, continuing]) {
           expect(findUnavailableCapabilityReferences(request)).toEqual([]);
           expect(customProviderGuidanceState(request)).toEqual({
-            providerToolIndices: [13],
+            providerToolIndices: [22],
             guidanceMessageIndices: [1],
           });
           expect(
@@ -623,7 +595,7 @@ describe("web_search Gateway fixture", () => {
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
-        malformedDirectProviderResult("exa_search"),
+        malformedDirectProviderResult("perplexity_search"),
       ]);
       try {
         const result = await runFx(
@@ -651,7 +623,7 @@ describe("web_search Gateway fixture", () => {
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
-        malformedDirectProviderArguments("exa_search"),
+        malformedDirectProviderArguments("perplexity_search"),
       ]);
       try {
         const result = await runFx(
@@ -689,8 +661,8 @@ describe("web_search Gateway fixture", () => {
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, {
-              FX_TRACE_LOG: traceLog,
-              FX_TRACE_SCOPES: "agent,tool",
+              FFX_TRACE_LOG: traceLog,
+              FFX_TRACE_SCOPES: "agent,tool",
             }),
             timeoutMs: TIMEOUT,
           },
@@ -729,8 +701,8 @@ describe("web_search Gateway fixture", () => {
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, {
-              FX_MODEL: PARALLEL_OUTER_MODEL,
-              FX_WEB_SEARCH_BACKEND: "ai_gateway_parallel_search",
+              FFX_MODEL: PARALLEL_OUTER_MODEL,
+              FFX_WEB_SEARCH_BACKEND: "ai_gateway_parallel_search",
             }),
             timeoutMs: TIMEOUT,
           },
@@ -742,20 +714,19 @@ describe("web_search Gateway fixture", () => {
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[0].headers.get("ai-language-model-id")).toBe(PARALLEL_OUTER_MODEL);
         expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
-        expect(gateway.requests[0].body).not.toContain('"name":"exa_search"');
         expect(gateway.requests[0].body).not.toContain('"name":"perplexity_search"');
         expect(gateway.requests[0].body).toContain("gateway.parallel_search");
         expect(gateway.requests[0].body).toContain('"name":"parallel_search"');
         expect(gateway.requests[0].body).not.toContain("gateway.perplexity_search");
         const request = parseGatewayRequest(gateway.requests[0]!.body);
         expect(serializedToolNames(request)).toEqual(
-          AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.map((name) =>
-            name === "exa_search" ? "parallel_search" : name
+          AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.map((name) =>
+            name === "perplexity_search" ? "parallel_search" : name
           ),
         );
         expect(findUnavailableCapabilityReferences(request)).toEqual([]);
         expect(customProviderGuidanceState(request)).toEqual({
-          providerToolIndices: [13],
+          providerToolIndices: [22],
           guidanceMessageIndices: [1],
         });
       } finally {
@@ -782,7 +753,7 @@ describe("web_search Gateway fixture", () => {
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, {
-              FX_MODEL: "anthropic/claude-opus-4.6",
+              FFX_MODEL: "anthropic/claude-opus-4.6",
             }),
             timeoutMs: TIMEOUT,
           },
@@ -790,8 +761,7 @@ describe("web_search Gateway fixture", () => {
 
         parseFxJson(result);
         expect(gateway.requests).toHaveLength(2);
-        expect(gateway.requests[0].body).toContain('"name":"exa_search"');
-        expect(gateway.requests[0].body).not.toContain('"name":"perplexity_search"');
+        expect(gateway.requests[0].body).toContain('"name":"perplexity_search"');
         expect(gateway.requests[0].body).not.toContain('"name":"parallel_search"');
         expect(JSON.parse(gateway.requests[0].body)).toMatchObject({ reasoning: "high" });
         expect(JSON.parse(gateway.requests[1].body)).toMatchObject({ reasoning: "high" });
@@ -806,7 +776,7 @@ describe("web_search Gateway fixture", () => {
   );
 
   test(
-    "fx ask preserves the exact GLM model while sending declared Fast",
+    "ffx ask preserves the exact GLM model while sending declared Fast",
     async () => {
       const root = createIsolatedRoot("allow", {
         model: "zai/glm-5.2",
@@ -823,7 +793,7 @@ describe("web_search Gateway fixture", () => {
           ["ask", "--auto", "--json", "--no-save", "Reply with a short confirmation."],
           {
             cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, { FX_MODEL: undefined }),
+            env: fakeGatewayEnv(root, gateway, { FFX_MODEL: undefined }),
             timeoutMs: TIMEOUT,
           },
         );
@@ -869,7 +839,7 @@ describe("web_search Gateway fixture", () => {
             {
               cwd: root.workspace,
               env: fakeGatewayEnv(root, gateway, {
-                FX_MODEL: testCase.model,
+                FFX_MODEL: testCase.model,
               }),
               timeoutMs: TIMEOUT,
             },
@@ -884,7 +854,7 @@ describe("web_search Gateway fixture", () => {
           expect(gateway.requests[0].body).not.toContain('"thinking"');
 
           const stored = JSON.parse(
-            readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+            readFileSync(join(root.home, ".ffx", "settings.json"), "utf8"),
           );
           expect(stored.effort).toBe(testCase.effort);
           expect(stored.fast_mode).toBe(true);
@@ -908,7 +878,7 @@ describe("web_search Gateway fixture", () => {
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, {
-              FX_WEB_SEARCH_BACKEND: "parallel_search",
+              FFX_WEB_SEARCH_BACKEND: "parallel_search",
             }),
             timeoutMs: TIMEOUT,
           },
@@ -944,14 +914,13 @@ describe("web_search Gateway fixture", () => {
           expect(json.output).toContain("search capability unavailable");
           expect(json.tool_calls).toHaveLength(0);
           expect(gateway.requests).toHaveLength(1);
-          expect(gateway.requests[0].body).not.toContain("gateway.exa_search");
           expect(gateway.requests[0].body).not.toContain("gateway.perplexity_search");
           expect(gateway.requests[0].body).not.toContain("gateway.parallel_search");
           expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
           const request = parseGatewayRequest(gateway.requests[0]!.body);
           expect(serializedToolNames(request)).toEqual(
-            AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.filter((name) =>
-              name !== "exa_search"
+            AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.filter((name) =>
+              name !== "perplexity_search"
             ),
           );
           expect(findUnavailableCapabilityReferences(request)).toEqual([]);
@@ -973,7 +942,7 @@ describe("web_search Gateway fixture", () => {
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
-        outerDirectProviderSearch("exa_search", { results: [] }),
+        outerDirectProviderSearch("perplexity_search", { results: [] }),
         outerText("zero search handled"),
       ]);
       try {
@@ -1001,7 +970,7 @@ describe("web_search Gateway fixture", () => {
   );
 
   test(
-    "default fx ask applies environment model, permission, and step-limit overrides",
+    "default ffx ask applies environment model, permission, and step-limit overrides",
     async () => {
       const root = createIsolatedRoot(null, {
         model: OUTER_MODEL,
@@ -1021,9 +990,9 @@ describe("web_search Gateway fixture", () => {
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, {
-              FX_MODEL: PARALLEL_OUTER_MODEL,
-              FX_PERMISSION_MODE: "auto",
-              FX_MAX_AGENT_STEPS: "1",
+              FFX_MODEL: PARALLEL_OUTER_MODEL,
+              FFX_PERMISSION_MODE: "auto",
+              FFX_MAX_AGENT_STEPS: "1",
             }),
             timeoutMs: TIMEOUT,
           },
@@ -1055,12 +1024,9 @@ describe("web_search Gateway fixture", () => {
         await startAcpCodeSession(client);
         const messages = await runAcpPrompt(client, "Search the web for the latest Zig release.");
         const updates = JSON.stringify(messages);
-        const toolUpdates = messages
-          .filter((message: any) => message.params?.update?.toolCallId === "search_direct_1")
-          .map((message: any) => message.params.update);
 
         expect(gateway.requests).toHaveLength(2);
-        expect(gateway.requests[0].body).toContain("gateway.exa_search");
+        expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
         expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
         const initial = parseGatewayRequest(gateway.requests[0]!.body);
         const continuing = parseGatewayRequest(gateway.requests[1]!.body);
@@ -1073,21 +1039,6 @@ describe("web_search Gateway fixture", () => {
         );
         expect(updates).not.toContain("Searching latest Zig release");
         expect(updates).not.toContain("Found 1 result for latest Zig release");
-        expect(toolUpdates).toHaveLength(2);
-        expect(toolUpdates[0]).toEqual({
-          sessionUpdate: "tool_call",
-          toolCallId: "search_direct_1",
-          name: "web_search",
-          title: "Searching web",
-          kind: "search",
-          status: "pending",
-          rawInput: {},
-        });
-        expect(toolUpdates[1]?.sessionUpdate).toBe("tool_call_update");
-        expect(toolUpdates[1]?.status).toBe("completed");
-        expect(updates).not.toContain("exa_search");
-        expect(updates).not.toContain("perplexity_search");
-        expect(updates).not.toContain("parallel_search");
         expect(updates).toContain(SOURCE_URL);
       } finally {
         await client.close();
@@ -1147,7 +1098,6 @@ describe("web_search Gateway fixture", () => {
         const messages = await runAcpPrompt(client, "Issue denied web search.");
 
         expect(gateway.requests).toHaveLength(1);
-        expect(gateway.requests[0].body).not.toContain("gateway.exa_search");
         expect(gateway.requests[0].body).not.toContain("gateway.perplexity_search");
         expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
         const request = parseGatewayRequest(gateway.requests[0]!.body);

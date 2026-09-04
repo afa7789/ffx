@@ -1,11 +1,9 @@
 const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const background_store = @import("../background/background_store.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
-const mcp_contract = @import("../mcp/mcp_contract.zig");
-const mcp_health = @import("../mcp/health.zig");
-const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_json = @import("../session/session_json.zig");
@@ -13,8 +11,6 @@ const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
-const update_notes = @import("../upgrade/update_notes.zig");
-const update_target = @import("../upgrade/update_target.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 
@@ -365,16 +361,15 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
 }
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
-    const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
+    return auth.gateway_connected or auth.active_source != null;
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
-    return auth.chatgpt_connected or auth.active_source == .chatgpt_subscription;
+    return auth.chatgpt_connected;
 }
 
 fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
-    return auth.grok_connected or auth.active_source == .grok_subscription;
+    return auth.grok_connected;
 }
 
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
@@ -396,70 +391,6 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (!wrote_provider) try writer.writeAll("none");
 }
 
-pub const McpLocalSnapshot = struct {
-    servers: []const mcp_health.ConfiguredServerSnapshot = &.{},
-    configuration_issues: []const mcp_health.ConfigurationIssue = &.{},
-    inspection_error: ?[]const u8 = null,
-
-    fn writeText(self: McpLocalSnapshot, writer: *std.Io.Writer, alloc: Allocator, prefix: []const u8) !void {
-        try writer.print("[{s}] mcp_connection_check=not_checked\n", .{prefix});
-        try writer.print(
-            "[{s}] mcp_servers={d} mcp_configuration_issues={d}\n",
-            .{ prefix, self.servers.len, self.configuration_issues.len },
-        );
-        for (self.servers) |server| {
-            try writer.print("[{s}] mcp_server=", .{prefix});
-            try writeTerminalSafe(writer, alloc, server.configured_name);
-            try writer.print(
-                " source={s} scope={s} admission={s} transport={s} connection=not_checked authentication=not_checked\n",
-                .{
-                    @tagName(server.source),
-                    @tagName(server.scope),
-                    if (server.workspace_admission) |admission| @tagName(admission) else "not_applicable",
-                    @tagName(server.transport),
-                },
-            );
-        }
-        for (self.configuration_issues) |issue| {
-            try writer.print("[{s}] mcp_configuration_issue=", .{prefix});
-            try writeTerminalSafe(writer, alloc, issue.message);
-            try writer.writeByte('\n');
-        }
-        if (self.inspection_error) |error_name| {
-            try writer.print("[{s}] mcp_inspection_error={s}\n", .{ prefix, error_name });
-        }
-    }
-
-    fn writeJson(self: McpLocalSnapshot, writer: *std.Io.Writer) !void {
-        try writer.writeAll("{\"connection_check\":\"not_checked\",\"servers\":[");
-        for (self.servers, 0..) |server, index| {
-            if (index > 0) try writer.writeByte(',');
-            try std.json.Stringify.value(.{
-                .name = server.configured_name,
-                .source = server.source,
-                .scope = server.scope,
-                .admission = server.workspace_admission,
-                .required = server.required,
-                .transport = server.transport,
-                .connection = "not_checked",
-                .authentication = "not_checked",
-            }, .{}, writer);
-        }
-        try writer.writeAll("],\"configuration_issues\":[");
-        for (self.configuration_issues, 0..) |issue, index| {
-            if (index > 0) try writer.writeByte(',');
-            try std.json.Stringify.value(issue.message, .{}, writer);
-        }
-        try writer.writeAll("],\"inspection_error\":");
-        if (self.inspection_error) |error_name| {
-            try std.json.Stringify.value(error_name, .{}, writer);
-        } else {
-            try writer.writeAll("null");
-        }
-        try writer.writeByte('}');
-    }
-};
-
 pub const StatusSnapshot = struct {
     model: []const u8,
     provider: model_provider.ProviderId = .gateway,
@@ -468,10 +399,9 @@ pub const StatusSnapshot = struct {
     build_revision: []const u8 = "",
     auth: auth_runtime.StatusSnapshot = .{},
     auth_help: ?[]const u8 = null,
-    mcp: ?McpLocalSnapshot = null,
     mcp_config_error: ?[]const u8 = null,
-    mcp_config_warning: ?mcp_contract.ProfileConfigWarning = null,
     permission_mode: types.PermissionMode,
+    sandbox: []const u8 = "none",
     workspace_root: []const u8,
     history_turns: usize,
     session_permission_grants: usize,
@@ -490,7 +420,7 @@ pub const StatusSnapshot = struct {
 
         try out.writer.print("[status] model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("[status] model_source={s}\n", .{provider_catalog.label(self.provider)});
+            try out.writer.print("[status] model_source={s}\n", .{model_provider.label(self.provider)});
         }
         try out.writer.print("[status] update_channel={s}\n", .{self.update_channel});
         try out.writer.print("[status] build_channel={s}\n", .{self.build_channel});
@@ -499,20 +429,6 @@ pub const StatusSnapshot = struct {
         }
         if (self.mcp_config_error) |error_name| {
             try out.writer.print("[status] mcp_config_error={s}\n", .{error_name});
-        }
-        if (self.mcp_config_warning) |warning| {
-            try out.writer.print(
-                "[status] mcp_config_warning={s}",
-                .{@tagName(warning.cause)},
-            );
-            if (warning.key()) |key| {
-                try out.writer.writeAll(" key=");
-                try writeTerminalSafe(&out.writer, alloc, key);
-            }
-            try out.writer.print(
-                " additional_matches={d}\n",
-                .{warning.additional_matches},
-            );
         }
         try out.writer.print("[status] auth={s}\n", .{self.auth.activeSourceLabel()});
         if (self.provider != .gateway) {
@@ -529,11 +445,11 @@ pub const StatusSnapshot = struct {
             try out.writer.print("[status] team={s}\n", .{team});
         }
         try out.writer.print("[status] permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
+        try out.writer.print("[status] sandbox={s}\n", .{self.sandbox});
         try out.writer.print("[status] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[status] history_turns={d}\n", .{self.history_turns});
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
         try out.writer.print("[status] agent_step_limit={d}\n", .{self.agent_step_limit});
-        if (self.mcp) |mcp| try mcp.writeText(&out.writer, alloc, "status");
         return try out.toOwnedSlice();
     }
 
@@ -543,7 +459,7 @@ pub const StatusSnapshot = struct {
 
         try out.writer.print("model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("model_source={s}\n", .{provider_catalog.label(self.provider)});
+            try out.writer.print("model_source={s}\n", .{model_provider.label(self.provider)});
         }
         try out.writer.print("update_channel={s}\n", .{self.update_channel});
         try out.writer.print("build_channel={s}\n", .{self.build_channel});
@@ -561,6 +477,7 @@ pub const StatusSnapshot = struct {
         if (self.auth_help) |help| try out.writer.print("auth_help={s}\n", .{help});
         if (self.auth.team) |team| try out.writer.print("team={s}\n", .{team});
         try out.writer.print("permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
+        try out.writer.print("sandbox={s}\n", .{self.sandbox});
         try out.writer.print("workspace={s}\n", .{self.workspace_root});
         try out.writer.print("history_turns={d}\n", .{self.history_turns});
         try out.writer.print("session_permission_grants={d}\n", .{self.session_permission_grants});
@@ -581,7 +498,7 @@ pub const StatusSnapshot = struct {
         try std.json.Stringify.value(self.model, .{}, writer);
         if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
-            try std.json.Stringify.value(provider_catalog.label(self.provider), .{}, writer);
+            try std.json.Stringify.value(model_provider.label(self.provider), .{}, writer);
         }
         try writer.writeAll(",\"update_channel\":");
         try std.json.Stringify.value(self.update_channel, .{}, writer);
@@ -592,20 +509,6 @@ pub const StatusSnapshot = struct {
         if (self.mcp_config_error) |error_name| {
             try writer.writeAll(",\"mcp_config_error\":");
             try std.json.Stringify.value(error_name, .{}, writer);
-        }
-        if (self.mcp_config_warning) |warning| {
-            try writer.writeAll(",\"mcp_config_warning\":{\"cause\":");
-            try std.json.Stringify.value(@tagName(warning.cause), .{}, writer);
-            try writer.writeAll(",\"key\":");
-            if (warning.key()) |key| {
-                try std.json.Stringify.value(key, .{}, writer);
-            } else {
-                try writer.writeAll("null");
-            }
-            try writer.print(
-                ",\"additional_matches\":{d}}}",
-                .{warning.additional_matches},
-            );
         }
         try writer.writeAll(",\"auth\":");
         try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
@@ -639,15 +542,13 @@ pub const StatusSnapshot = struct {
         }
         try writer.writeAll(",\"permission_mode\":");
         try std.json.Stringify.value(permissionModeLabel(self.permission_mode), .{}, writer);
+        try writer.writeAll(",\"sandbox\":");
+        try std.json.Stringify.value(self.sandbox, .{}, writer);
         try writer.writeAll(",\"workspace\":");
         try std.json.Stringify.value(self.workspace_root, .{}, writer);
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
         try writer.print(",\"session_permission_grants\":{d}", .{self.session_permission_grants});
         try writer.print(",\"agent_step_limit\":{d}", .{self.agent_step_limit});
-        if (self.mcp) |mcp| {
-            try writer.writeAll(",\"mcp\":");
-            try mcp.writeJson(writer);
-        }
         try writer.writeByte('}');
     }
 };
@@ -778,7 +679,7 @@ pub const ModelListSnapshot = struct {
         const shown = self.shownCount();
         for (self.ids[0..shown]) |id| {
             if (self.provider != .gateway) {
-                try out.writer.print(" - {s} · {s}\n", .{ id, provider_catalog.label(self.provider) });
+                try out.writer.print(" - {s} · {s}\n", .{ id, model_provider.label(self.provider) });
             } else {
                 try out.writer.print(" - {s}\n", .{id});
             }
@@ -806,7 +707,7 @@ pub const ModelListSnapshot = struct {
         const shown = self.shownCount();
         for (self.ids[0..shown]) |id| {
             if (self.provider != .gateway) {
-                try out.writer.print("\n - {s} · {s}", .{ id, provider_catalog.label(self.provider) });
+                try out.writer.print("\n - {s} · {s}", .{ id, model_provider.label(self.provider) });
             } else {
                 try out.writer.print("\n - {s}", .{id});
             }
@@ -836,7 +737,7 @@ pub const ModelListSnapshot = struct {
                 try out.writer.writeAll("{\"id\":");
                 try std.json.Stringify.value(id, .{}, &out.writer);
                 try out.writer.writeAll(",\"source\":");
-                try std.json.Stringify.value(provider_catalog.label(self.provider), .{}, &out.writer);
+                try std.json.Stringify.value(model_provider.label(self.provider), .{}, &out.writer);
                 try out.writer.writeByte('}');
             }
         }
@@ -851,8 +752,9 @@ pub const ModelListSnapshot = struct {
     fn emptyCatalogProviderName(self: ModelListSnapshot) []const u8 {
         return switch (self.provider) {
             .gateway => "gateway",
-            .codex => provider_catalog.label(.codex),
-            .grok => provider_catalog.label(.grok),
+            .codex => model_provider.label(.codex),
+            .grok => model_provider.label(.grok),
+            else => model_provider.label(self.provider),
         };
     }
 
@@ -860,14 +762,8 @@ pub const ModelListSnapshot = struct {
         if (!self.private_models_hidden) return null;
         const reason = self.public_only_reason orelse return "Using the public model catalog.";
         return switch (reason) {
-            .no_credential => "Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
-            .fx_login_team_required => "Choose a Vercel team to load its private models.",
-            .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
-            .credential_refresh_required => "The selected sign-in must refresh before authenticated models can load.",
-            .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
-            .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
-            .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
-            .grok_subscription => "Grok models require an authenticated Grok catalog.",
+            .no_credential => "Using the public model catalog; configure a provider API key for the full catalog.",
+            .authenticated_credential_rejected => "Your credential was rejected; using the public model catalog.",
         };
     }
 };
@@ -911,13 +807,13 @@ pub const SessionListSnapshot = struct {
         }
         if (self.has_more) {
             try out.writer.print(
-                "[sessions] more saved sessions; continue with `fx sessions {s}--cursor {s}`\n",
+                "[sessions] more saved sessions; continue with `ffx sessions {s}--cursor {s}`\n",
                 .{ if (self.all_workspaces) "--all " else "", self.next_cursor orelse "" },
             );
         }
         if (self.skipped_invalid > 0) {
             try out.writer.print(
-                "[sessions] warning: skipped {d} unreadable saved session{s}; run `fx doctor` for recovery guidance\n",
+                "[sessions] warning: skipped {d} unreadable saved session{s}; run `ffx doctor` for recovery guidance\n",
                 .{ self.skipped_invalid, if (self.skipped_invalid == 1) "" else "s" },
             );
         }
@@ -1238,7 +1134,7 @@ pub const SessionRecoverySnapshot = struct {
         if (self.result.status == .indeterminate) {
             return std.fmt.allocPrint(
                 alloc,
-                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\nresolve: fx --resume {s}\ninspect: fx doctor\n",
+                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\nresolve: ffx --resume {s}\ninspect: ffx doctor\n",
                 .{
                     self.result.recovered_session_id,
                     self.result.source_session_id,
@@ -1249,7 +1145,7 @@ pub const SessionRecoverySnapshot = struct {
         if (self.result.status == .recovered_with_unverified_artifacts) {
             return std.fmt.allocPrint(
                 alloc,
-                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\nresume: fx --resume {s}\n",
+                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\nresume: ffx --resume {s}\n",
                 .{
                     self.result.source_session_id,
                     self.result.recovered_session_id,
@@ -1260,7 +1156,7 @@ pub const SessionRecoverySnapshot = struct {
         }
         return std.fmt.allocPrint(
             alloc,
-            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nresume: fx --resume {s}\n",
+            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nresume: ffx --resume {s}\n",
             .{
                 self.result.source_session_id,
                 self.result.recovered_session_id,
@@ -1312,7 +1208,6 @@ pub const DoctorSnapshot = struct {
     permission_mode: types.PermissionMode,
     agent_step_limit: usize,
     checks: []const doctor_runtime.Check,
-    mcp: ?McpLocalSnapshot = null,
 
     pub fn render(self: DoctorSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -1333,7 +1228,7 @@ pub const DoctorSnapshot = struct {
         try out.writer.print("[doctor] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[doctor] model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("[doctor] model_source={s}\n", .{provider_catalog.label(self.provider)});
+            try out.writer.print("[doctor] model_source={s}\n", .{model_provider.label(self.provider)});
         }
         try out.writer.print("[doctor] auth={s}\n", .{self.auth.activeSourceLabel()});
         try out.writer.print("[doctor] auth_refreshable={}\n", .{self.auth.refreshable()});
@@ -1343,14 +1238,9 @@ pub const DoctorSnapshot = struct {
         }
         try out.writer.print("[doctor] permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
         try out.writer.print("[doctor] agent_step_limit={d}\n", .{self.agent_step_limit});
-        if (self.mcp) |mcp| try mcp.writeText(&out.writer, alloc, "doctor");
 
         for (self.checks) |entry| {
-            try out.writer.print("[{s}] ", .{checkStatusLabel(entry.status)});
-            try writeTerminalSafe(&out.writer, alloc, entry.name);
-            try out.writer.writeAll(": ");
-            try writeTerminalSafe(&out.writer, alloc, entry.detail);
-            try out.writer.writeByte('\n');
+            try out.writer.print("[{s}] {s}: {s}\n", .{ checkStatusLabel(entry.status), entry.name, entry.detail });
         }
 
         return try out.toOwnedSlice();
@@ -1376,7 +1266,7 @@ pub const DoctorSnapshot = struct {
         try std.json.Stringify.value(self.model, .{}, writer);
         if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
-            try std.json.Stringify.value(provider_catalog.label(self.provider), .{}, writer);
+            try std.json.Stringify.value(model_provider.label(self.provider), .{}, writer);
         }
         try writer.writeAll(",\"auth\":");
         try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
@@ -1401,12 +1291,148 @@ pub const DoctorSnapshot = struct {
             try writer.writeByte('}');
         }
 
-        try writer.writeByte(']');
-        if (self.mcp) |mcp| {
-            try writer.writeAll(",\"mcp\":");
-            try mcp.writeJson(writer);
+        try writer.writeAll("]}");
+    }
+};
+
+pub const BackgroundListSnapshot = struct {
+    records: []const background_store.Record,
+
+    pub fn render(self: BackgroundListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: BackgroundListSnapshot, alloc: Allocator) ![]u8 {
+        if (self.records.len == 0) {
+            return std.fmt.allocPrint(alloc, "[background] no persisted background records\n", .{});
         }
-        try writer.writeByte('}');
+
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+
+        try out.writer.print("[background] {d} saved\n", .{self.records.len});
+        for (self.records) |entry| {
+            try out.writer.print(" - #{d} [{s}] {s}\n", .{ entry.id, @tagName(entry.state), entry.command });
+            try out.writer.print("   cwd: {s}\n", .{entry.cwd});
+            try out.writer.print("   log: {s}\n", .{entry.log_path});
+            if (entry.server_url) |url| {
+                try out.writer.print("   url: {s}\n", .{url});
+            }
+            if (entry.diagnostic) |diagnostic| {
+                try out.writer.print("   diagnostic: {s}\n", .{diagnostic});
+            }
+        }
+
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: BackgroundListSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+
+        try out.writer.print("{{\"kind\":\"background\",\"count\":{d},\"records\":[", .{self.records.len});
+        for (self.records, 0..) |entry, i| {
+            if (i > 0) try out.writer.writeByte(',');
+            try out.writer.print("{{\"id\":{d},\"started_at_ms\":{d},\"updated_at_ms\":{d}", .{ entry.id, entry.started_at_ms, entry.updated_at_ms });
+            try out.writer.writeAll(",\"pid\":");
+            try std.json.Stringify.value(entry.pid, .{}, &out.writer);
+            try out.writer.writeAll(",\"command\":");
+            try std.json.Stringify.value(entry.command, .{}, &out.writer);
+            try out.writer.writeAll(",\"cwd\":");
+            try std.json.Stringify.value(entry.cwd, .{}, &out.writer);
+            try out.writer.writeAll(",\"log_path\":");
+            try std.json.Stringify.value(entry.log_path, .{}, &out.writer);
+            try out.writer.writeAll(",\"state\":");
+            try std.json.Stringify.value(@tagName(entry.state), .{}, &out.writer);
+            try out.writer.writeAll(",\"server_url\":");
+            if (entry.server_url) |url| {
+                try std.json.Stringify.value(url, .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.writeAll(",\"diagnostic\":");
+            if (entry.diagnostic) |diagnostic| {
+                try std.json.Stringify.value(diagnostic, .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.writeAll("}");
+        }
+        try out.writer.writeAll("]}");
+        return try out.toOwnedSlice();
+    }
+};
+
+pub const BackgroundDetailSnapshot = struct {
+    record: background_store.Record,
+
+    pub fn render(self: BackgroundDetailSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: BackgroundDetailSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+
+        try out.writer.print("[background] #{d} [{s}] {s}\n", .{ self.record.id, @tagName(self.record.state), self.record.command });
+        try out.writer.print("pid: {s}\n", .{self.record.pid});
+        try out.writer.print("cwd: {s}\n", .{self.record.cwd});
+        try out.writer.print("log: {s}\n", .{self.record.log_path});
+        try out.writer.print("started_at_ms: {d}\n", .{self.record.started_at_ms});
+        try out.writer.print("updated_at_ms: {d}\n", .{self.record.updated_at_ms});
+        try out.writer.print("expect_url: {s}\n", .{if (self.record.expect_url) "true" else "false"});
+        try out.writer.print("server_url: {s}\n", .{self.record.server_url orelse "(none)"});
+        try out.writer.print("diagnostic: {s}\n", .{self.record.diagnostic orelse "(none)"});
+        if (self.record.exit_code) |code| {
+            try out.writer.print("exit_code: {d}\n", .{code});
+        } else {
+            try out.writer.writeAll("exit_code: (none)\n");
+        }
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: BackgroundDetailSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+
+        try out.writer.print("{{\"kind\":\"background_detail\",\"id\":{d},\"started_at_ms\":{d},\"updated_at_ms\":{d}", .{ self.record.id, self.record.started_at_ms, self.record.updated_at_ms });
+        try out.writer.writeAll(",\"pid\":");
+        try std.json.Stringify.value(self.record.pid, .{}, &out.writer);
+        try out.writer.writeAll(",\"command\":");
+        try std.json.Stringify.value(self.record.command, .{}, &out.writer);
+        try out.writer.writeAll(",\"cwd\":");
+        try std.json.Stringify.value(self.record.cwd, .{}, &out.writer);
+        try out.writer.writeAll(",\"log_path\":");
+        try std.json.Stringify.value(self.record.log_path, .{}, &out.writer);
+        try out.writer.writeAll(",\"state\":");
+        try std.json.Stringify.value(@tagName(self.record.state), .{}, &out.writer);
+        try out.writer.print(",\"expect_url\":{s}", .{if (self.record.expect_url) "true" else "false"});
+        try out.writer.writeAll(",\"server_url\":");
+        if (self.record.server_url) |url| {
+            try std.json.Stringify.value(url, .{}, &out.writer);
+        } else {
+            try out.writer.writeAll("null");
+        }
+        try out.writer.writeAll(",\"diagnostic\":");
+        if (self.record.diagnostic) |diagnostic| {
+            try std.json.Stringify.value(diagnostic, .{}, &out.writer);
+        } else {
+            try out.writer.writeAll("null");
+        }
+        try out.writer.writeAll(",\"exit_code\":");
+        if (self.record.exit_code) |code| {
+            try out.writer.print("{d}", .{code});
+        } else {
+            try out.writer.writeAll("null");
+        }
+        try out.writer.writeByte('}');
+        return try out.toOwnedSlice();
     }
 };
 
@@ -1574,24 +1600,12 @@ pub const UpgradeSnapshot = struct {
                     try writeVersionWithPrefix(&out.writer, self.latest);
                 }
                 try out.writer.writeByte('\n');
-                const channel = update_target.Channel.parse(self.channel) orelse .stable;
-                if (update_notes.destination(
-                    channel,
-                    self.latest,
-                    self.current_revision,
-                    self.latest_revision,
-                )) |notes| {
-                    try update_notes.writeLabel(notes.kind, &out.writer);
-                    try out.writer.writeAll(": ");
-                    try notes.writeUrl(&out.writer);
-                    try out.writer.writeByte('\n');
-                }
             },
             .up_to_date => {
                 if (std.mem.eql(u8, self.channel, "dev") and self.latest_revision.len > 0) {
-                    try out.writer.print("fx dev {s} is already up to date (", .{shortRevision(self.latest_revision)});
+                    try out.writer.print("ffx dev {s} is already up to date (", .{shortRevision(self.latest_revision)});
                 } else {
-                    try out.writer.writeAll("fx is already up to date (");
+                    try out.writer.writeAll("ffx is already up to date (");
                 }
                 try writeVersionWithPrefix(&out.writer, self.latest);
                 try out.writer.writeAll(")\n");
@@ -1727,6 +1741,23 @@ fn writeSessionHistoryTurnText(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try writer.writeAll("[assistant]\n");
             try writeTextBlock(writer, entry.assistant);
         },
+        .background_command => |entry| {
+            try writeSessionUserTurnText(writer, entry.user);
+            try writeSessionExecutionText(writer, entry.execution);
+            if (entry.assistant) |assistant| {
+                try writer.writeAll("[assistant]\n");
+                try writeTextBlock(writer, assistant);
+            }
+            try writer.writeAll("[background]\n");
+            try writer.print("log: {s}\n", .{entry.log_path});
+            try writer.print("expect_url: {s}\n", .{if (entry.expect_url) "true" else "false"});
+            try writer.print("url: {s}\n", .{entry.url orelse "(none)"});
+            if (entry.background_record_id) |record_id| {
+                try writer.writeAll("record_id: ");
+                try writeHexBytes(writer, &record_id);
+                try writer.writeByte('\n');
+            }
+        },
         .interrupted => |entry| {
             try writeSessionUserTurnText(writer, entry.user);
             try writeSessionExecutionText(writer, entry.execution);
@@ -1822,6 +1853,33 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try session_json.writeExecutionMemoryJson(writer, entry.execution);
             try writer.writeByte('}');
         },
+        .background_command => |entry| {
+            try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
+            try writeSessionUserTurnJson(writer, entry.user);
+            if (entry.assistant) |assistant| {
+                try writer.writeAll(",\"assistant\":");
+                try std.json.Stringify.value(assistant, .{}, writer);
+            }
+            if (!entry.execution.isEmpty()) {
+                try writer.writeAll(",\"execution\":");
+                try session_json.writeExecutionMemoryJson(writer, entry.execution);
+            }
+            try writer.writeAll(",\"log_path\":");
+            try std.json.Stringify.value(entry.log_path, .{}, writer);
+            try writer.print(",\"expect_url\":{s}", .{if (entry.expect_url) "true" else "false"});
+            try writer.writeAll(",\"url\":");
+            if (entry.url) |url| {
+                try std.json.Stringify.value(url, .{}, writer);
+            } else {
+                try writer.writeAll("null");
+            }
+            if (entry.background_record_id) |record_id| {
+                try writer.writeAll(",\"background_record_id\":\"");
+                try writeHexBytes(writer, &record_id);
+                try writer.writeByte('"');
+            }
+            try writer.writeByte('}');
+        },
         .interrupted => |entry| {
             try writer.writeAll("{\"kind\":\"interrupted\",\"user\":");
             try writeSessionUserTurnJson(writer, entry.user);
@@ -1900,9 +1958,9 @@ test "command failure snapshot renders stable escaped json" {
 test "core status snapshot text and json stay stable" {
     const snapshot = StatusSnapshot{
         .model = "alpha",
-        .auth_help = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+        .auth_help = "Fx needs access to a model provider. Run ffx login, or ffx setup to use an API key, or set FFX_PROVIDER_API_KEY + FFX_PROVIDER_BASE_URL, or set AI_GATEWAY_API_KEY.",
         .permission_mode = .ask,
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/ffx",
         .history_turns = 3,
         .session_permission_grants = 1,
         .agent_step_limit = 24,
@@ -1911,14 +1969,14 @@ test "core status snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=Fx needs access to a model provider. Run ffx login, or ffx setup to use an API key, or set FFX_PROVIDER_API_KEY + FFX_PROVIDER_BASE_URL, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] sandbox=none\n[status] workspace=/tmp/ffx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to a model provider. Run ffx login, or ffx setup to use an API key, or set FFX_PROVIDER_API_KEY + FFX_PROVIDER_BASE_URL, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/ffx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24}",
         json,
     );
 }
@@ -1926,9 +1984,9 @@ test "core status snapshot text and json stay stable" {
 test "core status snapshot includes selected team when present" {
     const snapshot = StatusSnapshot{
         .model = "alpha",
-        .auth = .{ .active_source = .fx_login, .team = "example-team" },
+        .auth = .{ .active_source = .stored_key, .team = "example-team" },
         .permission_mode = .ask,
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/ffx",
         .history_turns = 0,
         .session_permission_grants = 0,
         .agent_step_limit = 24,
@@ -1937,14 +1995,14 @@ test "core status snapshot includes selected team when present" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=fx login\n[status] auth_refreshable=true\n[status] team=example-team\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=" ++ comptime credentials.sourceLabel(.stored_key) ++ "\n[status] auth_refreshable=false\n[status] team=example-team\n[status] permission_mode=ask\n[status] sandbox=none\n[status] workspace=/tmp/ffx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"fx login\",\"auth_refreshable\":true,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"" ++ comptime credentials.sourceLabel(.stored_key) ++ "\",\"auth_refreshable\":false,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/ffx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24}",
         json,
     );
 }
@@ -1954,12 +2012,12 @@ test "status distinguishes the selected model route from connected providers" {
         .model = "gpt-5.4",
         .provider = .codex,
         .auth = .{
-            .active_source = .chatgpt_subscription,
+            .active_source = .stored_key,
             .gateway_connected = true,
             .chatgpt_connected = true,
         },
         .permission_mode = .auto,
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/ffx",
         .history_turns = 0,
         .session_permission_grants = 0,
         .agent_step_limit = 24,
@@ -1979,7 +2037,7 @@ test "MCP config diagnostic renders in status text and JSON but not interactive 
     const snapshot = StatusSnapshot{
         .model = "alpha",
         .permission_mode = .ask,
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/ffx",
         .history_turns = 0,
         .session_permission_grants = 0,
         .agent_step_limit = 24,
@@ -2005,93 +2063,6 @@ test "MCP config diagnostic renders in status text and JSON but not interactive 
     const interactive = try snapshot.renderInteractiveBody(std.testing.allocator);
     defer std.testing.allocator.free(interactive);
     try std.testing.expect(std.mem.find(u8, interactive, "mcp_config_error") == null);
-}
-
-test "MCP config warning renders bounded status text and JSON" {
-    const snapshot = StatusSnapshot{
-        .model = "test-model",
-        .permission_mode = .ask,
-        .workspace_root = "/tmp/project",
-        .history_turns = 0,
-        .session_permission_grants = 0,
-        .agent_step_limit = 10,
-        .mcp_config_warning = mcp_contract.ProfileConfigWarning.init(
-            .suspicious_server_key,
-            "MCP-Servers",
-            1,
-        ),
-    };
-    const text = try snapshot.renderText(std.testing.allocator);
-    defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.find(
-        u8,
-        text,
-        "[status] mcp_config_warning=suspicious_server_key key=MCP-Servers additional_matches=1\n",
-    ) != null);
-
-    const json = try snapshot.renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"mcp_config_warning\":{") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"key\":\"MCP-Servers\"") != null);
-}
-
-test "status and doctor share a side-effect-free MCP inspection contract" {
-    const servers = [_]mcp_health.ConfiguredServerSnapshot{.{
-        .configured_name = @constCast("project-docs"),
-        .source = .workspace,
-        .scope = .profile,
-        .workspace_admission = .pending,
-        .required = false,
-        .transport = .http,
-    }};
-    const issues = [_]mcp_health.ConfigurationIssue{.{
-        .message = @constCast("broken entry was ignored"),
-    }};
-    const mcp = McpLocalSnapshot{
-        .servers = &servers,
-        .configuration_issues = &issues,
-    };
-    const status = StatusSnapshot{
-        .model = "alpha",
-        .permission_mode = .auto,
-        .workspace_root = "/tmp/fx",
-        .history_turns = 0,
-        .session_permission_grants = 0,
-        .agent_step_limit = 24,
-        .mcp = mcp,
-    };
-    const status_text = try status.renderText(std.testing.allocator);
-    defer std.testing.allocator.free(status_text);
-    try std.testing.expect(std.mem.find(
-        u8,
-        status_text,
-        "[status] mcp_server=project-docs source=workspace scope=profile admission=pending transport=http connection=not_checked authentication=not_checked",
-    ) != null);
-    const status_json = try status.renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(status_json);
-    try std.testing.expect(std.mem.find(
-        u8,
-        status_json,
-        "\"mcp\":{\"connection_check\":\"not_checked\"",
-    ) != null);
-    try std.testing.expect(std.mem.find(u8, status_json, "\"connection\":\"not_checked\"") != null);
-    try std.testing.expect(std.mem.find(u8, status_json, "broken entry was ignored") != null);
-
-    const doctor = DoctorSnapshot{
-        .workspace_root = "/tmp/fx",
-        .model = "alpha",
-        .permission_mode = .auto,
-        .agent_step_limit = 24,
-        .checks = &.{},
-        .mcp = mcp,
-    };
-    const doctor_json = try doctor.renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(doctor_json);
-    try std.testing.expect(std.mem.find(
-        u8,
-        doctor_json,
-        "\"mcp\":{\"connection_check\":\"not_checked\"",
-    ) != null);
 }
 
 test "core permissions snapshot text and json stay stable" {
@@ -2137,23 +2108,23 @@ test "model list explains public-only and rejected-credential catalogs" {
     }{
         .{
             .snapshot = .{ .ids = &ids, .private_models_hidden = true, .public_only_reason = .no_credential },
-            .text = "[models] 1 available\n - alpha\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
-            .body = "1 available\n - alpha\nUsing the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
+            .text = "[models] 1 available\n - alpha\n[models] Using the public model catalog; configure a provider API key for the full catalog.\n",
+            .body = "1 available\n - alpha\nUsing the public model catalog; configure a provider API key for the full catalog.",
         },
         .{
             .snapshot = rejected,
-            .text = "[models] 1 available\n - alpha\n[models] Your Gateway credential was rejected; using the public model catalog.\n",
-            .body = "1 available\n - alpha\nYour Gateway credential was rejected; using the public model catalog.",
+            .text = "[models] 1 available\n - alpha\n[models] Your credential was rejected; using the public model catalog.\n",
+            .body = "1 available\n - alpha\nYour credential was rejected; using the public model catalog.",
         },
         .{
             .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .no_credential },
-            .text = "[models] no models returned by gateway\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
-            .body = "no models returned by gateway\nUsing the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
+            .text = "[models] no models returned by gateway\n[models] Using the public model catalog; configure a provider API key for the full catalog.\n",
+            .body = "no models returned by gateway\nUsing the public model catalog; configure a provider API key for the full catalog.",
         },
         .{
             .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .authenticated_credential_rejected },
-            .text = "[models] no models returned by gateway\n[models] Your Gateway credential was rejected; using the public model catalog.\n",
-            .body = "no models returned by gateway\nYour Gateway credential was rejected; using the public model catalog.",
+            .text = "[models] no models returned by gateway\n[models] Your credential was rejected; using the public model catalog.\n",
+            .body = "no models returned by gateway\nYour credential was rejected; using the public model catalog.",
         },
         .{
             .snapshot = .{ .ids = &.{}, .provider = .codex },
@@ -2182,10 +2153,10 @@ test "model list explains public-only and rejected-credential catalogs" {
     // An API key hides nothing, so the note must stay absent.
     const quiet_text = try shown.renderText(alloc);
     defer alloc.free(quiet_text);
-    try std.testing.expect(std.mem.find(u8, quiet_text, "team-private") == null);
+    try std.testing.expect(std.mem.find(u8, quiet_text, "provider API key") == null);
     const quiet_body = try shown.renderInteractiveBody(alloc);
     defer alloc.free(quiet_body);
-    try std.testing.expect(std.mem.find(u8, quiet_body, "team-private") == null);
+    try std.testing.expect(std.mem.find(u8, quiet_body, "provider API key") == null);
 }
 
 test "core model list snapshot handles limits and empty lists" {
@@ -2262,7 +2233,7 @@ test "core session list snapshot text and json stay stable" {
     defer std.testing.allocator.free(paged_text);
     try std.testing.expectEqualStrings(
         "[sessions] 1 saved\n - Session title\n   id=abc | 3 turns | Spanish | updated 1970-01-01 00:00:00.002 UTC\n" ++
-            "[sessions] more saved sessions; continue with `fx sessions --cursor v1:2:abc`\n",
+            "[sessions] more saved sessions; continue with `ffx sessions --cursor v1:2:abc`\n",
         paged_text,
     );
 
@@ -2427,7 +2398,7 @@ test "core empty session detail snapshot text and json stay stable" {
     const detail = session_store.ReadOnlyDetail{
         .summary = .{
             .id = @constCast("sess-empty"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .workspace_root = @constCast("/tmp/ffx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("en"),
@@ -2435,8 +2406,8 @@ test "core empty session detail snapshot text and json stay stable" {
         },
         .state = .{
             .id = @constCast("sess-empty"),
-            .origin_workspace_root = @constCast("/tmp/fx"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .origin_workspace_root = @constCast("/tmp/ffx"),
+            .workspace_root = @constCast("/tmp/ffx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("en"),
@@ -2478,6 +2449,10 @@ test "core session detail snapshot preserves history variant shapes" {
         .action = .read,
         .status = .success,
     }};
+    const record_id = types.StableBackgroundRecordId{
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    };
     const history = [_]types.HistoryTurn{
         .{ .compacted_summary = .{
             .summary = @constCast("summary"),
@@ -2488,10 +2463,14 @@ test "core session detail snapshot preserves history variant shapes" {
             .user = .{ .text = @constCast("hola"), .images = @constCast(&images) },
             .assistant = @constCast("que tal"),
         } },
-        .{ .assistant = .{
+        .{ .background_command = .{
             .user = .{ .text = @constCast("npm run dev") },
-            .assistant = @constCast("The historical command is no longer owned."),
+            .assistant = @constCast("The server is starting."),
             .execution = .{ .files = files[0..] },
+            .log_path = @constCast("/tmp/server.log"),
+            .expect_url = true,
+            .url = @constCast("http://localhost:3000"),
+            .background_record_id = record_id,
         } },
         .{ .interrupted = .{
             .user = .{ .text = @constCast("inspect") },
@@ -2502,7 +2481,7 @@ test "core session detail snapshot preserves history variant shapes" {
     const detail = session_store.ReadOnlyDetail{
         .summary = .{
             .id = @constCast("sess-history"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .workspace_root = @constCast("/tmp/ffx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("es"),
@@ -2510,8 +2489,8 @@ test "core session detail snapshot preserves history variant shapes" {
         },
         .state = .{
             .id = @constCast("sess-history"),
-            .origin_workspace_root = @constCast("/tmp/fx"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .origin_workspace_root = @constCast("/tmp/ffx"),
+            .workspace_root = @constCast("/tmp/ffx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("es"),
@@ -2531,18 +2510,20 @@ test "core session detail snapshot preserves history variant shapes" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.find(u8, text, "[compacted] removed_turns=3 compactions=1") != null);
     try std.testing.expect(std.mem.find(u8, text, "[user]\nhola\n[images] 1\n - /tmp/a.png (image/png)\n[assistant]\nque tal\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "[execution]\nfile: read success src/main.zig\n[assistant]\nThe historical command is no longer owned.\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "[background]") == null);
+    try std.testing.expect(std.mem.find(u8, text, "[execution]\nfile: read success src/main.zig\n[assistant]\nThe server is starting.\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[background]\nlog: /tmp/server.log\nexpect_url: true\nurl: http://localhost:3000\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "record_id: 00112233445566778899aabbccddeeff") != null);
     try std.testing.expect(std.mem.find(u8, text, "[assistant]\nI inspected the entry point.\n[interrupted]") != null);
 
     const json = try (SessionDetailSnapshot{ .detail = detail }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"compacted_summary\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"assistant\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"background_command\"") == null);
+    try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"background_command\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"interrupted\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "{\"path\":\"/tmp/a.png\",\"media_type\":\"image/png\"}") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"assistant\":\"The historical command is no longer owned.\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"assistant\":\"The server is starting.\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"background_record_id\":\"00112233445566778899aabbccddeeff\"") != null);
     try std.testing.expect(std.mem.count(u8, json, "\"execution\"") >= 2);
 }
 
@@ -2560,7 +2541,7 @@ test "core session detail JSON includes assistant execution memory" {
         .output_bytes = 48,
         .stored_output_bytes = 48,
         .command_output_replay = .{ .available = .{
-            .handle = "fx-command-replay-private-sentinel.bin",
+            .handle = "ffx-command-replay-private-sentinel.bin",
             .framed_bytes = 77,
         } },
         .command_process_presentation = .{ .exit_code = 9 },
@@ -2573,21 +2554,12 @@ test "core session detail JSON includes assistant execution memory" {
     const history = [_]types.HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("fetch pdf") },
         .assistant = @constCast("artifact saved"),
-        .execution = .{
-            .tool_steps = steps[0..],
-            .turn_summary = .{
-                .started_at_ms = 100,
-                .completed_at_ms = 250,
-                .thinking_duration_ms = 40,
-                .turn_duration_ms = 150,
-                .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
-            },
-        },
+        .execution = .{ .tool_steps = steps[0..] },
     } }};
     const detail = session_store.ReadOnlyDetail{
         .summary = .{
             .id = @constCast("sess-exec"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .workspace_root = @constCast("/tmp/ffx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("en"),
@@ -2595,8 +2567,8 @@ test "core session detail JSON includes assistant execution memory" {
         },
         .state = .{
             .id = @constCast("sess-exec"),
-            .origin_workspace_root = @constCast("/tmp/fx"),
-            .workspace_root = @constCast("/tmp/fx"),
+            .origin_workspace_root = @constCast("/tmp/ffx"),
+            .workspace_root = @constCast("/tmp/ffx"),
             .created_at_ms = 1,
             .updated_at_ms = 2,
             .conversation_language = types.ConversationLanguage.literal("en"),
@@ -2614,18 +2586,12 @@ test "core session detail JSON includes assistant execution memory" {
 
     const json = try (SessionDetailSnapshot{ .detail = detail }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"execution\":{\"schema_version\":3") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"turn_summary\"") == null);
+    try std.testing.expect(std.mem.find(u8, json, "\"execution\":{\"schema_version\":2") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"name\":\"web_fetch\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "artifact-file.pdf") != null);
     try std.testing.expect(std.mem.find(u8, json, "command_output_replay") == null);
     try std.testing.expect(std.mem.find(u8, json, "command_process_presentation") == null);
-    try std.testing.expect(std.mem.find(u8, json, "fx-command-replay-private-sentinel.bin") == null);
-
-    const text = try (SessionDetailSnapshot{ .detail = detail }).renderText(std.testing.allocator);
-    defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "started_at_ms") == null);
-    try std.testing.expect(std.mem.find(u8, text, "input_tokens") == null);
+    try std.testing.expect(std.mem.find(u8, json, "ffx-command-replay-private-sentinel.bin") == null);
 }
 
 test "core session migration snapshot text and json stay stable" {
@@ -2663,7 +2629,7 @@ test "core session recovery snapshot text and json stay stable" {
     );
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[session recovery] copied source-session to recovered-session\nhistory_turns: 4\nresume: fx --resume recovered-session\n",
+        "[session recovery] copied source-session to recovered-session\nhistory_turns: 4\nresume: ffx --resume recovered-session\n",
         text,
     );
 
@@ -2687,7 +2653,7 @@ test "core session recovery snapshot text and json stay stable" {
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(partial_text);
     try std.testing.expectEqualStrings(
-        "[session recovery] copied source-session to partial-session\nhistory_turns: 4\nwarning: legacy command artifacts could not be authenticated\nresume: fx --resume partial-session\n",
+        "[session recovery] copied source-session to partial-session\nhistory_turns: 4\nwarning: legacy command artifacts could not be authenticated\nresume: ffx --resume partial-session\n",
         partial_text,
     );
     const partial_json = try (SessionRecoverySnapshot{
@@ -2710,7 +2676,7 @@ test "core session recovery snapshot text and json stay stable" {
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(warning);
     try std.testing.expectEqualStrings(
-        "[session recovery] could not confirm target target-session\nsource: source-session (unchanged)\nresolve: fx --resume target-session\ninspect: fx doctor\n",
+        "[session recovery] could not confirm target target-session\nsource: source-session (unchanged)\nresolve: ffx --resume target-session\ninspect: ffx doctor\n",
         warning,
     );
 }
@@ -2721,9 +2687,9 @@ test "core doctor snapshot text and json stay stable" {
         .{ .name = @constCast("gh"), .status = .warn, .detail = @constCast("GitHub CLI not found in PATH") },
     };
     const snapshot = DoctorSnapshot{
-        .workspace_root = "/tmp/fx",
+        .workspace_root = "/tmp/ffx",
         .model = "alpha",
-        .auth = .{ .active_source = .ai_gateway_api_key },
+        .auth = .{ .active_source = .env_var },
         .permission_mode = .ask,
         .agent_step_limit = 24,
         .checks = &checks,
@@ -2732,48 +2698,58 @@ test "core doctor snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[doctor] ok=1 warn=1 fail=0\n[doctor] workspace=/tmp/fx\n[doctor] model=alpha\n[doctor] auth=AI_GATEWAY_API_KEY\n[doctor] auth_refreshable=false\n[doctor] permission_mode=ask\n[doctor] agent_step_limit=24\n[ok] auth: AI_GATEWAY_API_KEY is configured\n[warn] gh: GitHub CLI not found in PATH\n",
+        "[doctor] ok=1 warn=1 fail=0\n[doctor] workspace=/tmp/ffx\n[doctor] model=alpha\n[doctor] auth=" ++ comptime credentials.sourceLabel(.env_var) ++ "\n[doctor] auth_refreshable=false\n[doctor] permission_mode=ask\n[doctor] agent_step_limit=24\n[ok] auth: AI_GATEWAY_API_KEY is configured\n[warn] gh: GitHub CLI not found in PATH\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"alpha\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"ask\",\"agent_step_limit\":24,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}",
+        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/ffx\",\"model\":\"alpha\",\"auth\":\"" ++ comptime credentials.sourceLabel(.env_var) ++ "\",\"auth_refreshable\":false,\"permission_mode\":\"ask\",\"agent_step_limit\":24,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}",
         json,
     );
 }
 
-test "doctor text escapes hostile check details while json preserves data" {
-    const checks = [_]doctor_runtime.Check{.{
-        .name = "mcp_config",
-        .status = .warn,
-        .detail = "warning key=bad\n\x1b]0;pwn\x07",
-    }};
-    const snapshot = DoctorSnapshot{
-        .workspace_root = "/tmp/fx",
-        .model = "alpha",
-        .permission_mode = .ask,
-        .agent_step_limit = 24,
-        .checks = &checks,
+test "background output contracts import background store" {
+    try std.testing.expect(background_store.Record == @import("../background/background_store.zig").Record);
+    try std.testing.expect(background_store.TaskState == @import("../background/background_store.zig").TaskState);
+}
+
+test "core background list and detail snapshots preserve persisted fields" {
+    const records = [_]background_store.Record{
+        .{
+            .id = 7,
+            .pid = @constCast("100"),
+            .command = @constCast("npm run dev"),
+            .cwd = @constCast("/tmp/ffx"),
+            .log_path = @constCast("/tmp/ffx.log"),
+            .expect_url = false,
+            .server_url = @constCast("http://localhost:3000"),
+            .started_at_ms = 1,
+            .updated_at_ms = 2,
+            .state = .running,
+        },
     };
 
-    const text = try snapshot.renderText(std.testing.allocator);
-    defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.find(
-        u8,
-        text,
-        "warning key=bad\\x0a\\x1b]0;pwn\\x07",
-    ) != null);
-    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+    const list_json = try (BackgroundListSnapshot{ .records = &records }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(list_json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"background\",\"count\":1,\"records\":[{\"id\":7,\"started_at_ms\":1,\"updated_at_ms\":2,\"pid\":\"100\",\"command\":\"npm run dev\",\"cwd\":\"/tmp/ffx\",\"log_path\":\"/tmp/ffx.log\",\"state\":\"running\",\"server_url\":\"http://localhost:3000\",\"diagnostic\":null}]}",
+        list_json,
+    );
 
-    const json = try snapshot.renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.find(
-        u8,
-        json,
-        "\"detail\":\"warning key=bad\\n\\u001b]0;pwn\\u0007\"",
-    ) != null);
+    const detail_text = try (BackgroundDetailSnapshot{ .record = records[0] }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(detail_text);
+    try std.testing.expect(std.mem.find(u8, detail_text, "expect_url: false\n") != null);
+    try std.testing.expect(std.mem.find(u8, detail_text, "server_url: http://localhost:3000\n") != null);
+    try std.testing.expect(std.mem.find(u8, detail_text, "exit_code: (none)\n") != null);
+
+    const detail_json = try (BackgroundDetailSnapshot{ .record = records[0] }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(detail_json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"background_detail\",\"id\":7,\"started_at_ms\":1,\"updated_at_ms\":2,\"pid\":\"100\",\"command\":\"npm run dev\",\"cwd\":\"/tmp/ffx\",\"log_path\":\"/tmp/ffx.log\",\"state\":\"running\",\"expect_url\":false,\"server_url\":\"http://localhost:3000\",\"diagnostic\":null,\"exit_code\":null}",
+        detail_json,
+    );
 }
 
 test "core credits snapshot renders error output" {
@@ -2851,11 +2827,7 @@ test "core upgrade snapshot renders errors and statuses" {
         .status = .upgraded,
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(upgraded_text);
-    try std.testing.expectEqualStrings(
-        "upgraded to v0.2.10\n" ++
-            "notes: https://fx.sh/changelog#v0.2.10\n",
-        upgraded_text,
-    );
+    try std.testing.expectEqualStrings("upgraded to v0.2.10\n", upgraded_text);
 
     const upgraded_json = try (UpgradeSnapshot{
         .current = "0.2.9",
@@ -2875,11 +2847,7 @@ test "core upgrade snapshot renders errors and statuses" {
         .status = .upgraded,
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(prefixed_text);
-    try std.testing.expectEqualStrings(
-        "upgraded to v0.2.10\n" ++
-            "notes: https://fx.sh/changelog#v0.2.10\n",
-        prefixed_text,
-    );
+    try std.testing.expectEqualStrings("upgraded to v0.2.10\n", prefixed_text);
 
     const up_to_date = UpgradeSnapshot{
         .current = "0.2.9",
@@ -2889,7 +2857,7 @@ test "core upgrade snapshot renders errors and statuses" {
 
     const up_to_date_text = try up_to_date.renderText(std.testing.allocator);
     defer std.testing.allocator.free(up_to_date_text);
-    try std.testing.expectEqualStrings("fx is already up to date (v0.2.10)\n", up_to_date_text);
+    try std.testing.expectEqualStrings("ffx is already up to date (v0.2.10)\n", up_to_date_text);
 
     const failed_text = try (UpgradeSnapshot{
         .current = "0.2.9",
@@ -2920,11 +2888,7 @@ test "core upgrade snapshot identifies dev revisions" {
 
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings(
-        "upgraded to dev abcdef012345 (v0.3.66)\n" ++
-            "changes: https://github.com/vercel-labs/fx/compare/111111111111...abcdef0123456789abcdef0123456789abcdef01\n",
-        text,
-    );
+    try std.testing.expectEqualStrings("upgraded to dev abcdef012345 (v0.3.66)\n", text);
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);

@@ -257,7 +257,7 @@ pub const FrameSurface = struct {
     }
 
     /// Feed ANSI bytes with DECAWM disabled. Footer rows are painted as
-    /// terminal lines, and fx keeps autowrap disabled session-wide.
+    /// terminal lines, and ffx keeps autowrap disabled session-wide.
     pub fn writeAnsiBandNoWrap(
         self: *FrameSurface,
         start_row: u16,
@@ -346,7 +346,7 @@ pub const FrameSurface = struct {
         return target;
     }
 
-    /// Removes fx-owned color, emphasis, and hyperlink presentation while
+    /// Removes ffx-owned color, emphasis, and hyperlink presentation while
     /// preserving glyphs, geometry, ownership, and shell-owned cells.
     pub fn neutralizeFxOwnedPresentation(self: *FrameSurface) void {
         for (self.cells) |*cell| {
@@ -688,7 +688,7 @@ test "frame surface preserves shell rows from shadow" {
     try std.testing.expectEqual(paint_plan.CellOwner.preserved_shell, surface.cellAt(1, 1).?.owner);
 }
 
-test "frame surface presentation neutralization preserves shell cells and fx geometry" {
+test "frame surface presentation neutralization preserves shell cells and Fx geometry" {
     var shadow = try shadowGrid(std.testing.allocator, 8, 6);
     defer shadow.deinit();
     try shadow.feed("\x1b[1;1H\x1b[31mS\x1b]8;;https://shell.example\x1b\\H\x1b]8;;\x1b\\\x1b[0m");
@@ -698,7 +698,7 @@ test "frame surface presentation neutralization preserves shell cells and fx geo
     _ = try surface.writeAnsiBand(
         2,
         1,
-        "\x1b[1;32mF\x1b]8;;https://fx.example\x1b\\X\x1b]8;;\x1b\\\x1b[0m",
+        "\x1b[1;32mF\x1b]8;;https://ffx.example\x1b\\X\x1b]8;;\x1b\\\x1b[0m",
         .transcript,
         .same_owner,
     );
@@ -761,7 +761,7 @@ test "full-terminal scroll invalidation does not allow painting preserved shell 
     var surface = try FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
     defer surface.deinit();
 
-    try std.testing.expectError(error.WriteOutsideBand, surface.writeAnsiBand(1, 1, "fx", .transcript, .same_owner));
+    try std.testing.expectError(error.WriteOutsideBand, surface.writeAnsiBand(1, 1, "ffx", .transcript, .same_owner));
     try std.testing.expectEqual(paint_plan.CellOwner.preserved_shell, surface.cellAt(1, 1).?.owner);
 }
 

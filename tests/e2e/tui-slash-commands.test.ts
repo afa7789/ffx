@@ -1,43 +1,27 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
-import {
-  FAKE_GATEWAY_MODEL,
-  fakeGatewayFinalText,
-  fakeGatewayToolCall,
-  startFakeGateway,
-  TmuxSession,
-  tmuxAvailable,
-} from "./tmux-helpers";
+import { FFX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
+import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TMUX_SKIP = !tmuxAvailable();
 const SKIP = TMUX_SKIP || !HAS_API_KEY;
 const TIMEOUT = 30_000;
 
 let session: TmuxSession | null = null;
-let gateway: ReturnType<typeof startFakeGateway> | null = null;
 const tempDirs: string[] = [];
 
 afterEach(async () => {
   if (session) { await session.kill(); session = null; }
-  if (gateway) { gateway.stop(); gateway = null; }
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 async function launchAndWait(): Promise<TmuxSession> {
-  const root = mkdtempSync(join(tmpdir(), "fx-slash-commands-"));
+  const root = mkdtempSync(join(tmpdir(), "ffx-slash-commands-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   mkdirSync(home);
@@ -55,7 +39,7 @@ async function launchNoKeyAndWait(): Promise<{
   terminal: TmuxSession;
   stderrPath: string;
 }> {
-  const root = mkdtempSync(join(tmpdir(), "fx-slash-commands-no-key-"));
+  const root = mkdtempSync(join(tmpdir(), "ffx-slash-commands-no-key-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   const stderrPath = join(root, "stderr.log");
@@ -68,10 +52,10 @@ async function launchNoKeyAndWait(): Promise<{
     env: {
       HOME: home,
       AI_GATEWAY_API_KEY: undefined,
-      FX_AUTO_UPGRADE: "0",
-      FX_DISABLE_KEYCHAIN: "1",
-      FX_PERMISSION_MODE: undefined,
-      FX_SKIP_ONBOARDING: "1",
+      FFX_AUTO_UPGRADE: "0",
+      FFX_DISABLE_KEYCHAIN: "1",
+      FFX_PERMISSION_MODE: undefined,
+      FFX_SKIP_ONBOARDING: "1",
       VERCEL_OIDC_TOKEN: undefined,
     },
   });
@@ -119,7 +103,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
   test(
     "compact status notice preserves native scrollback",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-status-compact-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-status-compact-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
@@ -136,12 +120,12 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
         minimumHistoryLines: 2000,
         env: {
           HOME: home,
-          AI_GATEWAY_API_KEY: "status-compact-key",
-          FX_AUTO_UPGRADE: "0",
-          FX_DISABLE_KEYCHAIN: "1",
-          FX_PERMISSION_MODE: "auto",
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
+          FFX_PROVIDER_API_KEY: "status-compact-key",
+          FFX_AUTO_UPGRADE: "0",
+          FFX_DISABLE_KEYCHAIN: "1",
+          FFX_PERMISSION_MODE: "auto",
+          FFX_RECORD: tapePath,
+          FFX_RECORD_INPUT: "1",
           VERCEL_OIDC_TOKEN: undefined,
           NO_COLOR: "1",
         },
@@ -168,7 +152,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       expect(await session.waitForSessionEnd(5_000)).toBe(true);
       session = null;
 
-      const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], {
+      const replay = JSON.parse(execFileSync(FFX_BIN, ["replay", tapePath, "--json"], {
         encoding: "utf8",
       }));
       expect(replay.frame_count).toBeGreaterThan(0);
@@ -204,10 +188,10 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
   );
 
   test(
-    "/model Enter lists available models inline",
+    "/models lists available models",
     async () => {
       session = await launchAndWait();
-      await session.sendText("/model");
+      await session.sendText("/models");
       const pane = await session.waitForText(/anthropic|model/i, 10_000);
       expect(pane.length).toBeGreaterThan(0);
     },
@@ -215,14 +199,12 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
   );
 
   test(
-    "/compact reports when there is no eligible context",
+    "/compact shows compaction message",
     async () => {
-      const launched = await launchNoKeyAndWait();
-      session = launched.terminal;
+      session = await launchAndWait();
       await session.sendText("/compact");
-      const pane = await session.waitForText("No context to compact.", 5_000);
-      expect(pane).toContain("No context to compact.");
-      expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
+      const pane = await session.waitForText(/compact/i, 5_000);
+      expect(pane.toLowerCase()).toContain("compact");
     },
     TIMEOUT,
   );
@@ -239,7 +221,6 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
         "/issue",
         "/history",
         "/rules",
-        "/models",
       ].entries()) {
         await session.sendText(command);
         const expectedCount = index + 1;

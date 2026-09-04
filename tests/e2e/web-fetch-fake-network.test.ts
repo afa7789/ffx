@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FFX_BIN, runFx } from "../evals/eval-helpers";
 
 const TIMEOUT = 20_000;
 const FETCH_URL = "https://example.com/docs";
@@ -108,17 +108,17 @@ function startFakeGateway(
 function createIsolatedRoot(args: {
   webFetchPermission?: PermissionAction;
 } = {}) {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-web-fetch-e2e-")));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-web-fetch-e2e-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
 
   const permission: Record<string, Record<string, string>> = {};
   if (args.webFetchPermission) {
     permission.web_fetch = { "domain:example.com": args.webFetchPermission };
   }
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ permission }));
+  writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({ permission }));
   return { root, home, workspace: realpathSync(workspace) };
 }
 
@@ -129,11 +129,11 @@ function fakeGatewayEnv(
 ) {
   return {
     HOME: root.home,
-    AI_GATEWAY_API_KEY: "fake-web-fetch-key",
+    FFX_PROVIDER_API_KEY: "fake-web-fetch-key",
     VERCEL_OIDC_TOKEN: undefined,
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: gateway.model,
+    FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_MODEL: gateway.model,
     ...extra,
   };
 }
@@ -200,7 +200,6 @@ class AcpClient {
   private lines: string[] = [];
   private waiters: Array<(line: string) => void> = [];
   private closed = false;
-  private activeSessionId: string | null = null;
 
   private constructor(private proc: ChildProcess) {
     proc.stdout!.on("data", (chunk: Buffer) => {
@@ -225,7 +224,7 @@ class AcpClient {
         (entry): entry is [string, string] => entry[1] !== undefined,
       ),
     );
-    return new AcpClient(nodeSpawn(FX_BIN, ["acp"], {
+    return new AcpClient(nodeSpawn(FFX_BIN, ["acp"], {
       cwd,
       env: definedEnv,
       stdio: ["pipe", "pipe", "pipe"],
@@ -233,23 +232,7 @@ class AcpClient {
   }
 
   send(message: object) {
-    let outgoing = message as any;
-    if (
-      this.activeSessionId !== null &&
-      [
-        "session/prompt",
-        "session/cancel",
-        "session/set_mode",
-        "session/set_config_option",
-      ].includes(outgoing.method) &&
-      outgoing.params?.sessionId === undefined
-    ) {
-      outgoing = {
-        ...outgoing,
-        params: { ...(outgoing.params ?? {}), sessionId: this.activeSessionId },
-      };
-    }
-    this.proc.stdin!.write(`${JSON.stringify(outgoing)}\n`);
+    this.proc.stdin!.write(`${JSON.stringify(message)}\n`);
   }
 
   async readLine(timeoutMs = TIMEOUT): Promise<any> {
@@ -270,18 +253,7 @@ class AcpClient {
 
   async request(method: string, params: object, id: number) {
     this.send({ jsonrpc: "2.0", id, method, params });
-    let response: any;
-    do {
-      response = await this.readLine();
-    } while (response.id !== id);
-    if (
-      response.error === undefined &&
-      method === "session/new" &&
-      typeof response.result?.sessionId === "string"
-    ) {
-      this.activeSessionId = response.result.sessionId;
-    }
-    return response;
+    return this.readLine();
   }
 
   async close() {
@@ -337,7 +309,7 @@ describe("web_fetch Gateway fixture", () => {
           expect(gateway.requests).toHaveLength(1);
           expect(gateway.requests[0].headers.get("ai-language-model-id")).toBe(model);
           expectWebFetchSchema(gateway.requests[0]);
-          expect(gateway.requests[0].body).toContain("gateway.exa_search");
+          expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
         } finally {
           gateway.stop();
           rmSync(root.root, { recursive: true, force: true });
@@ -377,7 +349,7 @@ describe("web_fetch Gateway fixture", () => {
         expectNoFetchProgress(result.stderr);
 
         const sessionEvents = readFileSync(
-          join(root.home, ".fx", "sessions", json.session_id, "events.jsonl"),
+          join(root.home, ".ffx", "sessions", json.session_id, "events.jsonl"),
           "utf8",
         );
         expect(sessionEvents).toContain("web_fetch");
@@ -425,7 +397,7 @@ describe("web_fetch Gateway fixture", () => {
   );
 
   test(
-    "default fx ask validates malformed web_fetch before transport",
+    "default ffx ask validates malformed web_fetch before transport",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
@@ -564,22 +536,11 @@ describe("web_fetch Gateway fixture", () => {
           (message) =>
             message.method === "session/update" &&
             message.params?.update?.sessionUpdate === "tool_call" &&
-            message.params.update.toolCallId === "fetch_outer_1",
+            message.params.update.kind === "read" &&
+            message.params.update.title === "Fetching",
         );
 
         expect(fetchStarts).toHaveLength(1);
-        expect(fetchStarts[0]?.params.update).toEqual({
-          sessionUpdate: "tool_call",
-          toolCallId: "fetch_outer_1",
-          name: "web_fetch",
-          title: "Fetching",
-          kind: "fetch",
-          status: "pending",
-          rawInput: {
-            url: "https://example.com/docs",
-            prompt: "legacy",
-          },
-        });
       } finally {
         await client.close();
         gateway.stop();

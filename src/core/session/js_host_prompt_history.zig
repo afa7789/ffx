@@ -5,9 +5,9 @@ const Allocator = std.mem.Allocator;
 const initial_capacity: usize = 4 * 1024;
 const max_response_bytes: usize = 1024 * 1024;
 
-extern "fx" fn fx_prompt_history_available() i32;
+extern "ffx" fn fx_prompt_history_available() i32;
 
-extern "fx" fn fx_prompt_history_load(
+extern "ffx" fn fx_prompt_history_load(
     workspace_ptr: [*]const u8,
     workspace_len: usize,
     limit: usize,
@@ -15,7 +15,7 @@ extern "fx" fn fx_prompt_history_load(
     out_cap: usize,
 ) i32;
 
-extern "fx" fn fx_prompt_history_append(
+extern "ffx" fn fx_prompt_history_append(
     timestamp_ms: i64,
     workspace_ptr: [*]const u8,
     workspace_len: usize,
@@ -23,7 +23,7 @@ extern "fx" fn fx_prompt_history_append(
     text_len: usize,
 ) i32;
 
-extern "fx" fn fx_prompt_history_clear(
+extern "ffx" fn fx_prompt_history_clear(
     workspace_ptr: [*]const u8,
     workspace_len: usize,
 ) i32;

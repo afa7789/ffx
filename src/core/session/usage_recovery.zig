@@ -36,15 +36,6 @@ pub fn collectFromHome(
     alloc: Allocator,
     home_path: []const u8,
 ) !OwnedRecovery {
-    return collectFromHomeCancelable(alloc, home_path, null);
-}
-
-fn collectFromHomeCancelable(
-    alloc: Allocator,
-    home_path: []const u8,
-    cancel_requested: ?*const std.atomic.Value(bool),
-) !OwnedRecovery {
-    if (cancelRequested(cancel_requested)) return error.Cancelled;
     var store = session_store.Store.initReadOnlyFromHome(
         alloc,
         home_path,
@@ -76,7 +67,6 @@ fn collectFromHomeCancelable(
     var unknown_pending = false;
 
     for (marked_sessions.items) |marked| {
-        if (cancelRequested(cancel_requested)) return error.Cancelled;
         var state = store.loadReadOnly(alloc, marked.id) catch {
             unknown_pending = true;
             continue;
@@ -170,30 +160,6 @@ pub fn collectFromHomeConservative(
     };
 }
 
-pub fn collectFromHomeConservativeCancelable(
-    alloc: Allocator,
-    home_path: []const u8,
-    cancel_requested: *const std.atomic.Value(bool),
-) !OwnedRecovery {
-    return collectFromHomeCancelable(
-        alloc,
-        home_path,
-        cancel_requested,
-    ) catch |err| {
-        if (err == error.OutOfMemory or err == error.Cancelled) return err;
-        debug_trace.logf(
-            "usage",
-            "local usage recovery incomplete reason={s}",
-            .{@errorName(err)},
-        );
-        return unknown(alloc);
-    };
-}
-
-fn cancelRequested(cancel_requested: ?*const std.atomic.Value(bool)) bool {
-    return if (cancel_requested) |flag| flag.load(.seq_cst) else false;
-}
-
 fn empty(alloc: Allocator) Allocator.Error!OwnedRecovery {
     return .{
         .facts = try alloc.alloc(usage_report.GenerationFact, 0),
@@ -219,20 +185,11 @@ test "empty recovery owns empty slices" {
     try std.testing.expect(!recovery.unknown_pending);
 }
 
-test "cancelled recovery stops before opening profile state" {
-    const alloc = std.testing.allocator;
-    var cancelled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(
-        error.Cancelled,
-        collectFromHomeConservativeCancelable(alloc, "/unused", &cancelled),
-    );
-}
-
 test "missing recovery registry is an empty bounded set" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
     var store = try session_store.Store.initFromHome(alloc, home, "/");
@@ -248,7 +205,7 @@ test "recovery markers are idempotent and clear durably" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -263,13 +220,13 @@ test "recovery markers are idempotent and clear durably" {
         error.FileNotFound,
         tmp.dir.access(
             io_mod.getIo(),
-            "home/.fx/sessions/usage-recovery",
+            "home/.ffx/sessions/usage-recovery",
             .{},
         ),
     );
     try tmp.dir.access(
         io_mod.getIo(),
-        "home/.fx/usage-recovery/recovery-marker",
+        "home/.ffx/usage-recovery/recovery-marker",
         .{},
     );
 
@@ -303,7 +260,7 @@ test "recovery registry reads only marked durable session state" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -376,7 +333,7 @@ test "recovery registry reads only marked durable session state" {
 
     var marker_before_file = try tmp.dir.openFile(
         io_mod.getIo(),
-        "home/.fx/usage-recovery/indexed-usage-recovery",
+        "home/.ffx/usage-recovery/indexed-usage-recovery",
         .{},
     );
     defer marker_before_file.close(io_mod.getIo());
@@ -399,7 +356,7 @@ test "recovery registry reads only marked durable session state" {
 
     var marker_after_file = try tmp.dir.openFile(
         io_mod.getIo(),
-        "home/.fx/usage-recovery/indexed-usage-recovery",
+        "home/.ffx/usage-recovery/indexed-usage-recovery",
         .{},
     );
     defer marker_after_file.close(io_mod.getIo());
@@ -417,7 +374,7 @@ test "recovery marker distinguishes checkpoints around a crash boundary" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);

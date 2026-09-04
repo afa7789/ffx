@@ -4,15 +4,17 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
 const process_tree = @import("process_tree.zig");
+const background_process_provider = @import(
+    "background_process_provider.zig",
+);
 const io_mod = @import("../shared/io.zig");
-const self_exe = @import("../shared/self_exe.zig");
+const background_launch_output = @import("../background/background_launch_output.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const artifact_digest = @import("../session/artifact_digest.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
-const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 
 const Allocator = std.mem.Allocator;
 pub const CommandOutputStream = command_contract.CommandOutputStream;
@@ -24,7 +26,6 @@ pub const CommandExecutionResult = command_contract.RunCommandResult;
 pub const Config = struct {
     max_command_output_bytes: usize,
     cancel_flag: ?*std.atomic.Value(bool) = null,
-    force_cancel_flag: ?*std.atomic.Value(bool) = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?CommandOutputCallback = null,
@@ -35,6 +36,8 @@ pub const Config = struct {
     timeout_started_ms: ?i64 = null,
     command_artifact_capability: ?*session_child_store.SessionChildCapability = null,
     command_artifact_dir: ?[]const u8 = null,
+    background_process_provider: background_process_provider.Provider =
+        background_process_provider.unavailable_provider,
 };
 
 pub const CallbackProjection = enum {
@@ -42,14 +45,12 @@ pub const CallbackProjection = enum {
     raw,
 };
 
-const command_artifact_file_prefix = "fx-command-";
-const command_artifact_fallback_dir_name = "fx-command-output";
+const command_artifact_file_prefix = "ffx-command-";
+const command_artifact_fallback_dir_name = "ffx-command-output";
 const command_artifact_log_suffix = ".log";
 const command_artifact_stdout_suffix = ".stdout.log";
 const command_artifact_stderr_suffix = ".stderr.log";
 const pending_output_flush_bytes: usize = 4096;
-const command_output_poll_ms: i64 = 100;
-pub const termination_settle_timeout_ms: i64 = 5_000;
 const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
     std.process.can_replace and
@@ -61,27 +62,14 @@ const foreground_session_release_byte: u8 = 0x06;
 const foreground_session_setup_timeout_ms: i64 = 5000;
 const foreground_target_termination_grace_ms: i64 = 700;
 const foreground_target_cleanup_wait_ms: i64 = 250;
-const foreground_supervisor_handoff_ms: i64 = command_output_poll_ms * 2;
 const foreground_session_replace_failure_exit_code: u8 = 125;
 const foreground_session_failure_nonce_bytes: usize = 16;
 const foreground_session_failure_nonce_hex_bytes: usize = foreground_session_failure_nonce_bytes * 2;
-const foreground_session_script_length_bytes = @sizeOf(u64);
-const foreground_session_release_index = foreground_session_failure_nonce_hex_bytes;
-const foreground_session_script_length_index = foreground_session_release_index + 1;
-const foreground_session_control_bytes = foreground_session_script_length_index +
-    foreground_session_script_length_bytes;
-const foreground_session_replace_failure_prefix = "\x00FX_FOREGROUND_EXEC_FAILED:";
+const foreground_session_replace_failure_prefix = "\x00FFX_FOREGROUND_EXEC_FAILED:";
 const foreground_session_replace_failure_marker_bytes =
     foreground_session_replace_failure_prefix.len +
     foreground_session_failure_nonce_hex_bytes + 1;
-const foreground_session_force_signal = std.posix.SIG.USR1;
-const ForegroundSessionTerminationRequest = enum(std.c.sig_atomic_t) {
-    none,
-    graceful,
-    force,
-};
-var foreground_session_termination_request: std.c.sig_atomic_t =
-    @intFromEnum(ForegroundSessionTerminationRequest.none);
+var foreground_session_termination_requested: std.c.sig_atomic_t = 0;
 const foreground_session_replace_error_name_bytes = blk: {
     var max_len: usize = 0;
     for (std.meta.fields(std.process.ReplaceError)) |field| {
@@ -99,22 +87,6 @@ pub fn isForegroundSessionInvocation(args: []const [:0]const u8) bool {
     return args.len > 0 and std.mem.eql(u8, args[0], foreground_session_token);
 }
 
-fn readForegroundSessionInputExact(buffer: []u8) !void {
-    const zio = io_mod.getIo();
-    var offset: usize = 0;
-    while (offset < buffer.len) {
-        const read_len = std.Io.File.stdin().readStreaming(
-            zio,
-            &.{buffer[offset..]},
-        ) catch |err| switch (err) {
-            error.EndOfStream => return error.InvalidForegroundSessionRelease,
-            else => |read_err| return read_err,
-        };
-        if (read_len == 0) return error.InvalidForegroundSessionRelease;
-        offset += read_len;
-    }
-}
-
 pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     if (comptime !supports_foreground_session) {
         return error.OperationUnsupported;
@@ -122,11 +94,6 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     if (!isForegroundSessionInvocation(args) or args.len < 3) {
         return error.InvalidForegroundSessionInvocation;
     }
-    const deadline_ms = if (std.mem.eql(u8, args[1], "none"))
-        null
-    else
-        std.fmt.parseInt(i64, args[1], 10) catch
-            return error.InvalidForegroundSessionInvocation;
     if (std.c.setsid() == -1) return error.ForegroundSessionSetupFailed;
 
     const zio = io_mod.getIo();
@@ -135,288 +102,98 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         &.{foreground_session_ready_byte},
     );
 
-    var control: [foreground_session_control_bytes]u8 = undefined;
-    try readForegroundSessionInputExact(&control);
-    const failure_nonce = control[0..foreground_session_failure_nonce_hex_bytes];
-    if (control[foreground_session_release_index] != foreground_session_release_byte) {
+    var release: [1]u8 = undefined;
+    const release_len = std.Io.File.stdin().readStreaming(
+        zio,
+        &.{&release},
+    ) catch |err| switch (err) {
+        error.EndOfStream => return error.InvalidForegroundSessionRelease,
+        else => |read_err| return read_err,
+    };
+    if (release_len != 1 or release[0] != foreground_session_release_byte) {
         return error.InvalidForegroundSessionRelease;
     }
-    const script_len = std.math.cast(usize, std.mem.readInt(
-        u64,
-        control[foreground_session_script_length_index..][0..foreground_session_script_length_bytes],
-        .little,
-    )) orelse {
-        writeForegroundSessionReplaceFailure(
-            failure_nonce,
-            error.InvalidForegroundSessionScriptLength,
-        );
-        std.process.exit(foreground_session_replace_failure_exit_code);
-    };
-    const script = std.heap.page_allocator.alloc(u8, script_len) catch |err| {
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
-        std.process.exit(foreground_session_replace_failure_exit_code);
-    };
-    defer std.heap.page_allocator.free(script);
-    readForegroundSessionInputExact(script) catch |err| {
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
-        std.process.exit(foreground_session_replace_failure_exit_code);
-    };
 
-    @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
-        @intFromEnum(ForegroundSessionTerminationRequest.none);
+    // The group receives TERM together. Keep the supervisor alive while the
+    // target uses the cooperative shutdown window.
+    @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* = 0;
     const supervisor_action: std.posix.Sigaction = .{
         .handler = .{ .handler = recordForegroundSessionTermination },
-        .mask = foregroundSupervisorSignalMask(),
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.TERM, &supervisor_action, null);
-    std.posix.sigaction(foreground_session_force_signal, &supervisor_action, null);
     if (comptime builtin.os.tag == .linux) {
         _ = try std.posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, 1)});
     }
-    var process_witness: ?process_tree.DarwinProcessWitness =
-        if (comptime builtin.os.tag == .macos)
-            try .init()
-        else
-            null;
-    defer if (process_witness) |*witness| witness.deinit();
-    const spawn_options: std.process.SpawnOptions = .{
+    var target = std.process.spawn(zio, .{
         .argv = args[2..],
-        .stdin = .pipe,
+        .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
         .start_suspended = builtin.os.tag == .macos,
-    };
-    var target = (if (comptime builtin.os.tag == .macos)
-        darwin_process_spawn.spawn_inheriting_fd(
-            zio,
-            spawn_options,
-            process_witness.?.childFd(),
-        )
-    else
-        std.process.spawn(zio, spawn_options)) catch |err| {
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
+    }) catch |err| {
+        writeForegroundSessionReplaceFailure(args[1], err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
-    if (process_witness) |*witness| witness.closeChildCopy();
-    var target_input = target.stdin orelse {
+    const term = waitForForegroundTarget(&target) catch |err| {
         target.kill(zio);
-        writeForegroundSessionReplaceFailure(
-            failure_nonce,
-            error.ForegroundTargetInputMissing,
-        );
-        std.process.exit(foreground_session_replace_failure_exit_code);
-    };
-    target.stdin = null;
-    target_input.writeStreamingAll(zio, script) catch |err| {
-        target_input.close(zio);
-        target.kill(zio);
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
-        std.process.exit(foreground_session_replace_failure_exit_code);
-    };
-    target_input.close(zio);
-    const term = waitForForegroundTarget(
-        &target,
-        if (process_witness) |*witness| witness else null,
-        deadline_ms,
-    ) catch |err| {
-        target.kill(zio);
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
+        writeForegroundSessionReplaceFailure(args[1], err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
     exitForegroundSessionSupervisor(term);
 }
 
-fn recordForegroundSessionTermination(signal: std.posix.SIG) callconv(.c) void {
-    const request = @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request);
-    request.* = @intFromEnum(mergeForegroundSessionTerminationRequest(
-        @enumFromInt(request.*),
-        signal,
-    ));
+fn recordForegroundSessionTermination(_: std.posix.SIG) callconv(.c) void {
+    @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* = 1;
 }
 
-fn foregroundSupervisorSignalMask() std.posix.sigset_t {
-    var mask = std.posix.sigemptyset();
-    std.posix.sigaddset(&mask, std.posix.SIG.TERM);
-    std.posix.sigaddset(&mask, foreground_session_force_signal);
-    return mask;
+fn foregroundSessionTerminationRequested() bool {
+    return @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* != 0;
 }
-
-fn mergeForegroundSessionTerminationRequest(
-    current: ForegroundSessionTerminationRequest,
-    signal: std.posix.SIG,
-) ForegroundSessionTerminationRequest {
-    if (current == .force or signal == foreground_session_force_signal) return .force;
-    if (current == .none and signal == std.posix.SIG.TERM) return .graceful;
-    return current;
-}
-
-fn foregroundSessionTerminationRequest() ForegroundSessionTerminationRequest {
-    return @enumFromInt(
-        @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).*,
-    );
-}
-
-const ForegroundTerminationAction = enum {
-    none,
-    begin_graceful,
-    force,
-};
-
-fn decideForegroundTerminationAction(
-    request: ForegroundSessionTerminationRequest,
-    termination_started_ms: ?i64,
-    forced: bool,
-    now_ms: i64,
-) ForegroundTerminationAction {
-    if (forced or request == .none) return .none;
-    if (request == .force) return .force;
-    const started_ms = termination_started_ms orelse return .begin_graceful;
-    if (now_ms >= started_ms and
-        now_ms - started_ms >= foreground_target_termination_grace_ms)
-    {
-        return .force;
-    }
-    return .none;
-}
-
-fn foregroundRequestAtDeadline(
-    observed: ForegroundSessionTerminationRequest,
-    owner_alive: bool,
-    deadline_ms: ?i64,
-    now_ms: i64,
-) ForegroundSessionTerminationRequest {
-    if (!owner_alive) return .force;
-    if (observed != .none) return observed;
-    const deadline = deadline_ms orelse return .none;
-    return if (now_ms >= deadline) .force else .none;
-}
-
-fn foregroundSessionOwnerAlive() bool {
-    var poll_fds = [_]std.posix.pollfd{.{
-        .fd = std.posix.STDIN_FILENO,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    return (std.posix.poll(&poll_fds, 0) catch return false) == 0;
-}
-
-const ChildWaiter = struct {
-    child: *std.process.Child,
-    io: std.Io,
-    ready: std.atomic.Value(bool) = .init(false),
-    result: std.process.Child.WaitError!std.process.Child.Term = undefined,
-    future: ?std.Io.Future(void) = null,
-
-    fn init(child: *std.process.Child) ChildWaiter {
-        return .{
-            .child = child,
-            .io = io_mod.getIo(),
-        };
-    }
-
-    fn start(self: *ChildWaiter) !void {
-        self.future = try std.Io.concurrent(
-            self.io,
-            ChildWaiter.waitMain,
-            .{self},
-        );
-    }
-
-    fn waitMain(self: *ChildWaiter) void {
-        self.result = self.child.wait(self.io);
-        self.ready.store(true, .release);
-    }
-
-    fn isReady(self: *const ChildWaiter) bool {
-        return self.ready.load(.acquire);
-    }
-
-    fn awaitReady(self: *ChildWaiter) !std.process.Child.Term {
-        std.debug.assert(self.isReady());
-        var future = &self.future.?;
-        future.await(self.io);
-        return try self.result;
-    }
-
-    fn awaitDiscard(self: *ChildWaiter) void {
-        var future = &self.future.?;
-        future.await(self.io);
-    }
-
-    fn abort(self: *ChildWaiter, pid: std.posix.pid_t) void {
-        if (self.isReady()) {
-            self.awaitDiscard();
-            return;
-        }
-        signalProcess(pid, std.posix.SIG.KILL) catch {};
-        self.awaitDiscard();
-    }
-};
 
 fn waitForForegroundTarget(
     target: *std.process.Child,
-    process_witness: ?*const process_tree.DarwinProcessWitness,
-    deadline_ms: ?i64,
 ) !std.process.Child.Term {
     const target_pid = target.id orelse return error.ForegroundTargetMissing;
     var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
     defer descendants.deinit();
-    if (process_witness) |witness| {
-        descendants.bindProcessWitness(witness);
-    }
     if (comptime builtin.os.tag == .macos) {
         try descendants.refresh(target_pid);
         try std.posix.kill(target_pid, std.posix.SIG.CONT);
     }
-    var waiter = ChildWaiter.init(target);
-    try waiter.start();
-    var wait_pending = true;
-    defer if (wait_pending) waiter.abort(target_pid);
     var termination_started_ms: ?i64 = null;
     var forced = false;
-    var owner_alive = true;
 
     while (true) {
-        const now_ms = io_mod.milliTimestamp();
-        if (owner_alive and !foregroundSessionOwnerAlive()) {
-            owner_alive = false;
-            debug_trace.logf(
-                "core",
-                "captured command owner liveness closed; forcing process tree cleanup",
-                .{},
-            );
-        }
-        const request = foregroundRequestAtDeadline(
-            foregroundSessionTerminationRequest(),
-            owner_alive,
-            deadline_ms,
-            now_ms,
-        );
-        if (request == .force) {
-            @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
-                @intFromEnum(ForegroundSessionTerminationRequest.force);
-        }
         try refreshForegroundTargetTree(&descendants, target_pid);
-        advanceForegroundTargetTermination(
-            &descendants,
-            request,
-            now_ms,
-            &termination_started_ms,
-            &forced,
-        );
+        const now_ms = io_mod.milliTimestamp();
+        if (foregroundSessionTerminationRequested()) {
+            if (termination_started_ms == null) {
+                beginForegroundTargetTermination(
+                    &descendants,
+                    now_ms,
+                    &termination_started_ms,
+                );
+            } else if (!forced and
+                now_ms - termination_started_ms.? >= foreground_target_termination_grace_ms)
+            {
+                forced = true;
+                forceKillForegroundTargetDescendants(&descendants);
+            }
+        }
 
-        if (waiter.isReady()) {
-            wait_pending = false;
-            const term = try waiter.awaitReady();
+        if (try pollProcessLeader(target)) |term| {
             try refreshForegroundTargetTree(&descendants, target_pid);
-            advanceForegroundTargetTermination(
-                &descendants,
-                foregroundSessionTerminationRequest(),
-                io_mod.milliTimestamp(),
-                &termination_started_ms,
-                &forced,
-            );
+            if (termination_started_ms == null and
+                foregroundSessionTerminationRequested())
+            {
+                beginForegroundTargetTermination(
+                    &descendants,
+                    io_mod.milliTimestamp(),
+                    &termination_started_ms,
+                );
+            }
             if (termination_started_ms) |started_ms| {
                 try waitForForegroundTargetDescendants(
                     &descendants,
@@ -477,44 +254,27 @@ fn refreshForegroundTargetTree(
         try descendants.refreshAdditionalRoot(std.c.getpid());
     }
     if (comptime builtin.os.tag == .macos) {
-        if (foregroundSessionTerminationRequest() != .none) {
+        if (foregroundSessionTerminationRequested()) {
             try descendants.refreshLineageProcesses();
         }
     }
 }
 
-fn advanceForegroundTargetTermination(
+fn beginForegroundTargetTermination(
     descendants: *process_tree.Tracker,
-    request: ForegroundSessionTerminationRequest,
     now_ms: i64,
     termination_started_ms: *?i64,
-    forced: *bool,
 ) void {
-    switch (decideForegroundTerminationAction(
-        request,
-        termination_started_ms.*,
-        forced.*,
-        now_ms,
-    )) {
-        .none => {},
-        .begin_graceful => {
-            termination_started_ms.* = now_ms;
-            const count = descendants.signalOutsideProcessGroup(
-                std.posix.SIG.TERM,
-                std.c.getpid(),
-            );
-            debug_trace.logf(
-                "core",
-                "captured command termination reached tracked descendants count={d}",
-                .{count},
-            );
-        },
-        .force => {
-            if (termination_started_ms.* == null) termination_started_ms.* = now_ms;
-            forced.* = true;
-            forceKillForegroundTargetDescendants(descendants);
-        },
-    }
+    termination_started_ms.* = now_ms;
+    const count = descendants.signalOutsideProcessGroup(
+        std.posix.SIG.TERM,
+        std.c.getpid(),
+    );
+    debug_trace.logf(
+        "core",
+        "captured command termination reached tracked descendants count={d}",
+        .{count},
+    );
 }
 
 fn waitForForegroundTargetDescendants(
@@ -635,7 +395,7 @@ pub fn executeCommandInEnvironment(
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     try ExecutionControl.init(effective_cfg).check();
-    const invocation = try shell_resolver.capturedInvocation(scratch, environment, command);
+    const invocation = try shell_resolver.capturedInvocation(environment, command);
     debug_trace.logf(
         "core",
         "command runner explicit environment={s} shell={s}",
@@ -651,6 +411,26 @@ pub fn executeCommandInEnvironment(
     );
 }
 
+pub fn spawnPreparedBackground(
+    cfg: Config,
+    arena: Allocator,
+    cwd: []const u8,
+    output: *const background_launch_output.Output,
+) !background_process_provider.PreparedProcess {
+    var effective_cfg = cfg;
+    if (effective_cfg.timeout_started_ms == null) {
+        effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
+    }
+    try ExecutionControl.init(effective_cfg).check();
+    return effective_cfg.background_process_provider.spawnPrepared(
+        arena,
+        .{
+            .cwd = cwd,
+            .output = output.providerCapability(),
+            .isolation = .none,
+        },
+    );
+}
 const ExecutionControl = struct {
     cancel_flag: ?*std.atomic.Value(bool),
     timeout_ms: ?usize,
@@ -672,19 +452,7 @@ const ExecutionControl = struct {
             if (elapsed_ms >= timeout_ms) return error.TimeoutExpired;
         }
     }
-
-    fn deadlineMs(self: ExecutionControl) ?i64 {
-        const timeout_ms = self.timeout_ms orelse return null;
-        const timeout_i64 = std.math.cast(i64, timeout_ms) orelse return std.math.maxInt(i64);
-        const sum = @addWithOverflow(self.started_ms, timeout_i64);
-        return if (sum[1] == 0) sum[0] else std.math.maxInt(i64);
-    }
 };
-
-fn foreground_supervisor_fallback_deadline_ms(deadline_ms: ?i64) ?i64 {
-    const deadline = deadline_ms orelse return null;
-    return deadline +| foreground_supervisor_handoff_ms;
-}
 
 fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
     return if (cancel_flag) |flag| flag.load(.seq_cst) else false;
@@ -702,8 +470,7 @@ fn emitAcceptedOutputChunk(
 }
 
 const CollectedProcess = struct {
-    status: command_contract.CommandStatus,
-    output_incomplete: bool = false,
+    term: std.process.Child.Term,
     stdout: []const u8,
     stderr: []const u8,
     stdout_bytes: usize,
@@ -953,18 +720,13 @@ const OutputCollector = struct {
         }
     }
 
-    fn finish(
-        self: *OutputCollector,
-        status: command_contract.CommandStatus,
-        output_incomplete: bool,
-    ) !CollectedProcess {
+    fn finish(self: *OutputCollector, term: std.process.Child.Term) !CollectedProcess {
         if (self.artifact) |*artifact| {
             try artifact.sync();
             try artifact.contentAddressManagedOutput(self.alloc);
             const truncated = self.totalBytes() > self.cfg.max_command_output_bytes;
             return .{
-                .status = status,
-                .output_incomplete = output_incomplete,
+                .term = term,
                 .stdout = "",
                 .stderr = "",
                 .stdout_bytes = self.stdout_bytes,
@@ -979,8 +741,7 @@ const OutputCollector = struct {
         }
 
         return .{
-            .status = status,
-            .output_incomplete = output_incomplete,
+            .term = term,
             .stdout = try self.stdout.toOwnedSlice(self.alloc),
             .stderr = try self.stderr.toOwnedSlice(self.alloc),
             .stdout_bytes = self.stdout_bytes,
@@ -1015,20 +776,16 @@ const OutputCollector = struct {
 
 fn finishCollectedProcess(
     output: *OutputCollector,
-    status: command_contract.CommandStatus,
-    output_incomplete: bool,
+    term: std.process.Child.Term,
     duration_ms: u64,
     source: TerminationSource,
-    preserve_cancelled_status: bool,
 ) !CollectedProcess {
     switch (source) {
         .timed_out => return error.TimeoutExpired,
         .natural => {},
         .cancelled => {
-            if (!preserve_cancelled_status and output.totalBytes() == 0) {
-                return error.Cancelled;
-            }
-            if (output.totalBytes() != 0 and output.artifact == null) {
+            if (output.totalBytes() == 0) return error.Cancelled;
+            if (output.artifact == null) {
                 output.startArtifact() catch |err| {
                     debug_trace.logf("core", "cancelled command artifact promotion failed err={s}", .{@errorName(err)});
                     return error.Cancelled;
@@ -1037,7 +794,7 @@ fn finishCollectedProcess(
         },
     }
 
-    var result = output.finish(status, output_incomplete) catch |err| {
+    var result = output.finish(term) catch |err| {
         if (source != .cancelled) return err;
         debug_trace.logf("core", "cancelled command artifact finalization failed err={s}", .{@errorName(err)});
         return error.Cancelled;
@@ -1102,26 +859,26 @@ fn executeProcessWithInput(
         child.id
     else
         null;
-    child_needs_cleanup = false;
-    const collected = try collectSpawnedProcess(
+    var leader_term: ?std.process.Child.Term = null;
+    const source = try collectOutputForProcess(
         scratch,
         &child,
         &output,
         cfg,
         null,
         process_group_id,
-        .process_group,
+        &leader_term,
+    );
+    const term = try waitForCollectedProcess(
+        &child,
+        source,
+        process_group_id,
+        leader_term,
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
+    child_needs_cleanup = false;
 
-    return finishCollectedProcess(
-        &output,
-        collected.status,
-        collected.output_incomplete,
-        duration_ms,
-        collected.source,
-        cfg.force_cancel_flag != null,
-    );
+    return finishCollectedProcess(&output, term, duration_ms, source);
 }
 
 fn executeProcessWithScript(
@@ -1179,13 +936,7 @@ fn executeProcessWithDetachedSession(
     var helper_argv: std.ArrayList([]const u8) = .empty;
     try helper_argv.append(scratch, executable);
     try helper_argv.append(scratch, foreground_session_token);
-    const deadline_ms = ExecutionControl.init(cfg).deadlineMs();
-    const supervisor_deadline_ms = foreground_supervisor_fallback_deadline_ms(deadline_ms);
-    const deadline_text = if (supervisor_deadline_ms) |value|
-        try std.fmt.allocPrint(scratch, "{d}", .{value})
-    else
-        "none";
-    try helper_argv.append(scratch, deadline_text);
+    try helper_argv.append(scratch, &nonce);
     try helper_argv.appendSlice(scratch, argv);
 
     const started_ms = io_mod.milliTimestamp();
@@ -1210,60 +961,59 @@ fn executeProcessWithDetachedSession(
     phase = .group_ready;
     try ExecutionControl.init(cfg).check();
 
-    const script_write = child.stdin orelse return error.SpawnFailed;
+    var script_write = child.stdin orelse return error.SpawnFailed;
     child.stdin = null;
-    defer script_write.close(io_mod.getIo());
+    var script_write_open = true;
+    defer if (script_write_open) script_write.close(io_mod.getIo());
 
-    var script_length: [foreground_session_script_length_bytes]u8 = undefined;
-    std.mem.writeInt(u64, &script_length, @intCast(script.len), .little);
-    try script_write.writeStreamingAll(io_mod.getIo(), &nonce);
-    try script_write.writeStreamingAll(
+    var script_write_error: ?std.Io.File.Writer.Error = null;
+    script_write.writeStreamingAll(
         io_mod.getIo(),
         &.{foreground_session_release_byte},
-    );
-    try script_write.writeStreamingAll(io_mod.getIo(), &script_length);
-    try script_write.writeStreamingAll(io_mod.getIo(), script);
+    ) catch |err| {
+        script_write_error = err;
+    };
+    if (script_write_error == null) {
+        script_write.writeStreamingAll(io_mod.getIo(), script) catch |err| {
+            script_write_error = err;
+        };
+    }
+    script_write.close(io_mod.getIo());
+    script_write_open = false;
 
     var launch_failure_probe = ForegroundLaunchFailureProbe.init(&failure_marker);
     const process_group_id = child.id;
-    child_needs_cleanup = false;
-    var collected = try collectSpawnedProcess(
+    var leader_term: ?std.process.Child.Term = null;
+    const source = try collectOutputForProcess(
         scratch,
         &child,
         &output,
         cfg,
         &launch_failure_probe,
         process_group_id,
-        .foreground_supervisor,
+        &leader_term,
     );
-    collected.source = reconcileForegroundTerminationSource(
-        collected.source,
-        deadline_ms,
-        io_mod.milliTimestamp(),
+    const term = try waitForCollectedProcess(
+        &child,
+        source,
+        process_group_id,
+        leader_term,
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
+    child_needs_cleanup = false;
 
-    if (foregroundSessionReplacementError(
-        collected.status,
-        launch_failure_probe,
-    )) |launch_err| return launch_err;
-    return finishCollectedProcess(
-        &output,
-        collected.status,
-        collected.output_incomplete,
-        duration_ms,
-        collected.source,
-        cfg.force_cancel_flag != null,
-    );
+    if (foregroundSessionReplacementError(term, launch_failure_probe)) |launch_err| return launch_err;
+    if (script_write_error) |write_err| return write_err;
+    return finishCollectedProcess(&output, term, duration_ms, source);
 }
 
 fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
     if (comptime builtin.is_test) {
-        const path_z = std.c.getenv("FX_TEST_PRODUCT_EXE") orelse
+        const path_z = std.c.getenv("FFX_TEST_PRODUCT_EXE") orelse
             return error.TestProductExecutableMissing;
         return std.mem.sliceTo(path_z, 0);
     }
-    return self_exe.pathForReexec(scratch);
+    return std.process.executablePathAlloc(io_mod.getIo(), scratch);
 }
 
 fn waitForForegroundSessionReady(
@@ -1341,11 +1091,11 @@ fn cleanupForegroundSessionChild(
 }
 
 fn foregroundSessionReplacementError(
-    status: command_contract.CommandStatus,
+    term: std.process.Child.Term,
     probe: ForegroundLaunchFailureProbe,
 ) ?(std.process.ReplaceError || error{CommandLaunchFailed}) {
-    switch (status) {
-        .exit_code => |code| if (code != foreground_session_replace_failure_exit_code) return null,
+    switch (term) {
+        .exited => |code| if (code != foreground_session_replace_failure_exit_code) return null,
         else => return null,
     }
     if (probe.status != .failed) return null;
@@ -1384,26 +1134,26 @@ fn executeProcessWithScriptUnisolated(
     script_write_open = false;
 
     const process_group_id = child.id;
-    child_needs_cleanup = false;
-    const collected = try collectSpawnedProcess(
+    var leader_term: ?std.process.Child.Term = null;
+    const source = try collectOutputForProcess(
         scratch,
         &child,
         &output,
         cfg,
         null,
         process_group_id,
-        .process_group,
+        &leader_term,
+    );
+    const term = try waitForCollectedProcess(
+        &child,
+        source,
+        process_group_id,
+        leader_term,
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
+    child_needs_cleanup = false;
 
-    return finishCollectedProcess(
-        &output,
-        collected.status,
-        collected.output_incomplete,
-        duration_ms,
-        collected.source,
-        cfg.force_cancel_flag != null,
-    );
+    return finishCollectedProcess(&output, term, duration_ms, source);
 }
 
 fn streamPreviewLimit(max_command_output_bytes: usize) usize {
@@ -1691,91 +1441,8 @@ test "explicit captured profiles execute exact shells without synthetic stderr" 
     } else |_| {}
 }
 
-test "zsh user profile reports natural SIGTERM after alias-safe startup" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
-        return error.SkipZigTest;
-
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "wrapper");
-
-    const home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
-    const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
-    const wrapper_dir = try io_mod.dirRealpathAlloc(arena, tmp.dir, "wrapper");
-    const wrapper_path = try std.fs.path.join(arena, &.{ wrapper_dir, "zsh" });
-    const debug_log = try std.fs.path.join(arena, &.{ workspace, "debug.log" });
-    const quoted_home = try shellQuote(arena, home);
-    const quoted_debug_log = try shellQuote(arena, debug_log);
-
-    {
-        var zshrc = try tmp.dir.createFile(
-            io_mod.getIo(),
-            "home/.zshrc",
-            .{ .truncate = true },
-        );
-        defer zshrc.close(io_mod.getIo());
-        try zshrc.writeStreamingAll(
-            io_mod.getIo(),
-            "alias builtin='print -r -- INTERCEPTED'\n" ++
-                "TRAPDEBUG() { print -r -- \"$ZSH_DEBUG_CMD\" >> \"$FX_SIGTERM_DEBUG_LOG\"; }\n",
-        );
-    }
-    {
-        var wrapper = try tmp.dir.createFile(
-            io_mod.getIo(),
-            "wrapper/zsh",
-            .{ .truncate = true },
-        );
-        defer wrapper.close(io_mod.getIo());
-        const source = try std.fmt.allocPrint(
-            arena,
-            "#!/bin/sh\nexport HOME={s}\nexport ZDOTDIR={s}\nexport FX_SIGTERM_DEBUG_LOG={s}\nexec /bin/zsh \"$@\"\n",
-            .{ quoted_home, quoted_home, quoted_debug_log },
-        );
-        try wrapper.writeStreamingAll(io_mod.getIo(), source);
-        try wrapper.setPermissions(
-            io_mod.getIo(),
-            std.Io.File.Permissions.fromMode(0o700),
-        );
-    }
-
-    const config = Config{ .max_command_output_bytes = 4096 };
-    const signaled = try executeCommandInEnvironment(
-        config,
-        arena,
-        "kill -TERM $$",
-        workspace,
-        .{ .user = wrapper_path },
-    );
-    try std.testing.expect(std.mem.startsWith(u8, signaled.output, "signal=15\n"));
-    const foreground = signaled.command_result.?;
-    try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
-    try std.testing.expectEqual(@as(?u32, @intFromEnum(std.posix.SIG.TERM)), foreground.signal);
-
-    const debug_output = try readAbsoluteFile(arena, debug_log, 4096);
-    try std.testing.expect(std.mem.find(u8, debug_output, "builtin trap - TERM") != null);
-    try std.testing.expect(std.mem.find(u8, debug_output, "kill -TERM $$") != null);
-
-    const trapped = try executeCommandInEnvironment(
-        config,
-        arena,
-        "trap 'exit 42' TERM; kill -TERM $$",
-        workspace,
-        .{ .user = wrapper_path },
-    );
-    try std.testing.expectEqual(@as(?i64, 42), trapped.command_result.?.exit_code);
-    try std.testing.expectEqual(@as(?u32, null), trapped.command_result.?.signal);
-}
-
 fn formatExitOutput(alloc: Allocator, command: []const u8, cwd: []const u8, exit_code: i64, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
-    return command_contract.formatCommandResult(alloc, .{
+    return command_contract.formatForegroundCommandResult(alloc, .{
         .command = command,
         .cwd = cwd,
         .status = .{ .exit_code = exit_code },
@@ -1788,46 +1455,23 @@ fn formatExitOutput(alloc: Allocator, command: []const u8, cwd: []const u8, exit
 }
 
 fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: std.process.Child.Term, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
-    return formatOutputWithStatus(
-        alloc,
-        command,
-        cwd,
-        commandStatusFromTerm(term),
-        stdout_raw,
-        stderr_raw,
-        duration_ms,
-        false,
-    );
-}
-
-fn formatOutputWithStatus(
-    alloc: Allocator,
-    command: []const u8,
-    cwd: []const u8,
-    status: command_contract.CommandStatus,
-    stdout_raw: []const u8,
-    stderr_raw: []const u8,
-    duration_ms: ?u64,
-    output_incomplete: bool,
-) !command_contract.RunCommandResult {
-    return command_contract.formatCommandResult(alloc, .{
+    return command_contract.formatForegroundCommandResult(alloc, .{
         .command = command,
         .cwd = cwd,
-        .status = status,
+        .status = foregroundCommandStatusFromTerm(term),
         .stdout_display = stdout_raw,
         .stderr_display = stderr_raw,
         .stdout_bytes = stdout_raw.len,
         .stderr_bytes = stderr_raw.len,
-        .output_incomplete = output_incomplete,
         .duration_ms = duration_ms,
     });
 }
 
-fn commandStatusFromTerm(term: std.process.Child.Term) command_contract.CommandStatus {
+fn foregroundCommandStatusFromTerm(term: std.process.Child.Term) command_contract.ForegroundCommandStatus {
     return switch (term) {
         .exited => |code| .{ .exit_code = @intCast(code) },
         .signal => |sig| .{ .signal = @intFromEnum(sig) },
-        .stopped, .unknown => .indeterminate,
+        else => .finished,
     };
 }
 
@@ -1840,20 +1484,11 @@ fn formatCollectedOutput(alloc: Allocator, command: []const u8, cwd: []const u8,
 }
 
 fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []const u8, result: CollectedProcess) !command_contract.RunCommandResult {
-    if (result.output_file == null) return formatOutputWithStatus(
-        alloc,
-        command,
-        cwd,
-        result.status,
-        result.stdout,
-        result.stderr,
-        result.duration_ms,
-        result.output_incomplete,
-    );
+    if (result.output_file == null) return formatOutput(alloc, command, cwd, result.term, result.stdout, result.stderr, result.duration_ms);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try command_contract.writeStatusLine(&out.writer, result.status);
+    try writeTermLine(&out.writer, result.term);
     try out.writer.print("truncated={s}\n", .{if (result.truncated) "true" else "false"});
     try out.writer.print("stdout_bytes={d}\n", .{result.stdout_bytes});
     try out.writer.print("stderr_bytes={d}\n", .{result.stderr_bytes});
@@ -1865,17 +1500,14 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
         try writePreviewEnvelope(alloc, &out.writer, "stderr", result.stderr_preview);
     }
     const output = try out.toOwnedSlice();
-    const status = command_contract.projectStatus(result.status);
     return .{
         .output = output,
         .cancelled = result.cancelled,
-        .command_result = .{
+        .command_result = .{ .foreground = .{
             .command = command,
             .cwd = cwd,
-            .exit_code = status.exit_code,
-            .signal = status.signal,
-            .termination_indeterminate = status.termination_indeterminate,
-            .output_incomplete = result.output_incomplete,
+            .exit_code = termExitCode(result.term),
+            .signal = termSignal(result.term),
             .duration_ms = result.duration_ms,
             .stdout_bytes = result.stdout_bytes,
             .stderr_bytes = result.stderr_bytes,
@@ -1883,7 +1515,29 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
             .output_file = metadataField(output, "output_file="),
             .stdout_file = metadataField(output, "stdout_file="),
             .stderr_file = metadataField(output, "stderr_file="),
-        },
+        } },
+    };
+}
+
+fn writeTermLine(writer: *std.Io.Writer, term: std.process.Child.Term) !void {
+    switch (term) {
+        .exited => |code| try writer.print("exit_code={d}\n", .{code}),
+        .signal => |sig| try writer.print("signal={d}\n", .{sig}),
+        else => try writer.writeAll("process finished\n"),
+    }
+}
+
+fn termExitCode(term: std.process.Child.Term) ?i64 {
+    return switch (term) {
+        .exited => |code| @intCast(code),
+        else => null,
+    };
+}
+
+fn termSignal(term: std.process.Child.Term) ?u32 {
+    return switch (term) {
+        .signal => |sig| @intFromEnum(sig),
+        else => null,
     };
 }
 
@@ -1927,83 +1581,16 @@ fn writePreviewEnvelope(alloc: Allocator, writer: *std.Io.Writer, label: []const
 }
 
 const TerminationSource = enum {
+    // Cancellation and timeout share a signal path, so retain the initiating
+    // source until after the child is reaped.
     natural,
     cancelled,
     timed_out,
 };
 
-const CollectedOutput = struct {
-    source: TerminationSource,
-    output_incomplete: bool = false,
-};
-
-fn reconcileForegroundTerminationSource(
-    source: TerminationSource,
-    deadline_ms: ?i64,
-    now_ms: i64,
-) TerminationSource {
-    if (source != .natural) return source;
-    const deadline = deadline_ms orelse return .natural;
-    return if (now_ms >= deadline) .timed_out else .natural;
-}
-
-const TerminationProtocol = enum {
-    process_group,
-    foreground_supervisor,
-};
-
-const TerminationIntent = enum {
-    cooperative,
-    force,
-};
-
-fn pending_termination_source(
-    protocol: TerminationProtocol,
-    cancel_requested: bool,
-    deadline_ms: ?i64,
-    now_ms: i64,
-) TerminationSource {
-    if (protocol == .foreground_supervisor) {
-        if (foreground_supervisor_fallback_deadline_ms(deadline_ms)) |fallback_deadline_ms| {
-            if (now_ms >= fallback_deadline_ms) return .timed_out;
-        }
-    }
-    if (cancel_requested) return .cancelled;
-    const deadline = deadline_ms orelse return .natural;
-    return if (now_ms >= deadline) .timed_out else .natural;
-}
-
-const TerminationSignalPlan = struct {
-    scope: enum { process_group, supervisor },
-    signal: std.posix.SIG,
-};
-
-fn terminationSignalPlan(
-    protocol: TerminationProtocol,
-    intent: TerminationIntent,
-) TerminationSignalPlan {
-    return switch (protocol) {
-        .process_group => .{
-            .scope = .process_group,
-            .signal = if (intent == .force) std.posix.SIG.KILL else std.posix.SIG.TERM,
-        },
-        .foreground_supervisor => switch (intent) {
-            .cooperative => .{
-                .scope = .process_group,
-                .signal = std.posix.SIG.TERM,
-            },
-            .force => .{
-                .scope = .supervisor,
-                .signal = foreground_session_force_signal,
-            },
-        },
-    };
-}
-
 const OutputChunkEmitter = struct {
     stdout_pending: std.ArrayList(u8) = .empty,
     stderr_pending: std.ArrayList(u8) = .empty,
-    presentation_suppressed: bool = false,
 
     fn deinit(self: *@This(), arena: Allocator) void {
         self.stdout_pending.deinit(arena);
@@ -2020,12 +1607,12 @@ const OutputChunkEmitter = struct {
     ) !void {
         try output.append(stream, bytes);
         try emitAcceptedOutputChunk(cfg, stream, bytes);
-        self.emitPending(arena, self.pendingFor(stream), stream, bytes, cfg, false);
+        try emitPending(arena, self.pendingFor(stream), stream, bytes, cfg, false);
     }
 
-    fn flush(self: *@This(), arena: Allocator, cfg: Config) void {
-        self.emitPending(arena, &self.stdout_pending, .stdout, "", cfg, true);
-        self.emitPending(arena, &self.stderr_pending, .stderr, "", cfg, true);
+    fn flush(self: *@This(), arena: Allocator, cfg: Config) !void {
+        try emitPending(arena, &self.stdout_pending, .stdout, "", cfg, true);
+        try emitPending(arena, &self.stderr_pending, .stderr, "", cfg, true);
     }
 
     fn pendingFor(self: *@This(), stream: CommandOutputStream) *std.ArrayList(u8) {
@@ -2036,28 +1623,20 @@ const OutputChunkEmitter = struct {
     }
 
     fn emitPending(
-        self: *@This(),
         arena: Allocator,
         pending: *std.ArrayList(u8),
         stream: CommandOutputStream,
         new_bytes: []const u8,
         cfg: Config,
         flush_remainder: bool,
-    ) void {
-        if (self.presentation_suppressed) return;
+    ) !void {
         const ctx = cfg.output_chunk_ctx orelse return;
         const callback = cfg.on_output_chunk orelse return;
-        if (new_bytes.len > 0) pending.appendSlice(arena, new_bytes) catch |err| {
-            self.suppressPresentation(err);
-            return;
-        };
+        if (new_bytes.len > 0) try pending.appendSlice(arena, new_bytes);
 
         while (std.mem.findScalar(u8, pending.items, '\n')) |newline_index| {
             const line = pending.items[0 .. newline_index + 1];
-            emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, line, cfg.callback_projection) catch |err| {
-                self.suppressPresentation(err);
-                return;
-            };
+            try emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, line, cfg.callback_projection);
 
             const remaining = pending.items.len - (newline_index + 1);
             std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[newline_index + 1 ..]);
@@ -2065,31 +1644,14 @@ const OutputChunkEmitter = struct {
         }
 
         if (!flush_remainder and pending.items.len >= pending_output_flush_bytes) {
-            emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, pending.items, cfg.callback_projection) catch |err| {
-                self.suppressPresentation(err);
-                return;
-            };
+            try emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, pending.items, cfg.callback_projection);
             pending.clearRetainingCapacity();
         }
 
         if (flush_remainder and pending.items.len > 0) {
-            emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, pending.items, cfg.callback_projection) catch |err| {
-                self.suppressPresentation(err);
-                return;
-            };
+            try emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, pending.items, cfg.callback_projection);
             pending.clearRetainingCapacity();
         }
-    }
-
-    fn suppressPresentation(self: *@This(), err: anyerror) void {
-        debug_trace.logf(
-            "core",
-            "command output presentation suppressed err={s}",
-            .{@errorName(err)},
-        );
-        self.presentation_suppressed = true;
-        self.stdout_pending.clearRetainingCapacity();
-        self.stderr_pending.clearRetainingCapacity();
     }
 };
 
@@ -2221,177 +1783,20 @@ fn parseReplaceError(name: []const u8) ?std.process.ReplaceError {
     return null;
 }
 
-const ProcessObserver = struct {
-    waiter: ChildWaiter,
-    process_id: std.process.Child.Id,
-    stdout: std.Io.File,
-    stderr: std.Io.File,
-    detached_pipes: bool = false,
-
-    fn init(child: *std.process.Child) !ProcessObserver {
-        const process_id = child.id orelse return error.SpawnFailed;
-        const stdout = child.stdout orelse return error.SpawnFailed;
-        const stderr = child.stderr orelse return error.SpawnFailed;
-        const detached_pipes = comptime builtin.os.tag != .windows and
-            builtin.os.tag != .wasi;
-        if (detached_pipes) {
-            child.stdout = null;
-            child.stderr = null;
-        }
-        return .{
-            .waiter = ChildWaiter.init(child),
-            .process_id = process_id,
-            .stdout = stdout,
-            .stderr = stderr,
-            .detached_pipes = detached_pipes,
-        };
-    }
-
-    fn deinit(self: *ProcessObserver) void {
-        if (self.detached_pipes) {
-            self.stdout.close(self.waiter.io);
-            self.stderr.close(self.waiter.io);
-        }
-        self.* = undefined;
-    }
-
-    fn start(self: *ProcessObserver) !void {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-        try self.waiter.start();
-    }
-
-    fn observe(self: *ProcessObserver) ?command_contract.CommandStatus {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
-        if (!self.waiter.isReady()) return null;
-        const term = self.waiter.awaitReady() catch |err| {
-            return indeterminateStatus(err);
-        };
-        return statusFromTerm(term);
-    }
-
-    fn awaitTermination(
-        self: *ProcessObserver,
-        source: TerminationSource,
-    ) !command_contract.CommandStatus {
-        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-            self.waiter.awaitDiscard();
-            return self.observe().?;
-        }
-        const term = self.waiter.child.wait(self.waiter.io) catch |err| {
-            return switch (source) {
-                .natural => blk: {
-                    break :blk indeterminateStatus(err);
-                },
-                .cancelled, .timed_out => mapTerminationError(
-                    source,
-                    null,
-                    "process wait",
-                    err,
-                ),
-            };
-        };
-        return statusFromTerm(term);
-    }
-
-    fn statusFromTerm(
-        term: std.process.Child.Term,
-    ) command_contract.CommandStatus {
-        if (io_mod.getenv("FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT") != null) {
-            debug_trace.logf(
-                "core",
-                "command termination became indeterminate reason=injected_after_exit",
-                .{},
-            );
-            return .indeterminate;
-        }
-        const status = commandStatusFromTerm(term);
-        switch (status) {
-            .indeterminate => debug_trace.logf(
-                "core",
-                "command termination became indeterminate boundary=child_term term={s}",
-                .{@tagName(std.meta.activeTag(term))},
-            ),
-            .exit_code, .signal, .finished => {},
-        }
-        return status;
-    }
-
-    fn indeterminateStatus(
-        err: anyerror,
-    ) command_contract.CommandStatus {
-        debug_trace.logf(
-            "core",
-            "command termination became indeterminate boundary=process_wait err={s}",
-            .{@errorName(err)},
-        );
-        return .indeterminate;
-    }
-
-    fn signal(
-        self: *ProcessObserver,
-        process_group_id: ?std.posix.pid_t,
-        protocol: TerminationProtocol,
-        intent: TerminationIntent,
-    ) !void {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-            self.waiter.child.kill(self.waiter.io);
-            return;
-        }
-        const target_pid = process_group_id orelse self.process_id;
-        const plan = terminationSignalPlan(protocol, intent);
-        return switch (plan.scope) {
-            .process_group => signalProcessGroup(target_pid, plan.signal),
-            .supervisor => signalProcess(target_pid, plan.signal),
-        };
-    }
-
-    fn abort(self: *ProcessObserver, process_group_id: ?std.posix.pid_t) void {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-            cleanupChild(self.waiter.child);
-            return;
-        }
-        if (self.waiter.isReady()) {
-            self.waiter.awaitDiscard();
-            return;
-        }
-        const pid = process_group_id orelse self.process_id;
-        signalProcessGroup(pid, std.posix.SIG.KILL) catch |err| {
-            debug_trace.logf(
-                "core",
-                "command observer cleanup kill failed err={s}",
-                .{@errorName(err)},
-            );
-        };
-        self.waiter.awaitDiscard();
-    }
-};
-
-fn termination_settle_expired(
-    signal_started_ms: ?i64,
-    force_kill_sent: bool,
-    now_ms: i64,
-) bool {
-    const started_ms = signal_started_ms orelse return false;
-    return force_kill_sent and
-        now_ms >= started_ms and
-        now_ms - started_ms >= termination_settle_timeout_ms;
-}
-
 fn collectOutput(
     arena: Allocator,
-    observer: *ProcessObserver,
+    child: *std.process.Child,
     output: *OutputCollector,
     cfg: Config,
     source: *TerminationSource,
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
     process_group_id: ?std.posix.pid_t,
-    termination_protocol: TerminationProtocol,
-    leader_status: *?command_contract.CommandStatus,
-) !CollectedOutput {
+    leader_term: *?std.process.Child.Term,
+) !TerminationSource {
     const zio = io_mod.getIo();
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(arena, zio, multi_reader_buffer.toStreams(), &.{ observer.stdout, observer.stderr });
+    multi_reader.init(arena, zio, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer multi_reader.deinit();
 
     const stdout_r = multi_reader.reader(0);
@@ -2404,22 +1809,20 @@ fn collectOutput(
     var signal_started_ms: ?i64 = null;
     var force_kill_sent = false;
     var streams_finished = false;
-    var output_incomplete = false;
 
     while (true) {
         try updateTerminationSignal(
-            observer,
+            child,
             process_group_id,
-            termination_protocol,
             cfg,
             started_ms,
             source,
             &signal_started_ms,
             &force_kill_sent,
         );
-        if (leader_status.* == null) {
-            if (observer.observe()) |status| {
-                leader_status.* = status;
+        if (leader_term.* == null) {
+            if (try pollProcessLeader(child)) |term| {
+                leader_term.* = term;
                 if (process_group_id) |pid| {
                     if (source.* == .natural) {
                         terminateRemainingProcessGroup(pid);
@@ -2431,34 +1834,12 @@ fn collectOutput(
                     } else {
                         debug_trace.logf(
                             "core",
-                            "captured command leader completed during {s}; termination cleanup continuing",
+                            "captured command leader completed during {s}; remaining process group retains termination grace",
                             .{@tagName(source.*)},
                         );
                     }
                 }
             }
-        }
-
-        const now_ms = io_mod.milliTimestamp();
-        if (termination_settle_expired(
-            signal_started_ms,
-            force_kill_sent,
-            now_ms,
-        )) {
-            debug_trace.logf(
-                "core",
-                "command termination settlement expired boundary=post_force source={s} wait_ready={s}",
-                .{
-                    @tagName(source.*),
-                    if (observer.waiter.isReady()) "true" else "false",
-                },
-            );
-            recordOutputDrainFailure(
-                &output_incomplete,
-                "termination_settle_deadline",
-                error.Timeout,
-            );
-            break;
         }
 
         if (streams_finished) {
@@ -2473,20 +1854,12 @@ fn collectOutput(
             continue;
         }
 
-        const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = command_output_poll_ms * std.time.ns_per_ms }, .clock = .awake } }))
+        const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = 100_000_000 }, .clock = .awake } }))
             true
         else |err| switch (err) {
             error.EndOfStream => false,
             error.Timeout => true,
-            else => |e| blk: {
-                if (source.* != .natural or cancelRequested(cfg.cancel_flag)) return e;
-                recordOutputDrainFailure(
-                    &output_incomplete,
-                    "reader_coordination",
-                    e,
-                );
-                break :blk false;
-            },
+            else => |e| return e,
         };
 
         const stdout_buf = stdout_r.buffered();
@@ -2502,13 +1875,6 @@ fn collectOutput(
                 try emitter.append(arena, output, .stderr, stderr_buf, cfg);
             }
             stderr_r.tossBuffered();
-        }
-        if (emitter.presentation_suppressed and cancelRequested(cfg.cancel_flag)) {
-            return error.Cancelled;
-        }
-        if (source.* == .natural) {
-            recordMultiReaderFailure(&multi_reader, &output_incomplete);
-            if (output_incomplete) break;
         }
 
         if (!keep_reading) {
@@ -2526,164 +1892,80 @@ fn collectOutput(
     if (launch_failure_probe) |probe| {
         try probe.flush(arena, &emitter, output, cfg);
     }
-    emitter.flush(arena, cfg);
-    if (source.* == .natural) {
-        recordMultiReaderFailure(&multi_reader, &output_incomplete);
-    }
-    return .{
-        .source = source.*,
-        .output_incomplete = output_incomplete,
-    };
-}
-
-fn recordMultiReaderFailure(
-    multi_reader: *const std.Io.File.MultiReader,
-    output_incomplete: *bool,
-) void {
-    multi_reader.checkAnyError() catch |err| {
-        recordOutputDrainFailure(output_incomplete, "stream_read", err);
-    };
-}
-
-fn recordOutputDrainFailure(
-    output_incomplete: *bool,
-    reason: []const u8,
-    err: anyerror,
-) void {
-    if (output_incomplete.*) return;
-    output_incomplete.* = true;
-    debug_trace.logf(
-        "core",
-        "command output drain incomplete reason={s} err={s}",
-        .{ reason, @errorName(err) },
-    );
+    try emitter.flush(arena, cfg);
+    return source.*;
 }
 
 fn collectOutputForProcess(
-    arena: Allocator,
-    observer: *ProcessObserver,
-    output: *OutputCollector,
-    cfg: Config,
-    launch_failure_probe: ?*ForegroundLaunchFailureProbe,
-    process_group_id: ?std.posix.pid_t,
-    termination_protocol: TerminationProtocol,
-    leader_status: *?command_contract.CommandStatus,
-) !CollectedOutput {
-    var source: TerminationSource = .natural;
-    return collectOutput(
-        arena,
-        observer,
-        output,
-        cfg,
-        &source,
-        launch_failure_probe,
-        process_group_id,
-        termination_protocol,
-        leader_status,
-    ) catch |err|
-        return mapTerminationError(source, cfg.cancel_flag, "output collection", err);
-}
-
-fn waitForCollectedProcess(
-    observer: *ProcessObserver,
-    source: TerminationSource,
-    process_group_id: ?std.posix.pid_t,
-    leader_status: ?command_contract.CommandStatus,
-) !command_contract.CommandStatus {
-    if (leader_status) |status| {
-        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-            observer.waiter.awaitDiscard();
-        }
-        return status;
-    }
-    const status = try observer.awaitTermination(source);
-    if (process_group_id) |pid| {
-        terminateRemainingProcessGroup(pid);
-    }
-    return status;
-}
-
-const CollectedTermination = struct {
-    source: TerminationSource,
-    status: command_contract.CommandStatus,
-    output_incomplete: bool = false,
-};
-
-fn collectSpawnedProcess(
     arena: Allocator,
     child: *std.process.Child,
     output: *OutputCollector,
     cfg: Config,
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
     process_group_id: ?std.posix.pid_t,
-    termination_protocol: TerminationProtocol,
-) !CollectedTermination {
-    var observer = ProcessObserver.init(child) catch |err| {
-        cleanupChild(child);
-        return err;
-    };
-    defer observer.deinit();
-    observer.start() catch |err| {
-        debug_trace.logf(
-            "core",
-            "command wait authority unavailable after spawn err={s}",
-            .{@errorName(err)},
-        );
-        cleanupChild(child);
-        return .{
-            .source = .natural,
-            .status = .indeterminate,
-        };
-    };
-
-    var wait_pending = true;
-    defer if (wait_pending) observer.abort(process_group_id);
-
-    var leader_status: ?command_contract.CommandStatus = null;
-    const collected_output = try collectOutputForProcess(
+    leader_term: *?std.process.Child.Term,
+) !TerminationSource {
+    var source: TerminationSource = .natural;
+    return collectOutput(
         arena,
-        &observer,
+        child,
         output,
         cfg,
+        &source,
         launch_failure_probe,
         process_group_id,
-        termination_protocol,
-        &leader_status,
-    );
-    if (collected_output.output_incomplete and leader_status == null) {
-        debug_trace.logf(
-            "core",
-            "command output drain failed before process status; aborting command",
-            .{},
-        );
-        observer.abort(process_group_id);
-        wait_pending = false;
-        return .{
-            .source = collected_output.source,
-            .status = .indeterminate,
-            .output_incomplete = true,
-        };
+        leader_term,
+    ) catch |err|
+        return mapTerminationError(source, cfg.cancel_flag, "output collection", err);
+}
+
+fn waitForCollectedProcess(
+    child: *std.process.Child,
+    source: TerminationSource,
+    process_group_id: ?std.posix.pid_t,
+    leader_term: ?std.process.Child.Term,
+) !std.process.Child.Term {
+    if (leader_term) |term| {
+        closeChildPipes(child);
+        return term;
     }
-    const status = try waitForCollectedProcess(
-        &observer,
-        collected_output.source,
-        process_group_id,
-        leader_status,
-    );
-    wait_pending = false;
-    var output_incomplete = collected_output.output_incomplete;
-    if (io_mod.getenv("FX_COMMAND_TEST_OUTPUT_INCOMPLETE_AFTER_EXIT") != null) {
-        recordOutputDrainFailure(
-            &output_incomplete,
-            "injected_after_exit",
-            error.Unexpected,
-        );
+    const term = child.wait(io_mod.getIo()) catch |err|
+        return mapTerminationError(source, null, "process wait", err);
+    if (process_group_id) |pid| {
+        terminateRemainingProcessGroup(pid);
     }
-    return .{
-        .source = collected_output.source,
-        .status = status,
-        .output_incomplete = output_incomplete,
-    };
+    return term;
+}
+
+fn pollProcessLeader(child: *std.process.Child) !?std.process.Child.Term {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+    const pid = child.id orelse return null;
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        const result = std.posix.system.waitpid(pid, &status, std.posix.W.NOHANG);
+        switch (std.posix.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) return null;
+                if (result != pid) return error.Unexpected;
+                child.id = null;
+                return childTermFromStatus(@bitCast(status));
+            },
+            .INTR => continue,
+            .CHILD => return error.Unexpected,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn childTermFromStatus(status: u32) std.process.Child.Term {
+    return if (std.posix.W.IFEXITED(status))
+        .{ .exited = std.posix.W.EXITSTATUS(status) }
+    else if (std.posix.W.IFSIGNALED(status))
+        .{ .signal = std.posix.W.TERMSIG(status) }
+    else if (std.posix.W.IFSTOPPED(status))
+        .{ .stopped = std.posix.W.STOPSIG(status) }
+    else
+        .{ .unknown = status };
 }
 
 fn mapTerminationError(
@@ -2710,9 +1992,8 @@ fn mapTerminationError(
 }
 
 fn updateTerminationSignal(
-    observer: *ProcessObserver,
+    child: *std.process.Child,
     process_group_id: ?std.posix.pid_t,
-    termination_protocol: TerminationProtocol,
     cfg: Config,
     started_ms: i64,
     source: *TerminationSource,
@@ -2721,46 +2002,29 @@ fn updateTerminationSignal(
 ) !void {
     const now_ms = io_mod.milliTimestamp();
     if (signal_started_ms.* == null) {
-        const control = ExecutionControl{
-            .cancel_flag = cfg.cancel_flag,
-            .timeout_ms = cfg.timeout_ms,
-            .started_ms = started_ms,
-        };
-        source.* = pending_termination_source(
-            termination_protocol,
-            cancelRequested(cfg.cancel_flag),
-            control.deadlineMs(),
-            now_ms,
-        );
-        switch (source.*) {
-            .natural => {},
-            .cancelled => {
-                const force = cancelRequested(cfg.force_cancel_flag);
-                try observer.signal(
-                    process_group_id,
-                    termination_protocol,
-                    if (force) .force else .cooperative,
-                );
-                force_kill_sent.* = force;
-                debug_trace.logf(
-                    "core",
-                    "command termination requested source=cancelled force={s}",
-                    .{if (force) "true" else "false"},
-                );
-                signal_started_ms.* = now_ms;
-            },
-            .timed_out => {
-                try observer.signal(process_group_id, termination_protocol, .force);
-                force_kill_sent.* = true;
-                debug_trace.logf("core", "command termination requested source=timeout", .{});
-                signal_started_ms.* = now_ms;
-            },
+        if (cancelRequested(cfg.cancel_flag)) {
+            source.* = .cancelled;
+            try signalChild(child, process_group_id, false);
+            debug_trace.logf("core", "command termination requested source=cancelled", .{});
+            signal_started_ms.* = now_ms;
+        }
+        if (signal_started_ms.* == null) {
+            if (cfg.timeout_ms) |timeout_ms| {
+                if (now_ms - started_ms >= @as(i64, @intCast(timeout_ms))) {
+                    // Timeout uses the same signal path as cancellation but
+                    // records a distinct source for the post-wait mapping.
+                    source.* = .timed_out;
+                    try signalChild(child, process_group_id, false);
+                    debug_trace.logf("core", "command termination requested source=timeout", .{});
+                    signal_started_ms.* = now_ms;
+                }
+            }
         }
     }
 
     if (signal_started_ms.*) |sent_ms| {
         if (!force_kill_sent.* and now_ms - sent_ms >= 800) {
-            try observer.signal(process_group_id, termination_protocol, .force);
+            try signalChild(child, process_group_id, true);
             debug_trace.logf("core", "command force-killed after termination grace expired", .{});
             force_kill_sent.* = true;
         }
@@ -2780,19 +2044,30 @@ fn emitOutputChunk(
     try callback(ctx, lifecycle_id, stream, chunk);
 }
 
-fn signalProcess(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
-    std.posix.kill(pid, signal) catch |err| switch (err) {
+fn signalChild(
+    child: *std.process.Child,
+    process_group_id: ?std.posix.pid_t,
+    force: bool,
+) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        child.kill(io_mod.getIo());
+        return;
+    }
+
+    if (process_group_id) |pid| return signalProcessGroup(pid, force);
+    const pid = child.id orelse return;
+    return signalProcessGroup(pid, force);
+}
+
+fn signalProcessGroup(pid: std.posix.pid_t, force: bool) !void {
+    std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
         error.ProcessNotFound => {},
         else => return err,
     };
 }
 
-fn signalProcessGroup(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
-    return signalProcess(-pid, signal);
-}
-
 fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
-    signalProcessGroup(pid, std.posix.SIG.KILL) catch |err| {
+    signalProcessGroup(pid, true) catch |err| {
         debug_trace.logf(
             "core",
             "remaining captured process group cleanup failed err={s}",
@@ -2873,11 +2148,7 @@ test "format output covers stdout stderr empty signal and unknown statuses" {
 
     const none = try formatOutput(std.testing.allocator, "cmd", "/tmp", .{ .unknown = 9 }, "", "", null);
     defer std.testing.allocator.free(none.output);
-    try std.testing.expect(std.mem.find(
-        u8,
-        none.output,
-        "termination_indeterminate=true\n",
-    ) != null);
+    try std.testing.expectEqualStrings("process finished\n(no output)\n", none.output);
 
     const signaled = try formatOutput(std.testing.allocator, "cmd", "/tmp", .{ .signal = .TERM }, "", "", null);
     defer std.testing.allocator.free(signaled.output);
@@ -2892,7 +2163,7 @@ test "raw process execution returns foreground output" {
 
     try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "<stdout>\nhello\n</stdout>\n") != null);
-    const command_result = result.command_result.?;
+    const command_result = result.command_result.?.foreground;
     try std.testing.expectEqualStrings("printf 'hello'", command_result.command);
     try std.testing.expectEqualStrings("/tmp", command_result.cwd);
     try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
@@ -2934,7 +2205,7 @@ fn spawnForegroundSessionBootstrapForTest(
     const argv = [_][]const u8{
         product_path,
         foreground_session_token,
-        "none",
+        "test-nonce",
         "/bin/sh",
         "-c",
         target_script,
@@ -2946,21 +2217,6 @@ fn spawnForegroundSessionBootstrapForTest(
         .stderr = .pipe,
         .cwd = .{ .path = workspace },
     });
-}
-
-const foreground_session_test_nonce = "00000000000000000000000000000000";
-
-fn writeForegroundSessionFrameForTest(
-    output: std.Io.File,
-    release: u8,
-    script: []const u8,
-) !void {
-    var script_length: [foreground_session_script_length_bytes]u8 = undefined;
-    std.mem.writeInt(u64, &script_length, @intCast(script.len), .little);
-    try output.writeStreamingAll(io_mod.getIo(), foreground_session_test_nonce);
-    try output.writeStreamingAll(io_mod.getIo(), &.{release});
-    try output.writeStreamingAll(io_mod.getIo(), &script_length);
-    try output.writeStreamingAll(io_mod.getIo(), script);
 }
 
 fn expectForegroundSessionReadyForTest(child: *std.process.Child) !void {
@@ -2996,9 +2252,7 @@ fn expectRejectedForegroundSessionReleaseForTest(release: ?u8) !void {
 
     var release_write = child.stdin orelse return error.TestUnexpectedResult;
     child.stdin = null;
-    if (release) |byte| {
-        try writeForegroundSessionFrameForTest(release_write, byte, "");
-    }
+    if (release) |byte| try release_write.writeStreamingAll(io_mod.getIo(), &.{byte});
     release_write.close(io_mod.getIo());
 
     try expectChildExitCodeForTest(&child, 1);
@@ -3019,18 +2273,6 @@ fn expectReapedChildForTest(child: *std.process.Child, pid: std.posix.pid_t) !vo
     try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
 }
 
-fn expectProcessGoneWithinForTest(pid: std.posix.pid_t, timeout_ms: i64) !void {
-    const deadline_ms = io_mod.milliTimestamp() + timeout_ms;
-    while (io_mod.milliTimestamp() < deadline_ms) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-            error.ProcessNotFound => return,
-            else => return err,
-        };
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    return error.TestUnexpectedResult;
-}
-
 test "captured foreground command runs beneath a detached session supervisor" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -3044,7 +2286,7 @@ test "captured foreground command runs beneath a detached session supervisor" {
     }, std.testing.allocator, command, "/tmp");
     defer std.testing.allocator.free(result.output);
 
-    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
 }
 
 test "foreground session bootstrap waits for release before executing target" {
@@ -3069,74 +2311,16 @@ test "foreground session bootstrap waits for release before executing target" {
 
     var release_write = child.stdin orelse return error.TestUnexpectedResult;
     child.stdin = null;
-    defer release_write.close(io_mod.getIo());
-    try writeForegroundSessionFrameForTest(
-        release_write,
-        foreground_session_release_byte,
-        "",
+    try release_write.writeStreamingAll(
+        io_mod.getIo(),
+        &.{foreground_session_release_byte},
     );
+    release_write.close(io_mod.getIo());
 
     try expectChildExitCodeForTest(&child, 0);
     const marker = try readAbsoluteFile(alloc, marker_path, 32);
     defer alloc.free(marker);
     try std.testing.expectEqualStrings("released", marker);
-}
-
-test "foreground session owner loss kills the target and descendant before delayed effects" {
-    if (comptime !supports_foreground_session) return;
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const pids_path = try std.fs.path.join(alloc, &.{ workspace, "owner-loss.pids" });
-    defer alloc.free(pids_path);
-    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "owner-loss.finished" });
-    defer alloc.free(effect_path);
-    const quoted_pids = try shellQuote(alloc, pids_path);
-    defer alloc.free(quoted_pids);
-    const quoted_effect = try shellQuote(alloc, effect_path);
-    defer alloc.free(quoted_effect);
-    const target_script = try std.fmt.allocPrint(
-        alloc,
-        "sleep 30 & child=$!; printf '%s %s' \"$$\" \"$child\" > {s}; sleep 3; printf FINISHED > {s}",
-        .{ quoted_pids, quoted_effect },
-    );
-    defer alloc.free(target_script);
-
-    var child = try spawnForegroundSessionBootstrapForTest(workspace, target_script);
-    defer child.kill(io_mod.getIo());
-    try expectForegroundSessionReadyForTest(&child);
-
-    const owner_write = child.stdin orelse return error.TestUnexpectedResult;
-    child.stdin = null;
-    try writeForegroundSessionFrameForTest(
-        owner_write,
-        foreground_session_release_byte,
-        "",
-    );
-
-    const marker_deadline_ms = io_mod.milliTimestamp() + 2_000;
-    while (!absoluteFileExists(pids_path) and
-        io_mod.milliTimestamp() < marker_deadline_ms)
-    {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    const pids_text = try readAbsoluteFile(alloc, pids_path, 128);
-    defer alloc.free(pids_text);
-    var pids = std.mem.tokenizeAny(u8, pids_text, " \r\n\t");
-    const target_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
-    const descendant_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
-    try std.testing.expect(pids.next() == null);
-    defer signalProcess(target_pid, std.posix.SIG.KILL) catch {};
-    defer signalProcess(descendant_pid, std.posix.SIG.KILL) catch {};
-
-    owner_write.close(io_mod.getIo());
-    _ = try child.wait(io_mod.getIo());
-    try expectProcessGoneWithinForTest(target_pid, 2_000);
-    try expectProcessGoneWithinForTest(descendant_pid, 2_000);
-    try std.testing.expect(!absoluteFileExists(effect_path));
 }
 
 test "foreground session bootstrap EOF executes no target" {
@@ -3159,7 +2343,7 @@ test "foreground session protocol bytes do not enter captured output" {
     }, std.testing.allocator, "printf 'stdout-bytes'; printf 'stderr-bytes' >&2", "/tmp");
     defer std.testing.allocator.free(result.output);
 
-    const foreground = result.command_result.?;
+    const foreground = result.command_result.?.foreground;
     try std.testing.expectEqual(stdout_text.len, foreground.stdout_bytes);
     try std.testing.expectEqual(stderr_text.len, foreground.stderr_bytes);
     try std.testing.expect(std.mem.findScalar(u8, result.output, foreground_session_ready_byte) == null);
@@ -3175,42 +2359,14 @@ test "target replacement marker prefix remains ordinary stderr" {
     const stderr_text = foreground_session_replace_failure_prefix ++ "target-data\n";
     const result = try executeCommand(.{
         .max_command_output_bytes = 4096,
-    }, std.testing.allocator, "printf '\\000FX_FOREGROUND_EXEC_FAILED:target-data\\n' >&2; exit 125", "/tmp");
+    }, std.testing.allocator, "printf '\\000FFX_FOREGROUND_EXEC_FAILED:target-data\\n' >&2; exit 125", "/tmp");
     defer std.testing.allocator.free(result.output);
 
-    const foreground = result.command_result.?;
+    const foreground = result.command_result.?.foreground;
     try std.testing.expectEqual(@as(?i64, 125), foreground.exit_code);
     try std.testing.expectEqual(@as(usize, 0), foreground.stdout_bytes);
     try std.testing.expectEqual(stderr_text.len, foreground.stderr_bytes);
     try std.testing.expect(std.mem.find(u8, result.output, stderr_text) != null);
-}
-
-test "target cannot recover replacement nonce from supervisor" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
-
-    const token_probe = if (builtin.os.tag == .linux)
-        "tr '\\000' '\\n' < /proc/$PPID/cmdline | grep -E '^[0-9a-f]{32}$' | head -1"
-    else
-        "ps -ww -p $PPID -o command= | grep -Eo '[0-9a-f]{32}' | head -1";
-    const command = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "token=$({s}); printf '\\000FX_FOREGROUND_EXEC_FAILED:%s:FileNotFound\\n' \"$token\" >&2; exit 125",
-        .{token_probe},
-    );
-    defer std.testing.allocator.free(command);
-    const result = try executeCommand(.{
-        .max_command_output_bytes = 4096,
-    }, std.testing.allocator, command, "/tmp");
-    defer std.testing.allocator.free(result.output);
-
-    const foreground = result.command_result.?;
-    try std.testing.expectEqual(@as(?i64, 125), foreground.exit_code);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.output,
-        foreground_session_replace_failure_prefix,
-    ) != null);
-    try std.testing.expect(std.mem.find(u8, result.output, "FileNotFound") != null);
 }
 
 test "invalid readiness directly kills and reaps helper pid" {
@@ -3333,7 +2489,7 @@ test "detached session preserves replacement failure with a zero output budget" 
 
     var scratch_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer scratch_state.deinit();
-    const argv = [_][]const u8{"/definitely/missing/fx-command-target"};
+    const argv = [_][]const u8{"/definitely/missing/ffx-command-target"};
 
     try std.testing.expectError(
         error.FileNotFound,
@@ -3682,19 +2838,6 @@ const FailOutput = struct {
     }
 };
 
-const DelayAfterOutput = struct {
-    needle: []const u8,
-    delay_ns: u64,
-    seen: bool = false,
-
-    fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, chunk: []const u8) !void {
-        const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (std.mem.find(u8, chunk, self.needle) == null) return;
-        self.seen = true;
-        io_mod.sleep(self.delay_ns);
-    }
-};
-
 test "line buffered streaming emits lines and tail" {
     var capture = StreamCapture{ .alloc = std.testing.allocator };
     defer capture.deinit();
@@ -3727,65 +2870,6 @@ test "line buffered streaming preserves stderr stream and tail" {
     try std.testing.expect(capture.contains(.stdout, "out\n"));
     try std.testing.expect(capture.contains(.stderr, "err\n"));
     try std.testing.expect(capture.contains(.stderr, "tail"));
-}
-
-test "multi-reader stream failure marks output incomplete" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    const failed_pipe = try std.Io.Threaded.pipe2(.{});
-    const clean_pipe = try std.Io.Threaded.pipe2(.{});
-    var failed_read = std.Io.File{
-        .handle = failed_pipe[0],
-        .flags = .{ .nonblocking = false },
-    };
-    var failed_write = std.Io.File{
-        .handle = failed_pipe[1],
-        .flags = .{ .nonblocking = false },
-    };
-    var clean_read = std.Io.File{
-        .handle = clean_pipe[0],
-        .flags = .{ .nonblocking = false },
-    };
-    var clean_write = std.Io.File{
-        .handle = clean_pipe[1],
-        .flags = .{ .nonblocking = false },
-    };
-    failed_read.close(std.testing.io);
-    failed_write.close(std.testing.io);
-    clean_write.close(std.testing.io);
-    defer clean_read.close(std.testing.io);
-
-    var buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
-    var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(
-        std.testing.allocator,
-        std.testing.io,
-        buffer.toStreams(),
-        &.{ failed_read, clean_read },
-    );
-    defer multi_reader.deinit();
-
-    var output_incomplete = false;
-    try multi_reader.fill(1, .none);
-    recordMultiReaderFailure(&multi_reader, &output_incomplete);
-    try std.testing.expect(output_incomplete);
-    try std.testing.expectError(error.EndOfStream, multi_reader.fill(1, .none));
-}
-
-test "presentation failure preserves the complete command result" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    var trigger = FailOutput{};
-    const result = try executeCommand(.{
-        .max_command_output_bytes = 4096,
-        .output_chunk_ctx = @ptrCast(&trigger),
-        .on_output_chunk = FailOutput.onChunk,
-    }, std.testing.allocator, "printf 'first\\nsecond\\n'", "/tmp");
-    defer std.testing.allocator.free(result.output);
-
-    try std.testing.expect(trigger.seen);
-    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
-    try std.testing.expect(std.mem.find(u8, result.output, "first\nsecond") != null);
 }
 
 test "raw callback projection preserves bytes without changing command result" {
@@ -3837,7 +2921,7 @@ test "accepted callbacks preserve repeated newline-free stream order" {
     try emitter.append(std.testing.allocator, &output, .stdout, "O1", cfg);
     try emitter.append(std.testing.allocator, &output, .stderr, "E2", cfg);
     try emitter.append(std.testing.allocator, &output, .stdout, "O2", cfg);
-    emitter.flush(std.testing.allocator, cfg);
+    try emitter.flush(std.testing.allocator, cfg);
 
     try std.testing.expectEqual(@as(usize, 4), capture.chunks.items.len);
     try std.testing.expectEqual(.stderr, capture.streams.items[0]);
@@ -3965,7 +3049,7 @@ test "cap-crossing cancellation returns a synchronized bounded result" {
 
     try std.testing.expect(trigger.seen);
     try std.testing.expect(result.cancelled);
-    const foreground = result.command_result.?;
+    const foreground = result.command_result.?.foreground;
     try std.testing.expect(foreground.truncated);
     try std.testing.expectEqual(expected.len, foreground.stdout_bytes);
     try std.testing.expectEqual(@as(usize, 0), foreground.stderr_bytes);
@@ -4042,7 +3126,7 @@ test "cancelled managed command confirms an indeterminate artifact target" {
 
     try std.testing.expect(trigger.seen);
     try std.testing.expect(result.cancelled);
-    const foreground = result.command_result.?;
+    const foreground = result.command_result.?.foreground;
     const output_path = foreground.output_file orelse
         return error.TestExpectedEqual;
     const output_handle = std.fs.path.basename(output_path);
@@ -4114,7 +3198,7 @@ test "below-cap cancellation retains complete artifact and non-truncated metadat
     try std.testing.expect(std.mem.find(u8, result.output, "bytes truncated") == null);
     try std.testing.expect(std.mem.find(u8, result.output, "truncated=false\n") != null);
 
-    const foreground = result.command_result.?;
+    const foreground = result.command_result.?.foreground;
     try std.testing.expect(!foreground.truncated);
     try std.testing.expectEqual(expected.len, foreground.stdout_bytes);
     try std.testing.expectEqual(@as(usize, 0), foreground.stderr_bytes);
@@ -4125,54 +3209,21 @@ test "below-cap cancellation retains complete artifact and non-truncated metadat
 }
 
 test "zero-output cancellation remains a bare error" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const ready_path = try std.fs.path.join(alloc, &.{ workspace, "zero-output-ready" });
-    defer alloc.free(ready_path);
-    const quoted_ready = try shellQuote(alloc, ready_path);
-    defer alloc.free(quoted_ready);
-    const command = try std.fmt.allocPrint(
-        alloc,
-        ": > {s}; exec sleep 5",
-        .{quoted_ready},
-    );
-    defer alloc.free(command);
-
     var cancel = std.atomic.Value(bool).init(false);
-    var ready_seen = std.atomic.Value(bool).init(false);
-    const Watcher = struct {
-        fn run(
-            path: []const u8,
-            flag: *std.atomic.Value(bool),
-            seen: *std.atomic.Value(bool),
-        ) void {
-            const started_ms = io_mod.milliTimestamp();
-            while (io_mod.milliTimestamp() - started_ms < 2000) {
-                if (absoluteFileExists(path)) {
-                    seen.store(true, .seq_cst);
-                    break;
-                }
-                io_mod.sleep(10 * std.time.ns_per_ms);
-            }
+    const Flip = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            io_mod.sleep(120 * std.time.ns_per_ms);
             flag.store(true, .seq_cst);
         }
     };
-    const thread = try std.Thread.spawn(
-        .{},
-        Watcher.run,
-        .{ ready_path, &cancel, &ready_seen },
-    );
+    const thread = try std.Thread.spawn(.{}, Flip.run, .{&cancel});
     defer thread.join();
 
     try std.testing.expectError(error.Cancelled, executeCommand(.{
         .max_command_output_bytes = 1024,
         .cancel_flag = &cancel,
-        .timeout_ms = 3000,
-    }, alloc, command, workspace));
-    try std.testing.expect(ready_seen.load(.seq_cst));
+        .timeout_ms = 1000,
+    }, std.testing.allocator, "exec sleep 5", "/tmp"));
 }
 
 test "artifact write failure after cancellation remains a bare error" {
@@ -4238,20 +3289,15 @@ test "artifact write failure after cancellation remains a bare error" {
     defer watcher.join();
 
     const process_group_id = child.id;
-    var observer = try ProcessObserver.init(&child);
-    defer observer.deinit();
-    try observer.start();
-    defer observer.abort(process_group_id);
-    var leader_status: ?command_contract.CommandStatus = null;
+    var leader_term: ?std.process.Child.Term = null;
     try std.testing.expectError(error.Cancelled, collectOutputForProcess(
         alloc,
-        &observer,
+        &child,
         &output,
         cfg,
         null,
         process_group_id,
-        .process_group,
-        &leader_status,
+        &leader_term,
     ));
     try std.testing.expect(ready_seen.load(.seq_cst));
 }
@@ -4263,189 +3309,17 @@ test "timeout source is distinct from cancellation" {
     }, std.testing.allocator, "sleep 5", "/tmp"));
 }
 
-test "foreground force cleanup preserves the supervisor" {
-    const mask = foregroundSupervisorSignalMask();
-    try std.testing.expect(std.posix.sigismember(&mask, std.posix.SIG.TERM));
-    try std.testing.expect(std.posix.sigismember(&mask, foreground_session_force_signal));
-
-    try std.testing.expectEqual(
-        ForegroundSessionTerminationRequest.force,
-        mergeForegroundSessionTerminationRequest(.graceful, foreground_session_force_signal),
-    );
-    try std.testing.expectEqual(
-        ForegroundSessionTerminationRequest.force,
-        mergeForegroundSessionTerminationRequest(.force, std.posix.SIG.TERM),
-    );
-
-    const timeout = terminationSignalPlan(.foreground_supervisor, .force);
-    try std.testing.expect(timeout.scope == .supervisor);
-    try std.testing.expectEqual(foreground_session_force_signal, timeout.signal);
-
-    const cancellation = terminationSignalPlan(.foreground_supervisor, .cooperative);
-    try std.testing.expect(cancellation.scope == .process_group);
-    try std.testing.expectEqual(std.posix.SIG.TERM, cancellation.signal);
-
-    const ordinary = terminationSignalPlan(.process_group, .force);
-    try std.testing.expect(ordinary.scope == .process_group);
-    try std.testing.expectEqual(std.posix.SIG.KILL, ordinary.signal);
-}
-
-test "foreground force request dominates graceful termination" {
-    try std.testing.expectEqual(
-        ForegroundTerminationAction.none,
-        decideForegroundTerminationAction(.none, null, false, 1000),
-    );
-    try std.testing.expectEqual(
-        ForegroundTerminationAction.begin_graceful,
-        decideForegroundTerminationAction(.graceful, null, false, 1000),
-    );
-    try std.testing.expectEqual(
-        ForegroundTerminationAction.none,
-        decideForegroundTerminationAction(.graceful, 1000, false, 1699),
-    );
-    try std.testing.expectEqual(
-        ForegroundTerminationAction.force,
-        decideForegroundTerminationAction(.graceful, 1000, false, 1700),
-    );
-    try std.testing.expectEqual(
-        ForegroundTerminationAction.force,
-        decideForegroundTerminationAction(.force, 1000, false, 1001),
-    );
-    try std.testing.expectEqual(
-        ForegroundTerminationAction.none,
-        decideForegroundTerminationAction(.force, 1000, true, 2000),
-    );
-
-    try std.testing.expectEqual(
-        ForegroundSessionTerminationRequest.none,
-        foregroundRequestAtDeadline(.none, true, 1700, 1699),
-    );
-    try std.testing.expectEqual(
-        ForegroundSessionTerminationRequest.force,
-        foregroundRequestAtDeadline(.none, true, 1700, 1700),
-    );
-    try std.testing.expectEqual(
-        ForegroundSessionTerminationRequest.graceful,
-        foregroundRequestAtDeadline(.graceful, true, 1700, 2000),
-    );
-    try std.testing.expectEqual(
-        ForegroundSessionTerminationRequest.force,
-        foregroundRequestAtDeadline(.none, false, null, 1000),
-    );
-    try std.testing.expectEqual(
-        ForegroundSessionTerminationRequest.force,
-        foregroundRequestAtDeadline(.graceful, false, 1700, 1000),
-    );
-}
-
-test "termination result follows the delivered signal source" {
-    try std.testing.expectEqual(
-        TerminationSource.natural,
-        reconcileForegroundTerminationSource(.natural, 1700, 1699),
-    );
-    try std.testing.expectEqual(
-        TerminationSource.timed_out,
-        reconcileForegroundTerminationSource(.natural, 1700, 2000),
-    );
-    try std.testing.expectEqual(
-        TerminationSource.cancelled,
-        reconcileForegroundTerminationSource(.cancelled, 1700, 2000),
-    );
-}
-
-test "forced termination settlement expires only after its deadline" {
-    try std.testing.expect(!termination_settle_expired(null, true, 10_000));
-    try std.testing.expect(!termination_settle_expired(5_000, false, 10_000));
-    try std.testing.expect(!termination_settle_expired(5_000, true, 9_999));
-    try std.testing.expect(termination_settle_expired(5_000, true, 10_000));
-}
-
-test "nonterminal child terms remain indeterminate" {
-    try std.testing.expectEqual(
-        command_contract.CommandStatus.indeterminate,
-        commandStatusFromTerm(.{ .unknown = 0 }),
-    );
-    try std.testing.expectEqual(
-        command_contract.CommandStatus.indeterminate,
-        commandStatusFromTerm(.{ .stopped = std.posix.SIG.STOP }),
-    );
-}
-
-test "pending termination source makes supervisor fallback timeout dominant" {
-    const deadline_ms: i64 = 1000;
-    const fallback_deadline_ms = deadline_ms + foreground_supervisor_handoff_ms;
-
-    try std.testing.expectEqual(
-        TerminationSource.natural,
-        pending_termination_source(.foreground_supervisor, false, deadline_ms, 999),
-    );
-    try std.testing.expectEqual(
-        TerminationSource.cancelled,
-        pending_termination_source(.foreground_supervisor, true, deadline_ms, 1000),
-    );
-    try std.testing.expectEqual(
-        TerminationSource.timed_out,
-        pending_termination_source(.foreground_supervisor, false, deadline_ms, 1000),
-    );
-    try std.testing.expectEqual(
-        TerminationSource.timed_out,
-        pending_termination_source(.foreground_supervisor, true, deadline_ms, fallback_deadline_ms),
-    );
-    try std.testing.expectEqual(
-        TerminationSource.cancelled,
-        pending_termination_source(.process_group, true, deadline_ms, fallback_deadline_ms),
-    );
-}
-
-test "timeout prevents captured user shell from evaluating trailing statements" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
-        return error.SkipZigTest;
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "post-timeout-effect.txt" });
-    defer alloc.free(effect_path);
-    const quoted_effect = try shellQuote(alloc, effect_path);
-    defer alloc.free(quoted_effect);
-    var capture = StreamCapture{ .alloc = alloc };
-    defer capture.deinit();
-    const command = try std.fmt.allocPrint(
-        alloc,
-        "sleep 2; printf 'SHOULD-NOT-RUN\\n'; printf 'SHOULD-NOT-RUN' > {s}",
-        .{quoted_effect},
-    );
-    defer alloc.free(command);
-
-    try std.testing.expectError(error.TimeoutExpired, executeCommandInEnvironment(.{
-        .max_command_output_bytes = 1024,
-        .output_chunk_ctx = @ptrCast(&capture),
-        .on_output_chunk = StreamCapture.onChunk,
-        .timeout_ms = 120,
-    }, alloc, command, workspace, .{ .user = "/bin/zsh" }));
-    try std.testing.expect(!capture.contains(.stdout, "SHOULD-NOT-RUN\n"));
-    try std.testing.expect(!absoluteFileExists(effect_path));
-}
-
 test "timeout remains dominant when its output callback fails" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
     var trigger = FailOutput{};
-    try std.testing.expectError(
-        error.TestOutputCallbackFailure,
-        FailOutput.onChunk(@ptrCast(&trigger), null, .stdout, "TIMEOUT-FAIL"),
-    );
+    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = FailOutput.onChunk,
+        .timeout_ms = 120,
+    }, std.testing.allocator, "trap 'echo TIMEOUT-FAIL; exit 0' TERM; while :; do :; done", "/tmp"));
     try std.testing.expect(trigger.seen);
-    try std.testing.expect(
-        mapTerminationError(
-            .timed_out,
-            null,
-            "output collection",
-            error.TestOutputCallbackFailure,
-        ) == error.TimeoutExpired,
-    );
 }
 
 test "timeout terminates foreground process group descendants" {
@@ -4463,14 +3337,14 @@ test "timeout terminates foreground process group descendants" {
     defer alloc.free(quoted_ready);
     const command = try std.fmt.allocPrint(
         alloc,
-        "sleep 30 & child=$!; printf '%s' \"$child\" > {s}; wait",
+        "(while :; do :; done) & child=$!; printf '%s' \"$child\" > {s}; wait",
         .{quoted_ready},
     );
     defer alloc.free(command);
 
     try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 2000,
+        .timeout_ms = 500,
     }, alloc, command, workspace));
 
     const pid_text = try readAbsoluteFile(alloc, ready_path, 64);
@@ -4495,142 +3369,13 @@ test "timeout terminates foreground process group descendants" {
     }
 }
 
-test "timeout terminates redirected descendant after setsid" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-timeout.pid" });
-    defer alloc.free(pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
-        "python3 -c 'import os,time\n" ++
-            "pid=os.fork()\n" ++
-            "if pid == 0:\n" ++
-            " os.setsid()\n" ++
-            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
-            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
-            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
-            " time.sleep(30)\n" ++
-            "else:\n" ++
-            " while True: time.sleep(1)'",
-        .{pid_path},
-    );
-    defer alloc.free(command);
-
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-        .max_command_output_bytes = 1024,
-        .timeout_ms = 10_000,
-    }, alloc, command, workspace));
-
-    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
-    defer alloc.free(pid_text);
-    const pid = try std.fmt.parseInt(
-        std.posix.pid_t,
-        std.mem.trim(u8, pid_text, " \t\r\n"),
-        10,
-    );
-    try expectProcessGone(pid);
-}
-
-test "timeout terminates double-forked descendant after setsid" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "double-fork-timeout.pid" });
-    defer alloc.free(pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
-        "python3 -c 'import os,time\n" ++
-            "pid=os.fork()\n" ++
-            "if pid == 0:\n" ++
-            " os.setsid()\n" ++
-            " grandchild=os.fork()\n" ++
-            " if grandchild > 0: os._exit(0)\n" ++
-            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
-            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
-            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
-            " time.sleep(30)\n" ++
-            "else:\n" ++
-            " while True: time.sleep(1)'",
-        .{pid_path},
-    );
-    defer alloc.free(command);
-
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-        .max_command_output_bytes = 1024,
-        .timeout_ms = 10_000,
-    }, alloc, command, workspace));
-
-    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
-    defer alloc.free(pid_text);
-    const pid = try std.fmt.parseInt(
-        std.posix.pid_t,
-        std.mem.trim(u8, pid_text, " \t\r\n"),
-        10,
-    );
-    try expectProcessGone(pid);
-}
-
-test "timeout terminates environment-sanitized double-fork descendants" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "env-clear-timeout.pids" });
-    defer alloc.free(pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
-        "/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -c 'import os,time\n" ++
-            "for index in range(16):\n" ++
-            " pid=os.fork()\n" ++
-            " if pid == 0:\n" ++
-            "  os.setsid()\n" ++
-            "  grandchild=os.fork()\n" ++
-            "  if grandchild > 0: os._exit(0)\n" ++
-            "  with open(\"{s}\",\"a\") as output: output.write(str(os.getpid())+\"\\n\")\n" ++
-            "  null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
-            "  os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
-            "  time.sleep(30)\n" ++
-            "while True: time.sleep(1)'",
-        .{pid_path},
-    );
-    defer alloc.free(command);
-
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-        .max_command_output_bytes = 1024,
-        .timeout_ms = 10_000,
-    }, alloc, command, workspace));
-
-    const pid_text = try readAbsoluteFile(alloc, pid_path, 4096);
-    defer alloc.free(pid_text);
-    var pids: std.ArrayList(std.posix.pid_t) = .empty;
-    defer pids.deinit(alloc);
-    var lines = std.mem.tokenizeAny(u8, pid_text, " \t\r\n");
-    while (lines.next()) |line| {
-        try pids.append(alloc, try std.fmt.parseInt(std.posix.pid_t, line, 10));
-    }
-    defer for (pids.items) |pid| {
-        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-    };
-    try std.testing.expectEqual(@as(usize, 16), pids.items.len);
-    for (pids.items) |pid| try expectProcessGone(pid);
-}
-
 fn expectProcessGone(pid: std.posix.pid_t) !void {
     const started_ms = io_mod.milliTimestamp();
     while (true) {
-        if (!try process_tree.processIsAlive(std.testing.allocator, pid)) return;
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
         if (io_mod.milliTimestamp() - started_ms > 1000) {
             std.posix.kill(pid, std.posix.SIG.KILL) catch {};
             return error.TestUnexpectedResult;
@@ -4663,7 +3408,7 @@ test "natural command completion terminates background child inheriting pipes" {
         .timeout_ms = 2000,
     }, alloc, command, workspace);
     defer alloc.free(result.output);
-    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
     defer alloc.free(pid_text);
@@ -4699,7 +3444,7 @@ test "natural command completion terminates background child with redirected str
         .timeout_ms = 2000,
     }, alloc, command, workspace);
     defer alloc.free(result.output);
-    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
     defer alloc.free(pid_text);
@@ -4721,35 +3466,28 @@ test "natural command completion terminates redirected descendant after setsid" 
     defer alloc.free(workspace);
     const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-child.pid" });
     defer alloc.free(pid_path);
-    // Natural cleanup may kill the child before it publishes its PID unless
-    // the parent waits for readiness after setsid and stream redirection.
     const command = try std.fmt.allocPrint(
         alloc,
         "python3 -c 'import os,time\n" ++
-            "ready_r,ready_w=os.pipe()\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
-            " os.close(ready_r)\n" ++
             " os.setsid()\n" ++
             " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
             " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
-            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
-            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
             " time.sleep(30)\n" ++
             "else:\n" ++
-            " os.close(ready_w)\n" ++
-            " if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
-            " os.close(ready_r)'",
+            " pass'",
         .{pid_path},
     );
     defer alloc.free(command);
 
     const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 10_000,
+        .timeout_ms = 2000,
     }, alloc, command, workspace);
     defer alloc.free(result.output);
-    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
     defer alloc.free(pid_text);
@@ -4834,21 +3572,6 @@ test "execution control reuses configured timeout start time" {
     try std.testing.expectEqual(started_ms, control.started_ms);
 }
 
-test "foreground supervisor fallback leaves the parent two termination polls" {
-    try std.testing.expectEqual(
-        @as(?i64, null),
-        foreground_supervisor_fallback_deadline_ms(null),
-    );
-    try std.testing.expectEqual(
-        @as(?i64, 1200),
-        foreground_supervisor_fallback_deadline_ms(1000),
-    );
-    try std.testing.expectEqual(
-        @as(?i64, std.math.maxInt(i64)),
-        foreground_supervisor_fallback_deadline_ms(std.math.maxInt(i64) - 100),
-    );
-}
-
 test "cancel and timeout tie chooses cancellation" {
     var cancel = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.CancelledBeforeExecution, executeCommand(.{
@@ -4856,167 +3579,4 @@ test "cancel and timeout tie chooses cancellation" {
         .cancel_flag = &cancel,
         .timeout_ms = 1,
     }, std.testing.allocator, "sleep 5", "/tmp"));
-}
-
-test "runtime cancellation observed at the timeout deadline stays graceful" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    for (0..10) |_| {
-        const alloc = std.testing.allocator;
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-        defer alloc.free(workspace);
-        const term_path = try std.fs.path.join(alloc, &.{ workspace, "tie.term" });
-        defer alloc.free(term_path);
-        const quoted_term = try shellQuote(alloc, term_path);
-        defer alloc.free(quoted_term);
-        const command = try std.fmt.allocPrint(
-            alloc,
-            "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1; done",
-            .{quoted_term},
-        );
-        defer alloc.free(command);
-
-        const timeout_ms: usize = 2000;
-        const started_ms = io_mod.milliTimestamp();
-        var cancel = std.atomic.Value(bool).init(false);
-        const CancelNearDeadline = struct {
-            fn run(flag: *std.atomic.Value(bool), request_at_ms: i64) void {
-                while (io_mod.milliTimestamp() < request_at_ms) {
-                    io_mod.sleep(std.time.ns_per_ms);
-                }
-                flag.store(true, .seq_cst);
-            }
-        };
-        const request_at_ms = started_ms + @as(i64, @intCast(timeout_ms)) - 25;
-        const thread = try std.Thread.spawn(
-            .{},
-            CancelNearDeadline.run,
-            .{ &cancel, request_at_ms },
-        );
-        defer thread.join();
-        var result: ?CommandExecutionResult = null;
-        var cancelled = false;
-        if (executeCommand(.{
-            .max_command_output_bytes = 4096,
-            .cancel_flag = &cancel,
-            .timeout_ms = timeout_ms,
-            .timeout_started_ms = started_ms,
-        }, alloc, command, workspace)) |value| {
-            result = value;
-            cancelled = value.cancelled;
-        } else |err| switch (err) {
-            error.Cancelled => cancelled = true,
-            else => {
-                try std.testing.expectEqual(error.Cancelled, err);
-                cancelled = true;
-            },
-        }
-        defer if (result) |value| alloc.free(value.output);
-
-        try std.testing.expect(cancelled);
-        try std.testing.expect(io_mod.milliTimestamp() - started_ms >= @as(i64, @intCast(timeout_ms)));
-        try std.testing.expect(absoluteFileExists(term_path));
-        const term_text = try readAbsoluteFile(alloc, term_path, 64);
-        defer alloc.free(term_text);
-        try std.testing.expectEqualStrings("TERM", term_text);
-    }
-}
-
-test "accepted short timeout matrix returns timeout errors" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    for ([_]usize{ 1, 2, 5, 10, 25, 50 }) |timeout_ms| {
-        try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-            .max_command_output_bytes = 1024,
-            .timeout_ms = timeout_ms,
-        }, std.testing.allocator, "sleep 30", "/tmp"));
-    }
-}
-
-test "supervisor handoff does not extend the parent timeout deadline" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "handoff-effect" });
-    defer alloc.free(effect_path);
-    const quoted_effect = try shellQuote(alloc, effect_path);
-    defer alloc.free(quoted_effect);
-    const command = try std.fmt.allocPrint(
-        alloc,
-        "sleep 0.6; printf trailing > {s}",
-        .{quoted_effect},
-    );
-    defer alloc.free(command);
-
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-        .max_command_output_bytes = 1024,
-        .timeout_ms = 500,
-    }, alloc, command, workspace));
-    try std.testing.expect(!absoluteFileExists(effect_path));
-}
-
-test "supervisor fallback force remains timeout dominant" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const term_path = try std.fs.path.join(alloc, &.{ workspace, "fallback.term" });
-    defer alloc.free(term_path);
-    const quoted_term = try shellQuote(alloc, term_path);
-    defer alloc.free(quoted_term);
-    const command = try std.fmt.allocPrint(
-        alloc,
-        "trap 'printf TERM > {s}; exit 130' TERM; printf 'FALLBACK-BLOCK\n'; while :; do sleep 1; done",
-        .{quoted_term},
-    );
-    defer alloc.free(command);
-
-    const timeout_ms: usize = 2000;
-    const started_ms = io_mod.milliTimestamp();
-    var cancel = std.atomic.Value(bool).init(false);
-    const CancelNearDeadline = struct {
-        fn run(flag: *std.atomic.Value(bool), request_at_ms: i64) void {
-            while (io_mod.milliTimestamp() < request_at_ms) {
-                io_mod.sleep(std.time.ns_per_ms);
-            }
-            flag.store(true, .seq_cst);
-        }
-    };
-    const thread = try std.Thread.spawn(
-        .{},
-        CancelNearDeadline.run,
-        .{ &cancel, started_ms + @as(i64, @intCast(timeout_ms)) - 25 },
-    );
-    defer thread.join();
-    var delay = DelayAfterOutput{
-        .needle = "FALLBACK-BLOCK",
-        .delay_ns = 2500 * std.time.ns_per_ms,
-    };
-
-    var returned_result: ?CommandExecutionResult = null;
-    if (executeCommand(.{
-        .max_command_output_bytes = 4096,
-        .cancel_flag = &cancel,
-        .output_chunk_ctx = @ptrCast(&delay),
-        .on_output_chunk = DelayAfterOutput.onChunk,
-        .timeout_ms = timeout_ms,
-        .timeout_started_ms = started_ms,
-    }, alloc, command, workspace)) |value| {
-        returned_result = value;
-    } else |err| {
-        try std.testing.expectEqual(error.TimeoutExpired, err);
-    }
-    defer if (returned_result) |value| alloc.free(value.output);
-    try std.testing.expect(returned_result == null);
-    try std.testing.expect(delay.seen);
-    try std.testing.expect(!absoluteFileExists(term_path));
 }

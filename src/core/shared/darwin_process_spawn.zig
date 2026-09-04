@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 
 var wrapped_vtable: std.Io.VTable = undefined;
 var wrapped_original_vtable: ?*const std.Io.VTable = null;
-const preferred_inherited_fd_target: std.posix.fd_t = 64;
 
 pub fn wrap(original: std.Io) std.Io {
     if (wrapped_original_vtable) |original_vtable| {
@@ -22,25 +21,6 @@ pub fn wrap(original: std.Io) std.Io {
 fn process_spawn(
     userdata: ?*anyopaque,
     options: std.process.SpawnOptions,
-) std.process.SpawnError!std.process.Child {
-    return process_spawn_inheriting_fd(userdata, options, null);
-}
-
-/// Spawns through the Darwin adapter while duplicating one borrowed descriptor
-/// to a reserved high child descriptor. The caller retains parent ownership.
-pub fn spawn_inheriting_fd(
-    io: std.Io,
-    options: std.process.SpawnOptions,
-    inherited_fd: std.posix.fd_t,
-) std.process.SpawnError!std.process.Child {
-    if (comptime builtin.os.tag != .macos) return error.OperationUnsupported;
-    return process_spawn_inheriting_fd(io.userdata, options, inherited_fd);
-}
-
-fn process_spawn_inheriting_fd(
-    userdata: ?*anyopaque,
-    options: std.process.SpawnOptions,
-    inherited_fd: ?std.posix.fd_t,
 ) std.process.SpawnError!std.process.Child {
     if (comptime builtin.os.tag != .macos) return error.OperationUnsupported;
     if (options.uid != null or options.gid != null) return error.OperationUnsupported;
@@ -85,9 +65,6 @@ fn process_spawn_inheriting_fd(
     try add_stdio_action(&actions, options.stderr, stderr_pipe, std.posix.STDERR_FILENO, false);
     if (progress_pipe) |pipe| {
         try add_inherit_or_dup(&actions, pipe[1], progress_fileno);
-    }
-    if (inherited_fd) |fd| {
-        try add_inherit_or_dup(&actions, fd, inherited_fd_target(fd));
     }
 
     var attributes: std.c.posix_spawnattr_t = undefined;
@@ -257,13 +234,6 @@ fn add_inherit_or_dup(
             std.c.posix_spawn_file_actions_adddup2(actions, source, target),
         );
     }
-}
-
-pub fn inherited_fd_target(source: std.posix.fd_t) std.posix.fd_t {
-    return if (source == preferred_inherited_fd_target)
-        preferred_inherited_fd_target + 1
-    else
-        preferred_inherited_fd_target;
 }
 
 extern "c" fn posix_spawnattr_setpgroup(
@@ -450,10 +420,10 @@ test "Darwin spawn resolves argv through parent PATH and replaces the child envi
     var environment = std.process.Environ.Map.init(alloc);
     defer environment.deinit();
     try environment.put("PATH", "/not/a/search/path");
-    try environment.put("FX_SPAWN_CONTRACT", "child-only");
+    try environment.put("FFX_SPAWN_CONTRACT", "child-only");
 
     const result = try std.process.run(alloc, io, .{
-        .argv = &.{ "sh", "-c", "printf '%s:%s' \"$FX_SPAWN_CONTRACT\" \"$PATH\"" },
+        .argv = &.{ "sh", "-c", "printf '%s:%s' \"$FFX_SPAWN_CONTRACT\" \"$PATH\"" },
         .environ_map = &environment,
     });
     defer alloc.free(result.stdout);
@@ -462,82 +432,6 @@ test "Darwin spawn resolves argv through parent PATH and replaces the child envi
     try expect_exited(result.term, 0);
     try std.testing.expectEqualStrings("child-only:/not/a/search/path", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
-}
-
-test "Darwin explicit inherited descriptor avoids low user descriptors" {
-    const io = try darwin_io();
-    for ([_]std.posix.fd_t{
-        0,
-        3,
-        preferred_inherited_fd_target,
-        preferred_inherited_fd_target + 1,
-        255,
-    }) |source_fd| {
-        const selected_fd = inherited_fd_target(source_fd);
-        try std.testing.expect(selected_fd >= preferred_inherited_fd_target);
-        try std.testing.expect(selected_fd != source_fd);
-    }
-    const pipe = try create_pipe(false);
-    defer close_pipe(pipe);
-    const target_fd = inherited_fd_target(pipe[1]);
-    try std.testing.expect(pipe[1] != target_fd);
-    try std.testing.expect(target_fd >= preferred_inherited_fd_target);
-    var source_buffer: [32]u8 = undefined;
-    const source = try std.fmt.bufPrint(&source_buffer, "{d}", .{pipe[1]});
-    var target_buffer: [32]u8 = undefined;
-    const target = try std.fmt.bufPrint(
-        &target_buffer,
-        "{d}",
-        .{target_fd},
-    );
-    var child = try spawn_inheriting_fd(io, .{
-        .argv = &.{
-            "/bin/sh",
-            "-c",
-            "test -e /dev/fd/$2 && ! test -e /dev/fd/$1",
-            "sh",
-            source,
-            target,
-        },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }, pipe[1]);
-    try wait_exited(&child, io, 0);
-}
-
-test "Darwin inherited descriptor survives Bash script execution" {
-    const io = try darwin_io();
-    const pipe = try create_pipe(false);
-    defer close_pipe(pipe);
-    const target_fd = inherited_fd_target(pipe[1]);
-    try std.testing.expect(pipe[1] != target_fd);
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    {
-        var script = try tmp.dir.createFile(io, "inherit-fd.sh", .{});
-        defer script.close(io);
-        try script.writeStreamingAll(
-            io,
-            "#!/bin/bash\n" ++
-                "/bin/sh -c 'test -p /dev/fd/$1' sh \"$1\"\n",
-        );
-    }
-    var fd_buffer: [32]u8 = undefined;
-    const fd_text = try std.fmt.bufPrint(
-        &fd_buffer,
-        "{d}",
-        .{target_fd},
-    );
-    var child = try spawn_inheriting_fd(io, .{
-        .argv = &.{ "/bin/bash", "inherit-fd.sh", fd_text },
-        .cwd = .{ .dir = tmp.dir },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }, pipe[1]);
-    try wait_exited(&child, io, 0);
 }
 
 test "Darwin spawn accepts path and directory working directories" {
@@ -639,7 +533,7 @@ test "Darwin spawn reports launch errors and preserves wait and kill" {
     const io = try darwin_io();
     const missing_before = try child_pid_snapshot();
     try std.testing.expectError(error.FileNotFound, std.process.spawn(io, .{
-        .argv = &.{"fx-contract-executable-that-does-not-exist"},
+        .argv = &.{"ffx-contract-executable-that-does-not-exist"},
     }));
     const missing_after = try wait_for_children_to_settle(io, missing_before);
     defer reap_new_children(io, missing_before, missing_after);
@@ -773,7 +667,7 @@ test "Darwin spawn partial setup failure closes every parent descriptor" {
     const children_before = try child_pid_snapshot();
     try std.testing.expectError(error.FileNotFound, std.process.spawn(io, .{
         .argv = &.{"/bin/sh"},
-        .cwd = .{ .path = "/fx-contract-cwd-that-does-not-exist" },
+        .cwd = .{ .path = "/ffx-contract-cwd-that-does-not-exist" },
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -790,7 +684,7 @@ test "Darwin spawn partial setup failure leaves no child behind" {
     const before = try child_pid_snapshot();
     try std.testing.expectError(error.FileNotFound, std.process.spawn(io, .{
         .argv = &.{"/bin/sh"},
-        .cwd = .{ .path = "/fx-contract-cwd-that-does-not-exist" },
+        .cwd = .{ .path = "/ffx-contract-cwd-that-does-not-exist" },
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,

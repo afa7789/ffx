@@ -9,7 +9,7 @@ const max_response_bytes: usize = 64 * 1024;
 pub const max_session_bytes: usize = 64 * 1024;
 pub const max_revision_bytes: usize = 1024;
 
-extern "fx" fn fx_http_request(
+extern "ffx" fn fx_http_request(
     method_ptr: [*]const u8,
     method_len: usize,
     url_ptr: [*]const u8,
@@ -23,7 +23,7 @@ extern "fx" fn fx_http_request(
     response_cap: usize,
 ) i32;
 
-extern "fx" fn fx_oauth_session_load(
+extern "ffx" fn fx_oauth_session_load(
     bytes_ptr: [*]u8,
     bytes_cap: usize,
     revision_ptr: [*]u8,
@@ -31,7 +31,7 @@ extern "fx" fn fx_oauth_session_load(
     revision_len_out: *usize,
 ) i32;
 
-extern "fx" fn fx_oauth_session_commit(
+extern "ffx" fn fx_oauth_session_commit(
     bytes_ptr: [*]const u8,
     bytes_len: usize,
     expected_revision_ptr: [*]const u8,
@@ -41,7 +41,7 @@ extern "fx" fn fx_oauth_session_commit(
     revision_len_out: *usize,
 ) i32;
 
-extern "fx" fn fx_oauth_session_remove(
+extern "ffx" fn fx_oauth_session_remove(
     expected_revision_ptr: [*]const u8,
     expected_revision_len: usize,
 ) i32;

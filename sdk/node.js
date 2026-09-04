@@ -1,7 +1,5 @@
 import { access, readFile } from "node:fs/promises";
-import { closeSync } from "node:fs";
 import { createRequire } from "node:module";
-import { Socket } from "node:net";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -10,14 +8,12 @@ import {
   createFxTerminal as createWasmTerminal,
   encodeXtermKeyEvent,
   fxSdkApiVersion,
-  listModels,
   supportsJspi,
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
+export { encodeXtermKeyEvent, fxSdkApiVersion, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
-const nativeCoreApiVersion = 3;
 
 const fetchOperationStale = 0;
 const fetchOperationApplied = 1;
@@ -31,7 +27,6 @@ const defaultNativeCandidates = [
   `./libfx.${process.platform}-${process.arch}.node`,
 ];
 let nativeBackendPromise;
-const wasmFilePromises = new Map();
 
 function jspiFallbackError(surface, nativeError) {
   const nativeDetail = nativeError ? ` Native loading failed: ${nativeError.message}.` : " No compatible native addon was found.";
@@ -66,13 +61,14 @@ async function loadNativeCandidate(candidate) {
 function validateNativeBackend(backend) {
   if (!backend) return null;
   const hasLowLevelCore = typeof backend.createCore === "function";
-  const expectedVersion = hasLowLevelCore ? nativeCoreApiVersion : libfxApiVersion;
-  if ((hasLowLevelCore || backend.libfxApiVersion !== undefined) && backend.libfxApiVersion !== expectedVersion) {
+  if ((hasLowLevelCore && backend.libfxApiVersion !== libfxApiVersion) ||
+    (!hasLowLevelCore && backend.libfxApiVersion !== undefined && backend.libfxApiVersion !== libfxApiVersion)) {
     const actualVersion = backend.libfxApiVersion ?? "missing";
-    throw new Error(`native addon API version ${actualVersion} is incompatible with expected API version ${expectedVersion}`);
+    throw new Error(`native addon API version ${actualVersion} is incompatible with libfx API version ${libfxApiVersion}`);
   }
-  if (typeof backend.createCore !== "function" && typeof backend.createFxTerminal !== "function") {
-    throw new Error("native addon must export createCore() or createFxTerminal()");
+  if (typeof backend.createFxAgent !== "function" && typeof backend.createCore !== "function" &&
+    typeof backend.createFxTerminal !== "function") {
+    throw new Error("native addon must export createFxAgent(), createCore(), or createFxTerminal()");
   }
   return backend;
 }
@@ -108,23 +104,32 @@ async function resolveNativeBackend(nativeAddon) {
   return nativeBackendPromise;
 }
 
-function wasmBytes(input) {
-  let path;
-  if (input instanceof URL && input.protocol === "file:") path = fileURLToPath(input);
-  else if (typeof input === "string" && !URL.canParse(input)) path = resolve(input);
-  else return input;
-  const cached = wasmFilePromises.get(path);
-  if (cached) return cached;
-  const pending = readFile(path);
-  wasmFilePromises.set(path, pending);
-  pending.catch(() => {
-    if (wasmFilePromises.get(path) === pending) wasmFilePromises.delete(path);
-  });
-  return pending;
+async function wasmBytes(input) {
+  if (input instanceof URL && input.protocol === "file:") return readFile(input);
+  if (typeof input === "string" && !URL.canParse(input)) return readFile(input);
+  return input;
+}
+
+function validateGatewayChatUrl(value) {
+  if (value === undefined) return;
+  if (typeof value !== "string") throw new TypeError("FX_GATEWAY_CHAT_URL must be a string");
+  let url;
+  try { url = new URL(value); } catch { throw new TypeError("FX_GATEWAY_CHAT_URL must be a valid URL"); }
+  if (url.username || url.password || url.hash) {
+    throw new TypeError("FX_GATEWAY_CHAT_URL must not contain credentials or a fragment");
+  }
+  if (url.href === "https://ai-gateway.vercel.sh/v3/ai/language-model") return;
+  const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost";
+  if (url.protocol !== "http:" || !loopback || !url.port) {
+    throw new TypeError("FX_GATEWAY_CHAT_URL must use the canonical Gateway or explicit loopback HTTP");
+  }
 }
 
 function createNativeCoreRuntime(addon, options) {
-  const { apiKey, model, gatewayChatUrl } = options;
+  const apiKey = options.env?.AI_GATEWAY_API_KEY;
+  const model = options.env?.FX_MODEL;
+  const gatewayChatUrl = options.env?.FX_GATEWAY_CHAT_URL;
+  validateGatewayChatUrl(gatewayChatUrl);
   const core = addon.createCore({
     apiKey,
     home: options.home ?? homedir(),
@@ -132,23 +137,9 @@ function createNativeCoreRuntime(addon, options) {
     ...(model === undefined ? {} : { model }),
     ...(gatewayChatUrl === undefined ? {} : { gatewayChatUrl }),
   });
-  let readyFd;
-  let readySocket;
-  try {
-    readyFd = addon.takeCoreReadyFd(core);
-    readySocket = new Socket({ fd: readyFd, readable: true, writable: false });
-  } catch (error) {
-    if (readyFd !== undefined) {
-      try { closeSync(readyFd); } catch {}
-    }
-    addon.destroyCore(core);
-    throw error;
-  }
-  const readyClosed = new Promise((resolve) => readySocket.once("close", resolve));
   let exitedResolve;
   let lineHandler = null;
   let lineBuffer = "";
-  const decoder = new TextDecoder();
   let settled = false;
   let fetchState = null;
   const exited = new Promise((resolve) => { exitedResolve = resolve; });
@@ -159,10 +150,10 @@ function createNativeCoreRuntime(addon, options) {
   const finish = (code) => {
     if (settled) return;
     settled = true;
+    clearInterval(timer);
     abortHostEffects();
     try { addon.destroyCore(core); } catch {}
-    readySocket.destroy();
-    void readyClosed.then(() => exitedResolve(code));
+    exitedResolve(code);
   };
   const pumpFetch = async (request) => {
     const controller = new AbortController();
@@ -206,14 +197,10 @@ function createNativeCoreRuntime(addon, options) {
         } catch {}
       }
     } finally {
-      if (fetchState === state) {
-        fetchState = null;
-        queueMicrotask(drainReady);
-      }
+      if (fetchState === state) fetchState = null;
     }
   };
-  function drainReady() {
-    if (settled) return;
+  const timer = setInterval(() => {
     try {
       if (fetchState) {
         if (!fetchState.controller.signal.aborted && !addon.coreFetchActive(core, fetchState.handle)) {
@@ -223,32 +210,22 @@ function createNativeCoreRuntime(addon, options) {
         const fetchRequest = addon.takeCoreFetch(core);
         if (fetchRequest) void pumpFetch(JSON.parse(fetchRequest.toString("utf8")));
       }
-      for (;;) {
-        const chunk = addon.drainCore(core);
-        if (!chunk.length) break;
-        lineBuffer += decoder.decode(chunk, { stream: true });
+      const chunk = addon.drainCore(core);
+      if (chunk.length && lineHandler) {
+        lineBuffer += chunk.toString("utf8");
         for (;;) {
           const newline = lineBuffer.indexOf("\n");
           if (newline < 0) break;
           const line = lineBuffer.slice(0, newline);
           lineBuffer = lineBuffer.slice(newline + 1);
-          if (line) void Promise.resolve(lineHandler(JSON.parse(line))).catch(() => finish(1));
+          if (line) lineHandler(JSON.parse(line));
         }
       }
       if (addon.coreExited(core)) finish(addon.coreExitCode(core));
     } catch {
       finish(1);
     }
-  }
-
-  readySocket.on("data", drainReady);
-  readySocket.on("end", () => { drainReady(); if (!settled) finish(1); });
-  readySocket.on("error", () => finish(1));
-  readySocket.on("close", () => { if (!settled) finish(1); });
-  // Some runtimes defer descriptor adoption until connect().
-  if (readySocket.pending) {
-    try { readySocket.connect({ fd: readyFd }); } catch (error) { finish(1); throw error; }
-  }
+  }, 2);
 
   return {
     exited,
@@ -271,20 +248,22 @@ function createNativeAgent(addon, options) {
 
 async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWasm, options) {
   const { nativeAddon, backend = "auto", ...runtimeOptions } = options ?? {};
+  validateGatewayChatUrl(runtimeOptions.env?.FX_GATEWAY_CHAT_URL);
   if (!new Set(["auto", "native", "wasm"]).has(backend)) {
     throw new TypeError('backend must be "auto", "native", or "wasm"');
   }
 
   let nativeError;
-  let nativeAttempted = false;
   if (backend !== "wasm") {
     const native = await resolveNativeBackend(nativeAddon);
     nativeError = native.error;
-    if (typeof native.backend?.[nativeMethod] === "function") {
-      nativeAttempted = true;
+    if (typeof native.backend?.[nativeMethod] === "function" ||
+      (surface === "agent" && typeof native.backend?.createCore === "function")) {
       try {
-        if (surface === "agent") return await createNativeAgent(native.backend, runtimeOptions);
-        return await native.backend[nativeMethod](runtimeOptions);
+        if (typeof native.backend?.[nativeMethod] === "function") {
+          return await native.backend[nativeMethod](runtimeOptions);
+        }
+        return await createNativeAgent(native.backend, runtimeOptions);
       } catch (error) {
         nativeError = error;
         if (backend === "native") throw error;
@@ -297,27 +276,15 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
     }
   }
 
-  if (!supportsJspi()) {
-    if (nativeAttempted) throw nativeError;
-    throw jspiFallbackError(surface, nativeError);
-  }
+  if (!supportsJspi()) throw jspiFallbackError(surface, nativeError);
   return wasmFactory({
     ...runtimeOptions,
     wasm: await wasmBytes(runtimeOptions.wasm ?? defaultWasm),
   });
 }
 
-export async function createFxAgent(options = {}) {
-  if (options != null && Object.hasOwn(Object(options), "env")) {
-    throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
-  }
-  return createWithFallback(
-    "agent",
-    "createCore",
-    createWasmAgent,
-    defaultCoreWasm,
-    options,
-  );
+export function createFxAgent(options = {}) {
+  return createWithFallback("agent", "createFxAgent", createWasmAgent, defaultCoreWasm, options);
 }
 
 export function createFxTerminal(options = {}) {

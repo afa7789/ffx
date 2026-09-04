@@ -8,12 +8,14 @@ pub const IdleFacts = struct {
     connected_clients: usize = 0,
     pending_requests: usize = 0,
     live_work: usize = 0,
+    monitor_required: bool = false,
 };
 
 pub fn idleEligible(facts: IdleFacts) bool {
     return facts.connected_clients == 0 and
         facts.pending_requests == 0 and
-        facts.live_work == 0;
+        facts.live_work == 0 and
+        !facts.monitor_required;
 }
 
 pub const QueueAdmission = enum {
@@ -146,6 +148,7 @@ test "idle eligibility accounts for every host owner" {
     try std.testing.expect(!idleEligible(.{ .connected_clients = 1 }));
     try std.testing.expect(!idleEligible(.{ .pending_requests = 1 }));
     try std.testing.expect(!idleEligible(.{ .live_work = 1 }));
+    try std.testing.expect(!idleEligible(.{ .monitor_required = true }));
 }
 
 test "queue admission is bounded and rejects shutdown" {

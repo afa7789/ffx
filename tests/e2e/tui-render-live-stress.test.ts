@@ -11,7 +11,7 @@ import {
 } from "./tui-render-assertions";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
-const LIVE_ENABLED = process.env.FX_LIVE_RENDER_STRESS === "1";
+const LIVE_ENABLED = process.env.FFX_LIVE_RENDER_STRESS === "1";
 const SKIP = !LIVE_ENABLED || !tmuxAvailable() || !HAS_API_KEY;
 const TIMEOUT = 240_000;
 const TRACE_SCOPES = "paint,render,scroll,footer.clean,input,tool,gateway";
@@ -43,7 +43,7 @@ function livePrompt(run: number, step: number): { prompt: string; marker: string
 }
 
 async function launch(run: number): Promise<{ session: TmuxSession; tracePath: string }> {
-  const workDir = mkdtempSync(join(tmpdir(), `fx-render-live-stress-${run}-`));
+  const workDir = mkdtempSync(join(tmpdir(), `ffx-render-live-stress-${run}-`));
   workDirs.push(workDir);
   const tracePath = join(workDir, "trace.log");
 
@@ -54,8 +54,8 @@ async function launch(run: number): Promise<{ session: TmuxSession; tracePath: s
     env: {
       AI_GATEWAY_API_KEY: process.env.AI_GATEWAY_API_KEY,
       VERCEL_OIDC_TOKEN: process.env.VERCEL_OIDC_TOKEN,
-      FX_TRACE_LOG: tracePath,
-      FX_TRACE_SCOPES: TRACE_SCOPES,
+      FFX_TRACE_LOG: tracePath,
+      FFX_TRACE_SCOPES: TRACE_SCOPES,
     },
   });
   await s.waitForComposer(10_000);
@@ -79,24 +79,6 @@ async function waitForScrollbackText(
   );
 }
 
-async function waitForScrollbackOccurrences(
-  activeSession: TmuxSession,
-  text: string,
-  minimum: number,
-  timeoutMs: number,
-): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  let scrollback = "";
-  while (Date.now() < deadline) {
-    scrollback = await activeSession.captureFullScrollback();
-    if (scrollback.split(text).length - 1 >= minimum) return scrollback;
-    await sleep(100);
-  }
-  throw new Error(
-    `Timed out waiting for ${minimum} durable occurrences of ${JSON.stringify(text)}.\nScrollback:\n${scrollback}`,
-  );
-}
-
 describe.skipIf(SKIP)("tui: live render stress", () => {
   test(
     "live streaming, tool activity, and resize preserve prompts and keep the footer visible",
@@ -108,15 +90,15 @@ describe.skipIf(SKIP)("tui: live render stress", () => {
       for (let step = 0; step < 3; step++) {
         const { prompt, marker, visible } = livePrompt(0, step);
         await session.sendText(prompt);
-        await waitForScrollbackText(session, visible, 10_000);
+        await session.waitForText(visible, 10_000);
         await sleep(1_500);
 
         await session.resizeWindow(64, 24);
         await session.resizeWindow(118, 36);
         await session.resizeWindow(84, 30);
 
-        const scrollback = await waitForScrollbackOccurrences(session, marker, 2, 120_000);
-        const pane = await session.capturePane();
+        const pane = await session.waitForText(marker, 120_000);
+        const scrollback = await waitForScrollbackText(session, visible, 10_000);
         assertPaneContains(scrollback, visible, failures, `step ${step} scrollback`);
         assertPaneContains(pane, marker, failures, `step ${step}`);
         const grid = await session.capturePaneGrid();

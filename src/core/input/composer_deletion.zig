@@ -176,7 +176,7 @@ fn applyPickerPolicy(
 
 fn reconcilePicker(insertion: composer_insertion.State) void {
     insertion.picker.reconcileInlinePickerAfterEdit(insertion.edit);
-    insertion.picker.resetActiveCompletionIndex();
+    insertion.picker.resetActiveModelPickerIndex();
 }
 
 const Fixture = struct {

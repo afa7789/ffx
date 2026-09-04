@@ -9,15 +9,13 @@ const mcp_contract = @import("mcp_contract.zig");
 const mcp_auth = @import("mcp_auth.zig");
 const mcp_auth_store = @import("mcp_auth_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const model_tool_schema = @import("../tooling/model_tool_schema.zig");
+const gateway_schema = @import("../tooling/gateway_schema.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
-const lexical_relevance = @import("../shared/lexical_relevance.zig");
-const capability_retrieval = @import("../tooling/capability_retrieval.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const legacy_http_sse = @import("legacy_http_sse.zig");
 const legacy_streamable_http = @import("legacy_streamable_http.zig");
@@ -28,7 +26,6 @@ const operation_control = @import("operation_control.zig");
 const controlled_lock = @import("controlled_lock.zig");
 const mcp_json = @import("mcp_json.zig");
 const protocol_negotiation = @import("protocol_negotiation.zig");
-const docker_run = @import("docker_run.zig");
 const stdio_dispatcher = @import("stdio_dispatcher.zig");
 const streamable_http = @import("streamable_http.zig");
 const feature_cache = @import("feature_cache.zig");
@@ -36,7 +33,6 @@ const access_policy = @import("access_policy.zig");
 const health = @import("health.zig");
 const model_catalog = @import("model_catalog.zig");
 const startup_admission = @import("startup_admission.zig");
-const project_config = @import("project_config.zig");
 const tool_subscription = @import("tool_subscription.zig");
 const completion_feature = @import("features/completion.zig");
 const prompts_feature = @import("features/prompts.zig");
@@ -61,8 +57,6 @@ const default_mcp_search_limit: usize = 8;
 const max_mcp_search_limit: usize = 20;
 const max_mcp_tool_tags: usize = 16;
 const mcp_server_instruction_search_bytes = context_limits.Name.mcp_server_instructions_bytes.defaultBytes();
-const mcp_tool_description_search_bytes: usize = 2 * 1024;
-const mcp_tool_schema_search_bytes: usize = 4 * 1024;
 const max_pending_legacy_url_waiters: usize = 32;
 const max_early_legacy_url_completions_per_window: usize = 64;
 const max_legacy_url_completion_candidates: usize = 1024;
@@ -95,16 +89,7 @@ fn allocateRuntimeGeneration() u64 {
     return generation;
 }
 
-pub const LoadRuntimeFn = *const fn (
-    Allocator,
-    []const u8,
-    elicitation.Capabilities,
-) anyerror!?*McpRuntime;
-
-pub const PreviewNativeWorkspaceAuthorityFn = *const fn (
-    Allocator,
-    []const u8,
-) anyerror![][]u8;
+pub const LoadRuntimeFn = *const fn (Allocator, elicitation.Capabilities) anyerror!?*McpRuntime;
 
 const ConnectionControl = struct {
     deadline: ?std.Io.Clock.Timestamp = null,
@@ -727,21 +712,28 @@ fn fetchResources(self: *McpRuntime, server: *McpServer, deadline: std.Io.Clock.
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        var exchange = try request_feature_catalog_page(
+        try reauthorizeOperation(
             self,
-            server,
-            .resources,
-            cursor,
-            deadline,
-            cancel_flag,
             access,
+            .{ .feature_server = server.config.name },
         );
-        defer exchange.response.deinit(self.alloc);
-        try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
-        var page = try resources_feature.parseResourcePage(self.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
+        const request_id = try nextFeatureRequestId(server);
+        const request = try resources_feature.buildListRequest(self.alloc, request_id, serverFeatureProtocol(server), cursor, writeModernRequestMetadata);
+        defer self.alloc.free(request);
+        var guard = ServerAccessPrecommit{
+            .runtime = self,
+            .target = .{ .feature_server = server.config.name },
+            .access = access,
+        };
+        var precommit = guard.transport();
+        var response = try sendFeatureRequest(self, server, request_id, request, deadline, cancel_flag, access, &precommit, null);
+        const received_at_ms = clockMillis();
+        defer response.deinit(self.alloc);
+        try acceptPageIdentity(&producing_identity, response.auth_identity);
+        var page = try resources_feature.parseResourcePage(self.alloc, response.body, serverFeatureProtocol(server), .{});
         defer page.deinit(self.alloc);
         try replaceOwnedCursor(self.alloc, &cursor, page.next_cursor);
-        try builder.appendPage(self.alloc, &page, exchange.received_at_ms, .{});
+        try builder.appendPage(self.alloc, &page, received_at_ms, .{});
         if (cursor == null) return .{ .catalog = try builder.finish(self.alloc), .auth_identity = producing_identity };
     }
 }
@@ -753,21 +745,28 @@ fn fetchResourceTemplates(self: *McpRuntime, server: *McpServer, deadline: std.I
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        var exchange = try request_feature_catalog_page(
+        try reauthorizeOperation(
             self,
-            server,
-            .resource_templates,
-            cursor,
-            deadline,
-            cancel_flag,
             access,
+            .{ .feature_server = server.config.name },
         );
-        defer exchange.response.deinit(self.alloc);
-        try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
-        var page = try resources_feature.parseTemplatePage(self.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
+        const request_id = try nextFeatureRequestId(server);
+        const request = try resources_feature.buildTemplatesListRequest(self.alloc, request_id, serverFeatureProtocol(server), cursor, writeModernRequestMetadata);
+        defer self.alloc.free(request);
+        var guard = ServerAccessPrecommit{
+            .runtime = self,
+            .target = .{ .feature_server = server.config.name },
+            .access = access,
+        };
+        var precommit = guard.transport();
+        var response = try sendFeatureRequest(self, server, request_id, request, deadline, cancel_flag, access, &precommit, null);
+        const received_at_ms = clockMillis();
+        defer response.deinit(self.alloc);
+        try acceptPageIdentity(&producing_identity, response.auth_identity);
+        var page = try resources_feature.parseTemplatePage(self.alloc, response.body, serverFeatureProtocol(server), .{});
         defer page.deinit(self.alloc);
         try replaceOwnedCursor(self.alloc, &cursor, page.next_cursor);
-        try builder.appendPage(self.alloc, &page, exchange.received_at_ms, .{});
+        try builder.appendPage(self.alloc, &page, received_at_ms, .{});
         if (cursor == null) return .{ .catalog = try builder.finish(self.alloc), .auth_identity = producing_identity };
     }
 }
@@ -779,21 +778,28 @@ fn fetchPrompts(self: *McpRuntime, server: *McpServer, deadline: std.Io.Clock.Ti
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        var exchange = try request_feature_catalog_page(
+        try reauthorizeOperation(
             self,
-            server,
-            .prompts,
-            cursor,
-            deadline,
-            cancel_flag,
             access,
+            .{ .feature_server = server.config.name },
         );
-        defer exchange.response.deinit(self.alloc);
-        try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
-        var page = try prompts_feature.parseListPage(self.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
+        const request_id = try nextFeatureRequestId(server);
+        const request = try prompts_feature.buildListRequest(self.alloc, request_id, serverFeatureProtocol(server), cursor, writeModernRequestMetadata);
+        defer self.alloc.free(request);
+        var guard = ServerAccessPrecommit{
+            .runtime = self,
+            .target = .{ .feature_server = server.config.name },
+            .access = access,
+        };
+        var precommit = guard.transport();
+        var response = try sendFeatureRequest(self, server, request_id, request, deadline, cancel_flag, access, &precommit, null);
+        const received_at_ms = clockMillis();
+        defer response.deinit(self.alloc);
+        try acceptPageIdentity(&producing_identity, response.auth_identity);
+        var page = try prompts_feature.parseListPage(self.alloc, response.body, serverFeatureProtocol(server), .{});
         defer page.deinit(self.alloc);
         try replaceOwnedCursor(self.alloc, &cursor, page.next_cursor);
-        try builder.appendPage(self.alloc, &page, exchange.received_at_ms, .{});
+        try builder.appendPage(self.alloc, &page, received_at_ms, .{});
         if (cursor == null) return .{ .catalog = try builder.finish(self.alloc), .auth_identity = producing_identity };
     }
 }
@@ -839,73 +845,6 @@ const FeatureResponse = struct {
         self.* = undefined;
     }
 };
-
-const FeatureCatalogPageResponse = struct {
-    response: FeatureResponse,
-    received_at_ms: u64,
-};
-
-fn request_feature_catalog_page(
-    self: *McpRuntime,
-    server: *McpServer,
-    kind: FeatureCatalogKind,
-    cursor: ?[]const u8,
-    deadline: std.Io.Clock.Timestamp,
-    cancel_flag: ?*std.atomic.Value(bool),
-    access: tool_mcp_runtime.Access,
-) !FeatureCatalogPageResponse {
-    try reauthorizeOperation(
-        self,
-        access,
-        .{ .feature_server = server.config.name },
-    );
-    const request_id = try nextFeatureRequestId(server);
-    const protocol = serverFeatureProtocol(server);
-    const request = switch (kind) {
-        .resources => try resources_feature.buildListRequest(
-            self.alloc,
-            request_id,
-            protocol,
-            cursor,
-            writeModernRequestMetadata,
-        ),
-        .resource_templates => try resources_feature.buildTemplatesListRequest(
-            self.alloc,
-            request_id,
-            protocol,
-            cursor,
-            writeModernRequestMetadata,
-        ),
-        .prompts => try prompts_feature.buildListRequest(
-            self.alloc,
-            request_id,
-            protocol,
-            cursor,
-            writeModernRequestMetadata,
-        ),
-    };
-    defer self.alloc.free(request);
-    var guard = ServerAccessPrecommit{
-        .runtime = self,
-        .target = .{ .feature_server = server.config.name },
-        .access = access,
-    };
-    var precommit = guard.transport();
-    return .{
-        .response = try sendFeatureRequest(
-            self,
-            server,
-            request_id,
-            request,
-            deadline,
-            cancel_flag,
-            access,
-            &precommit,
-            null,
-        ),
-        .received_at_ms = clockMillis(),
-    };
-}
 
 const LegacyElicitationSpec = struct {
     responder: ?tool_mcp_runtime.InputResponder,
@@ -2429,14 +2368,6 @@ fn respondToLegacyUrlRequired(
     };
 }
 
-fn requireWorkspaceOperationApproval(server: *const McpServer) !void {
-    if (server.config.source == .workspace and
-        server.config.workspace_admission != .approved)
-    {
-        return error.McpWorkspaceApprovalRequired;
-    }
-}
-
 fn completeFeatureArgument(
     self: *McpRuntime,
     alloc: Allocator,
@@ -2456,7 +2387,6 @@ fn completeFeatureArgument(
     defer operation_access.deinit();
     try operation_access.authorize(.{ .feature_server = server_name });
     const server = self.findServer(server_name) orelse return error.McpServerNotFound;
-    try requireWorkspaceOperationApproval(server);
     if (!server.capabilities.completion) return error.McpCompletionUnsupported;
     switch (reference) {
         .prompt => if (!server.capabilities.prompts) return error.McpPromptsUnsupported,
@@ -2528,6 +2458,7 @@ pub const McpServerConfig = mcp_contract.McpServerConfig;
 const freeOwnedStrings = mcp_contract.freeOwnedStrings;
 
 pub const McpTool = struct {
+    server_name: []const u8,
     original_name: []const u8,
     prefixed_name: []u8,
     title: ?[]u8 = null,
@@ -2538,6 +2469,8 @@ pub const McpTool = struct {
     annotations_json: ?[]u8 = null,
     metadata_json: ?[]u8 = null,
     tags: []const []u8,
+    search_text: []u8,
+    server_instructions: ?[]const u8 = null,
 };
 
 pub const ToolCatalogSnapshot = struct {
@@ -3189,7 +3122,7 @@ fn snapshotServerHealthBeforeDiscoveryPublication(
         .connecting
     else
         .disconnected;
-    const authentication = serverAuthenticationState(server);
+    const authentication = configuredAuthenticationState(server);
     const failure = try healthFailureForState(
         alloc,
         server.config.required,
@@ -3202,7 +3135,6 @@ fn snapshotServerHealthBeforeDiscoveryPublication(
         .negotiated_version = null,
         .source = server.config.source,
         .scope = server.config.scope,
-        .workspace_admission = server.config.workspace_admission,
         .required = server.config.required,
         .transport = server.config.transport,
         .protocol_version = null,
@@ -3271,7 +3203,6 @@ fn snapshotServerHealth(
         .negotiated_version = negotiated_version,
         .source = server.config.source,
         .scope = server.config.scope,
-        .workspace_admission = server.config.workspace_admission,
         .required = server.config.required,
         .transport = server.config.transport,
         .protocol_version = protocol_version,
@@ -3323,8 +3254,8 @@ fn configuredAuthenticationState(server: *const McpServer) health.Authentication
 }
 
 fn serverAuthenticationState(server: *const McpServer) health.AuthenticationState {
-    if (server.auth_challenge_present.load(.acquire)) return .required;
     if (server.auth_credentials_present.load(.acquire)) return .authenticated;
+    if (server.auth_challenge_present.load(.acquire)) return .required;
     return configuredAuthenticationState(server);
 }
 
@@ -3351,7 +3282,6 @@ fn snapshotServerModelSummary(
         startup_admission.decide(
             server.config.enabled,
             server.config.required,
-            server.config.workspace_admission,
             .ask_startup,
         ) == .deferred;
     var tool_count: ?usize = null;
@@ -3392,10 +3322,7 @@ fn healthFailureForState(
         return @as(?[]u8, try alloc.dupe(u8, "Enable this required server or mark it optional."));
     }
     if (authentication == .required) {
-        return @as(?[]u8, try alloc.dupe(
-            u8,
-            "Authentication is required or the saved credentials lack access; run /mcp auth <name> --open and check server permissions.",
-        ));
+        return @as(?[]u8, try alloc.dupe(u8, "Authentication is required; run /mcp auth <name> --open."));
     }
     if (connection == .failed) {
         return @as(?[]u8, try alloc.dupe(u8, "Connection or discovery failed; check the trusted profile configuration and trace logs."));
@@ -3648,6 +3575,7 @@ fn freeTools(alloc: Allocator, tools: []const McpTool) void {
         if (tool.annotations_json) |value| alloc.free(value);
         if (tool.metadata_json) |value| alloc.free(value);
         freeOwnedStrings(alloc, tool.tags);
+        alloc.free(tool.search_text);
     }
 }
 
@@ -3874,7 +3802,6 @@ pub const McpRuntime = struct {
     generation: u64,
     legacy_url_runtime_generation: u64 = 0,
     servers: std.ArrayList(McpServer) = .empty,
-    workspace_diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty,
     catalog_mutex: std.Io.RwLock = .init,
     recovery_mutex: std.Io.Mutex = .init,
     catalog_update_mutex: std.Io.Mutex = .init,
@@ -3940,10 +3867,6 @@ pub const McpRuntime = struct {
             server.subscription_lifecycle_lock.unlock(io_mod.getIo());
         }
         self.servers.deinit(self.alloc);
-        for (self.workspace_diagnostics.items) |*diagnostic| {
-            diagnostic.deinit(self.alloc);
-        }
-        self.workspace_diagnostics.deinit(self.alloc);
         std.debug.assert(self.legacy_url_waiters.items.len == 0);
         self.legacy_url_waiters.deinit(self.alloc);
         for (self.early_legacy_url_completions.items) |*completion| {
@@ -4894,141 +4817,11 @@ pub const McpRuntime = struct {
     pub fn addServer(
         self: *McpRuntime,
         config: McpServerConfig,
-    ) (Allocator.Error || error{ McpConfigScopeMismatch, McpConfigAdmissionMismatch })!void {
+    ) (Allocator.Error || error{McpConfigScopeMismatch})!void {
         if (!mcp_contract.sourceAllowsScope(config.source, config.scope)) {
             return error.McpConfigScopeMismatch;
         }
-        if (!mcp_contract.sourceAllowsWorkspaceAdmission(
-            config.source,
-            config.workspace_admission,
-        )) {
-            return error.McpConfigAdmissionMismatch;
-        }
         try self.servers.append(self.alloc, .{ .config = config, .runtime = self, .owner_alloc = self.alloc });
-    }
-
-    pub fn workspaceAuthorityReducedAgainst(
-        self: *const McpRuntime,
-        next: *const McpRuntime,
-        phase: startup_admission.Phase,
-    ) bool {
-        for (self.servers.items) |current| {
-            if (current.config.source != .workspace or
-                startup_admission.decide(
-                    current.config.enabled,
-                    current.config.required,
-                    current.config.workspace_admission,
-                    phase,
-                ) != .connect) continue;
-            var retained = false;
-            for (next.servers.items) |candidate| {
-                if (candidate.config.source != .workspace or
-                    !std.mem.eql(u8, current.config.name, candidate.config.name)) continue;
-                retained = startup_admission.decide(
-                    candidate.config.enabled,
-                    candidate.config.required,
-                    candidate.config.workspace_admission,
-                    phase,
-                ) == .connect;
-                if (retained) break;
-            }
-            if (!retained) return true;
-        }
-        return false;
-    }
-
-    pub fn workspaceAuthorityReducedAgainstConfigs(
-        self: *const McpRuntime,
-        next: []const McpServerConfig,
-        phase: startup_admission.Phase,
-    ) bool {
-        for (self.servers.items) |current| {
-            if (!project_config.configRetainsWorkspaceAuthority(
-                current.config,
-                next,
-                phase,
-            )) return true;
-        }
-        return false;
-    }
-
-    pub fn workspaceAuthorityReducedAgainstNames(
-        self: *const McpRuntime,
-        next_names: []const []const u8,
-        phase: startup_admission.Phase,
-    ) bool {
-        for (self.servers.items) |current| {
-            if (current.config.source != .workspace or
-                startup_admission.decide(
-                    current.config.enabled,
-                    current.config.required,
-                    current.config.workspace_admission,
-                    phase,
-                ) != .connect) continue;
-            var retained = false;
-            for (next_names) |name| {
-                if (std.mem.eql(u8, current.config.name, name)) {
-                    retained = true;
-                    break;
-                }
-            }
-            if (!retained) return true;
-        }
-        return false;
-    }
-
-    pub fn pendingWorkspaceNames(
-        self: *const McpRuntime,
-        alloc: Allocator,
-    ) ![][]u8 {
-        var names: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (names.items) |name| alloc.free(name);
-            names.deinit(alloc);
-        }
-        for (self.servers.items) |server| {
-            if (!server.config.enabled or
-                server.config.source != .workspace or
-                server.config.workspace_admission != .pending) continue;
-            const owned_name = try terminalSafeOwned(alloc, server.config.name, 256);
-            errdefer alloc.free(owned_name);
-            try names.append(alloc, owned_name);
-        }
-        return names.toOwnedSlice(alloc);
-    }
-
-    pub fn firstPendingWorkspaceName(
-        self: *const McpRuntime,
-        alloc: Allocator,
-    ) !?[]u8 {
-        for (self.servers.items) |server| {
-            if (!server.config.enabled or
-                server.config.source != .workspace or
-                server.config.workspace_admission != .pending) continue;
-            return @as(?[]u8, try alloc.dupe(u8, server.config.name));
-        }
-        return null;
-    }
-
-    pub fn hasPendingWorkspace(self: *const McpRuntime) bool {
-        for (self.servers.items) |server| {
-            if (server.config.enabled and
-                server.config.source == .workspace and
-                server.config.workspace_admission == .pending) return true;
-        }
-        return false;
-    }
-
-    pub fn takeWorkspaceDiagnostics(
-        self: *McpRuntime,
-        diagnostics: *std.ArrayList(project_config.WorkspaceDiagnostic),
-    ) !void {
-        try self.workspace_diagnostics.ensureUnusedCapacity(
-            self.alloc,
-            diagnostics.items.len,
-        );
-        self.workspace_diagnostics.appendSliceAssumeCapacity(diagnostics.items);
-        diagnostics.clearRetainingCapacity();
     }
 
     pub fn waitForDiscovery(
@@ -5086,29 +4879,7 @@ pub const McpRuntime = struct {
             server.connection_lock.unlockShared(io_mod.getIo());
             initialized += 1;
         }
-        const configuration_issues = try alloc.alloc(
-            health.ConfigurationIssue,
-            self.workspace_diagnostics.items.len,
-        );
-        var issues_initialized: usize = 0;
-        errdefer {
-            for (configuration_issues[0..issues_initialized]) |*issue| issue.deinit(alloc);
-            alloc.free(configuration_issues);
-        }
-        for (self.workspace_diagnostics.items, 0..) |diagnostic, index| {
-            configuration_issues[index] = .{
-                .message = try project_config.renderWorkspaceDiagnostic(
-                    alloc,
-                    diagnostic,
-                ),
-            };
-            issues_initialized += 1;
-        }
-        return .{
-            .captured_at_ms = captured_at_ms,
-            .servers = items,
-            .configuration_issues = configuration_issues,
-        };
+        return .{ .captured_at_ms = captured_at_ms, .servers = items };
     }
 
     /// Returns an owned model-safe catalog snapshot. The caller releases it with `deinit`.
@@ -5278,19 +5049,6 @@ pub const McpRuntime = struct {
         self.connectAllCancellable(tool_registry, &self.discovery_cancel_requested);
     }
 
-    pub fn connectAllForAcp(self: *McpRuntime, tool_registry: tool_dispatch.Registry) void {
-        if (self.discovery_state.cmpxchgStrong(.idle, .loading, .seq_cst, .seq_cst) != null) return;
-        self.discovery_cancel_requested.store(false, .seq_cst);
-        self.connectAllControlled(
-            tool_registry,
-            &self.discovery_cancel_requested,
-            null,
-            .acp_startup,
-        );
-        self.finishDeferredDiscovery();
-        self.discovery_state.store(.complete, .seq_cst);
-    }
-
     pub fn connectAllCancellable(
         self: *McpRuntime,
         tool_registry: tool_dispatch.Registry,
@@ -5422,7 +5180,6 @@ pub const McpRuntime = struct {
             const decision = startup_admission.decide(
                 server.config.enabled,
                 server.config.required,
-                server.config.workspace_admission,
                 phase,
             );
             if (decision != .deferred) continue;
@@ -5445,17 +5202,11 @@ pub const McpRuntime = struct {
             switch (startup_admission.decide(
                 server.config.enabled,
                 server.config.required,
-                server.config.workspace_admission,
                 phase,
             )) {
                 .disabled => {
                     server.state = .disabled;
-                    var name_buf: [256]u8 = undefined;
-                    debug_trace.logf(
-                        "mcp",
-                        "skipped disabled server {s}",
-                        .{debug_trace.terminalPreview(name_buf[0..], server.config.name)},
-                    );
+                    debug_trace.logf("mcp", "skipped disabled server {s}", .{server.config.name});
                     continue;
                 },
                 .deferred => continue,
@@ -5469,15 +5220,7 @@ pub const McpRuntime = struct {
                 server_timeout,
             ) catch |err| {
                 if (cancel_requested.load(.acquire)) return;
-                var name_buf: [256]u8 = undefined;
-                debug_trace.logf(
-                    "mcp",
-                    "connection failed for server {s}: {s}",
-                    .{
-                        debug_trace.terminalPreview(name_buf[0..], server.config.name),
-                        @errorName(err),
-                    },
-                );
+                debug_trace.logf("mcp", "connection failed for server {s}: {s}", .{ server.config.name, @errorName(err) });
                 if (server.last_error == null) {
                     server.setFailed(self.alloc, @errorName(err));
                 } else {
@@ -5493,30 +5236,7 @@ pub const McpRuntime = struct {
         open_ctx: ?*anyopaque,
         open_url: mcp_auth.OpenUrlFn,
     ) !mcp_auth.AuthenticationResult {
-        return self.authenticateServerControlled(
-            name,
-            open_ctx,
-            open_url,
-            null,
-        );
-    }
-
-    pub fn authenticateServerControlled(
-        self: *McpRuntime,
-        name: []const u8,
-        open_ctx: ?*anyopaque,
-        open_url: mcp_auth.OpenUrlFn,
-        cancel_flag: ?*const std.atomic.Value(bool),
-    ) !mcp_auth.AuthenticationResult {
-        const cancellation = operation_control.CancellationSources{
-            .caller = cancel_flag,
-            .runtime = &self.retiring,
-        };
-        if (cancellation.cancelled()) return error.Cancelled;
         const server = try self.authenticationServer(name);
-        try loadStoredCredentials(self.alloc, server, .{
-            .lifecycle_cancel_flag = &self.retiring,
-        });
         server.connection_lock.lockSharedUncancelable(io_mod.getIo());
         var connection_locked = true;
         defer if (connection_locked) server.connection_lock.unlockShared(io_mod.getIo());
@@ -5558,34 +5278,22 @@ pub const McpRuntime = struct {
                 .client_secret = client_secret,
                 .client_metadata_url = auth_config.client_metadata_url,
                 .scopes = auth_config.scopes,
-                .callback_port = auth_config.callback_port,
             },
             .previous_scope = source.previous_scope,
             .open_ctx = open_ctx,
             .open_url = open_url,
-            .cancel_flag = cancel_flag,
             .lifecycle_cancel_flag = &self.retiring,
         })) {
             .credentials => |credentials| credentials,
             .issuer_mismatch => |mismatch| return .{ .issuer_mismatch = mismatch },
         };
         var transferred = false;
-        var repaired_entries: usize = 0;
         defer if (!transferred) credentials.deinit(self.alloc);
         {
             server.auth_lock.lockUncancelable(io_mod.getIo());
             defer server.auth_lock.unlock(io_mod.getIo());
-            try validateInteractiveAuthPublication(
-                server,
-                source.generation,
-                cancellation,
-            );
-            const save_result = try mcp_auth_store.save(
-                self.alloc,
-                server.config.name,
-                credentials,
-            );
-            repaired_entries = save_result.repaired_entries;
+            try validateInteractiveAuthPublication(self, server, source.generation);
+            try mcp_auth_store.save(self.alloc, server.config.name, credentials);
             installAuthCredentials(self.alloc, server, &credentials);
             transferred = true;
             if (server.pending_auth_challenge) |*pending| pending.deinit(self.alloc);
@@ -5607,9 +5315,7 @@ pub const McpRuntime = struct {
         server.connection_lock.unlockShared(io_mod.getIo());
         connection_locked = false;
         try resumeToolSubscriptionAfterAuthentication(self, server, deadline);
-        return .{ .authenticated = .{
-            .repaired_entries = repaired_entries,
-        } };
+        return .authenticated;
     }
 
     pub fn validateAuthenticationServer(self: *McpRuntime, name: []const u8) !void {
@@ -5620,20 +5326,15 @@ pub const McpRuntime = struct {
         if (self.isDiscovering()) return error.McpDiscoveryInProgress;
         const server = self.findServer(name) orelse return error.McpServerNotFound;
         if (server.config.transport == .stdio) return error.McpAuthenticationNotRemote;
-        if (server.config.source == .workspace and
-            server.config.workspace_admission != .approved)
-        {
-            return error.McpWorkspaceApprovalRequired;
-        }
         return server;
     }
 
     fn validateInteractiveAuthPublication(
+        self: *const McpRuntime,
         server: *const McpServer,
         generation: u64,
-        cancellation: operation_control.CancellationSources,
     ) !void {
-        if (cancellation.cancelled()) return error.Cancelled;
+        if (self.retiring.load(.acquire)) return error.Cancelled;
         if (server.auth_logout_in_progress.load(.acquire) or
             server.auth_generation.load(.acquire) != generation)
         {
@@ -5644,8 +5345,6 @@ pub const McpRuntime = struct {
     pub const LogoutResult = struct {
         removed: bool = false,
         revocation_failed: bool = false,
-        repaired_entries: usize = 0,
-        local_only: bool = false,
     };
 
     const DetachedLogoutAuth = struct {
@@ -5721,30 +5420,6 @@ pub const McpRuntime = struct {
         if (self.isDiscovering()) return error.McpDiscoveryInProgress;
         const server = self.findServer(name) orelse return error.McpServerNotFound;
         if (server.config.transport == .stdio) return error.McpAuthenticationNotRemote;
-        if (server.config.source == .workspace and
-            server.config.workspace_admission != .approved)
-        {
-            const deleted = try mcp_auth_store.delete(
-                self.alloc,
-                server.config.name,
-                try server.config.remoteUrl(),
-            );
-            return .{
-                .removed = deleted.removed > 0,
-                .repaired_entries = deleted.repaired_entries,
-                .local_only = true,
-            };
-        }
-        loadStoredCredentials(self.alloc, server, .{
-            .lifecycle_cancel_flag = &self.retiring,
-        }) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            debug_trace.logf(
-                "mcp",
-                "stored credential load skipped during logout server={s} err={s}",
-                .{ server.config.name, @errorName(err) },
-            );
-        };
         server.auth_lock.lockUncancelable(io_mod.getIo());
         if (server.auth_logout_in_progress.load(.acquire)) {
             server.auth_lock.unlock(io_mod.getIo());
@@ -5761,10 +5436,7 @@ pub const McpRuntime = struct {
             self.restoreAuthAfterLogout(server, &auth);
             return err;
         };
-        if (deleted.removed == 0 and
-            deleted.repaired_entries == 0 and
-            auth.credentials == null)
-        {
+        if (deleted.removed == 0 and auth.credentials == null) {
             self.restoreAuthAfterLogout(server, &auth);
             return .{};
         }
@@ -5804,7 +5476,6 @@ pub const McpRuntime = struct {
         return .{
             .removed = true,
             .revocation_failed = revocation_failed,
-            .repaired_entries = deleted.repaired_entries,
         };
     }
 
@@ -5881,12 +5552,8 @@ pub const McpRuntime = struct {
         self: *McpRuntime,
         cancel_flag: ?*std.atomic.Value(bool),
         access: *const OperationAccessGuard,
-        server_filter: ?[]const u8,
     ) void {
         for (0..self.servers.items.len) |index| {
-            if (server_filter) |name| {
-                if (!std.mem.eql(u8, self.servers.items[index].config.name, name)) continue;
-            }
             if (!access.allows(.{ .tool_server = self.servers.items[index].config.name })) {
                 continue;
             }
@@ -6125,16 +5792,11 @@ pub const McpRuntime = struct {
                 const auth_witness = catalogAuthWitness(match.server);
                 if (permissions.rulesDenyAllTargetsForPermission(permission_rules, match.tool.prefixed_name)) break :result null;
                 const instruction_limit = limits.mcp_server_instructions_bytes;
-                const server_instructions = match.server.instructions;
-                const instruction_observed_bytes = if (server_instructions) |value|
-                    value.len
-                else
-                    0;
-                const instructions = if (server_instructions) |value|
+                const instructions = if (match.tool.server_instructions) |value|
                     value[0..context_limits.lineSafePrefixLength(value, instruction_limit.effectiveBytes())]
                 else
                     null;
-                const instructions_truncated = if (server_instructions) |value|
+                const instructions_truncated = if (match.tool.server_instructions) |value|
                     instructions.?.len < value.len
                 else
                     false;
@@ -6143,7 +5805,6 @@ pub const McpRuntime = struct {
                     match.tool,
                     instructions,
                     instructions_truncated,
-                    instruction_observed_bytes,
                     instruction_limit,
                 );
                 var schema_owned = true;
@@ -6182,7 +5843,7 @@ pub const McpRuntime = struct {
                         alloc,
                         match.tool.prefixed_name,
                         "instructions truncated",
-                        instruction_observed_bytes,
+                        match.tool.server_instructions.?.len,
                         instruction_limit,
                         "mcp_server_instructions_bytes",
                     )
@@ -6210,31 +5871,6 @@ pub const McpRuntime = struct {
         limits: context_limits.Values,
         access: tool_mcp_runtime.Access,
     ) !tool_mcp_runtime.SearchResult {
-        const prepared_query = try lexical_relevance.prepare(query);
-        return self.searchToolsPrepared(
-            alloc,
-            .{
-                .query = &prepared_query,
-                .kind = .mcp,
-                .limit = @min(
-                    if (limit == 0) default_mcp_search_limit else limit,
-                    max_mcp_search_limit,
-                ),
-            },
-            permission_rules,
-            limits,
-            access,
-        );
-    }
-
-    pub fn searchToolsPrepared(
-        self: *McpRuntime,
-        alloc: Allocator,
-        request: capability_retrieval.Request,
-        permission_rules: types.PermissionRuleSet,
-        limits: context_limits.Values,
-        access: tool_mcp_runtime.Access,
-    ) !tool_mcp_runtime.SearchResult {
         if (self.isDiscovering()) {
             return .{ .model_output = try alloc.dupe(
                 u8,
@@ -6247,54 +5883,18 @@ pub const McpRuntime = struct {
             self.generation,
         );
         defer operation_access.deinit();
-        self.refreshAllToolCatalogs(null, &operation_access, request.server);
+        self.refreshAllToolCatalogs(null, &operation_access);
         try operation_access.refresh();
         var result = result: {
             self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
             defer self.catalog_mutex.unlockShared(io_mod.getIo());
+            const capped_limit = @min(if (limit == 0) default_mcp_search_limit else limit, max_mcp_search_limit);
+            var matches: std.ArrayList(McpTool) = .empty;
+            defer matches.deinit(alloc);
             var auth_witnesses: std.ArrayList(CatalogAuthWitness) = .empty;
             defer auth_witnesses.deinit(alloc);
-            if (try renderAuthenticationRequired(
-                alloc,
-                self.servers.items,
-                &operation_access,
-                request.server orelse request.query.raw,
-            )) |output| {
-                break :result tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
-            }
-            var candidate_capacity: usize = 0;
-            var server_configured = request.server == null;
-            for (self.servers.items) |*server| {
-                if (request.server) |name| {
-                    if (!std.mem.eql(u8, server.config.name, name)) continue;
-                    server_configured = true;
-                }
-                candidate_capacity = try std.math.add(
-                    usize,
-                    candidate_capacity,
-                    server.tool_catalog.tools.items.len,
-                );
-            }
-            if (!server_configured) {
-                break :result tool_mcp_runtime.SearchResult{
-                    .model_output = try alloc.dupe(
-                        u8,
-                        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_not_found\"}",
-                    ),
-                };
-            }
-            const candidate_storage = try alloc.alloc(ToolSearchMatch, candidate_capacity);
-            defer alloc.free(candidate_storage);
-            const documents = try alloc.alloc(capability_retrieval.Document, candidate_capacity);
-            defer alloc.free(documents);
-            var identity_scratch_state = std.heap.ArenaAllocator.init(alloc);
-            defer identity_scratch_state.deinit();
-            const identity_scratch = identity_scratch_state.allocator();
-            var candidate_count: usize = 0;
-            for (self.servers.items) |*server| {
-                if (request.server) |name| {
-                    if (!std.mem.eql(u8, server.config.name, name)) continue;
-                }
+            var more_available = false;
+            server_loop: for (self.servers.items) |*server| {
                 if (server.state != .ready) continue;
                 if (!serverCatalogAvailable(server)) continue;
                 if (!operation_access.allows(.{ .tool_server = server.config.name })) continue;
@@ -6302,111 +5902,71 @@ pub const McpRuntime = struct {
                     instructions[0..context_limits.utf8PrefixLength(instructions, mcp_server_instruction_search_bytes)]
                 else
                     "";
-                for (server.tool_catalog.tools.items) |*tool| {
+                var server_matched = false;
+                for (server.tool_catalog.tools.items) |tool| {
                     if (!operation_access.allows(.{ .tool = tool.prefixed_name })) continue;
                     if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
-                    if (!try tool_result_limits.modelProjectionPreservesText(identity_scratch, server.config.name) or
-                        !try tool_result_limits.modelProjectionPreservesText(identity_scratch, tool.prefixed_name))
-                    {
-                        continue;
-                    }
-                    const searchable_description = tool.description[0..context_limits.utf8PrefixLength(
-                        tool.description,
-                        mcp_tool_description_search_bytes,
-                    )];
-                    const searchable_schema = tool.input_schema_json[0..context_limits.utf8PrefixLength(
-                        tool.input_schema_json,
-                        mcp_tool_schema_search_bytes,
-                    )];
-                    candidate_storage[candidate_count] = .{
-                        .server = server,
-                        .tool = tool,
-                    };
-                    documents[candidate_count] = .{
-                        .identities = .{ tool.original_name, tool.prefixed_name },
-                        .stable_key = tool.prefixed_name,
-                        .primary = .{
-                            server.config.name,
-                            tool.original_name,
-                            tool.prefixed_name,
-                            tool.title orelse "",
-                        },
-                        .primary_extra = tool.tags,
-                        .secondary = .{
-                            searchable_description,
-                            searchable_schema,
-                            searchable_instructions,
-                        },
-                    };
-                    candidate_count += 1;
-                }
-            }
-            var page = try capability_retrieval.retrieve(
-                alloc,
-                request,
-                .mcp,
-                documents[0..candidate_count],
-            );
-            defer page.deinit(alloc);
-            const matches = try alloc.alloc(ToolSearchMatch, page.matches.len);
-            defer alloc.free(matches);
-            for (page.matches, 0..) |match, index| {
-                matches[index] = candidate_storage[match.document_index];
-            }
-            for (matches) |match| {
-                const generation = catalogAuthWitness(match.server) orelse continue;
-                var witnessed = false;
-                for (auth_witnesses.items) |witness| {
-                    if (witness.server == match.server) {
-                        witnessed = true;
+                    if (!toolMatchesQuery(tool, searchable_instructions, query)) continue;
+                    server_matched = true;
+                    if (matches.items.len >= capped_limit) {
+                        more_available = true;
                         break;
                     }
+                    try matches.append(alloc, tool);
                 }
-                if (!witnessed) try auth_witnesses.append(alloc, .{
-                    .server = match.server,
-                    .generation = generation,
-                });
+                if (server_matched) {
+                    if (catalogAuthWitness(server)) |generation| {
+                        try auth_witnesses.append(alloc, .{
+                            .server = server,
+                            .generation = generation,
+                        });
+                    }
+                }
+                if (more_available) break :server_loop;
+            }
+            if (matches.items.len == 0) {
+                if (try renderAuthenticationRequired(
+                    alloc,
+                    self.servers.items,
+                    &operation_access,
+                )) |output| {
+                    break :result tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
+                }
             }
 
-            const full_cursor = try page.cursorAfter(alloc, matches.len);
-            defer if (full_cursor) |cursor| alloc.free(cursor);
             const full = try renderSearchResult(
                 alloc,
-                matches,
-                matches.len,
-                page.total_matches,
-                full_cursor,
+                matches.items,
+                matches.items.len,
                 limits.mcp_description_bytes,
                 limits.mcp_search_result_bytes,
                 0,
                 false,
+                more_available,
             );
             const observed_bytes = full.len;
             const effective_bytes = limits.mcp_search_result_bytes.effectiveBytes();
             if (full.len <= effective_bytes) {
                 errdefer alloc.free(full);
-                const notice = try renderSearchNotice(alloc, matches, matches.len, limits, observed_bytes, false);
+                const notice = try renderSearchNotice(alloc, matches.items, matches.items.len, limits, observed_bytes, false);
                 errdefer if (notice) |value| alloc.free(value);
                 try validateCatalogAuthWitnesses(auth_witnesses.items);
                 break :result tool_mcp_runtime.SearchResult{ .model_output = full, .notice = notice };
             }
             alloc.free(full);
 
-            var selected_count = matches.len;
+            var selected_count = matches.items.len;
             var model_output: ?[]u8 = null;
             while (true) {
-                const candidate_cursor = try page.cursorAfter(alloc, selected_count);
-                defer if (candidate_cursor) |cursor| alloc.free(cursor);
                 const candidate = try renderSearchResult(
                     alloc,
-                    matches,
+                    matches.items,
                     selected_count,
-                    page.total_matches,
-                    candidate_cursor,
                     limits.mcp_description_bytes,
                     limits.mcp_search_result_bytes,
                     observed_bytes,
                     true,
+                    more_available,
                 );
                 if (candidate.len <= effective_bytes) {
                     model_output = candidate;
@@ -6421,7 +5981,7 @@ pub const McpRuntime = struct {
             }
             const output = model_output.?;
             errdefer alloc.free(output);
-            const notice = try renderSearchNotice(alloc, matches, selected_count, limits, observed_bytes, true);
+            const notice = try renderSearchNotice(alloc, matches.items, selected_count, limits, observed_bytes, true);
             errdefer if (notice) |value| alloc.free(value);
             try validateCatalogAuthWitnesses(auth_witnesses.items);
             break :result tool_mcp_runtime.SearchResult{ .model_output = output, .notice = notice };
@@ -6520,9 +6080,7 @@ pub const McpRuntime = struct {
                 });
             };
             break :result switch (validation) {
-                .valid, .server_authoritative => @as(tool_mcp_runtime.ValidationResult, .{
-                    .valid = self.generation,
-                }),
+                .valid, .server_authoritative => tool_mcp_runtime.ValidationResult.valid,
                 .invalid => |violation| @as(tool_mcp_runtime.ValidationResult, .{
                     .invalid = try std.fmt.allocPrint(
                         arena,
@@ -6544,9 +6102,6 @@ pub const McpRuntime = struct {
         max_tool_result_bytes: usize,
         options: tool_mcp_runtime.CallOptions,
     ) !?tool_mcp_runtime.CallResult {
-        if (options.expected_runtime_generation) |expected| {
-            if (expected != self.generation) return error.McpAuthorityChanged;
-        }
         if (self.isDiscovering()) return null;
         var operation_access = try OperationAccessGuard.init(
             self.alloc,
@@ -7264,17 +6819,6 @@ pub const McpRuntime = struct {
         retired.deinit(self.alloc);
     }
 
-    pub fn loadStoredCredentialsForHealthSnapshot(self: *McpRuntime) !void {
-        if (self.discovery_state.load(.acquire) != .idle) {
-            return error.McpDiscoveryInProgress;
-        }
-        for (self.servers.items) |*server| {
-            try loadStoredCredentials(self.alloc, server, .{
-                .lifecycle_cancel_flag = &self.retiring,
-            });
-        }
-    }
-
     pub fn listServersAndTools(self: *McpRuntime, alloc: Allocator) ![]u8 {
         var snapshot = try self.snapshotHealth(alloc, clockMillis());
         defer snapshot.deinit(alloc);
@@ -7298,7 +6842,6 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
-        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.resources) return error.McpResourcesUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -7373,7 +6916,6 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
-        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.prompts) return error.McpPromptsUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -7422,7 +6964,6 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
-        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.resources) return error.McpResourcesUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -7539,7 +7080,6 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
-        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.prompts) return error.McpPromptsUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -8669,63 +8209,6 @@ fn replaceOwnedCursor(
     cursor.* = replacement;
 }
 
-const ToolCatalogPages = struct {
-    const CursorReplacement = enum {
-        preserve_until_owned,
-        release_before_alloc,
-    };
-
-    builder: tools_feature.CatalogBuilder,
-    cursor: ?[]u8 = null,
-
-    fn init(alloc: Allocator, protocol: tools_feature.Protocol) ToolCatalogPages {
-        return .{
-            .builder = tools_feature.CatalogBuilder.init(alloc, protocol),
-        };
-    }
-
-    fn deinit(self: *ToolCatalogPages, alloc: Allocator) void {
-        self.builder.deinit(alloc);
-        if (self.cursor) |value| alloc.free(value);
-        self.* = undefined;
-    }
-
-    fn append_response(
-        self: *ToolCatalogPages,
-        alloc: Allocator,
-        response: []const u8,
-        received_at_ms: u64,
-        cursor_replacement: CursorReplacement,
-    ) !bool {
-        var page = try tools_feature.parseListPage(
-            alloc,
-            response,
-            self.builder.protocol,
-            .{},
-        );
-        defer page.deinit(alloc);
-        switch (cursor_replacement) {
-            .preserve_until_owned => try replaceOwnedCursor(alloc, &self.cursor, page.next_cursor),
-            .release_before_alloc => {
-                if (self.cursor) |value| {
-                    alloc.free(value);
-                    self.cursor = null;
-                }
-                self.cursor = if (page.next_cursor) |value|
-                    try alloc.dupe(u8, value)
-                else
-                    null;
-            },
-        }
-        try self.builder.appendPage(alloc, &page, received_at_ms, .{});
-        return self.cursor == null;
-    }
-
-    fn finish(self: *ToolCatalogPages, alloc: Allocator) !tools_feature.Catalog {
-        return self.builder.finish(alloc);
-    }
-};
-
 fn fetchStdioToolCatalog(
     self: *McpRuntime,
     server: *McpServer,
@@ -8733,17 +8216,56 @@ fn fetchStdioToolCatalog(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !tools_feature.Catalog {
+    const alloc = self.alloc;
     const dispatcher = server.dispatcher orelse return error.McpConnectionClosed;
-    const fetched = try fetch_tool_catalog_pages(
-        self.alloc,
-        self,
-        server,
-        .{ .stdio = dispatcher },
-        deadline,
-        cancel_flag,
-        access,
+    var builder = tools_feature.CatalogBuilder.init(
+        alloc,
+        featureProtocol(server.stdio_protocol),
     );
-    return fetched.catalog;
+    defer builder.deinit(alloc);
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| alloc.free(value);
+    while (true) {
+        try reauthorizeOperation(
+            self,
+            access,
+            .{ .tool_server = server.config.name },
+        );
+        const request_id = try dispatcher.reserveRequestId();
+        const request = try buildToolsListRequest(alloc, request_id, server.stdio_protocol, cursor);
+        defer alloc.free(request);
+        var guard = ServerAccessPrecommit{
+            .runtime = self,
+            .target = .{ .tool_server = server.config.name },
+            .access = access,
+        };
+        var precommit = guard.transport();
+        const response = try dispatcher.request(
+            alloc,
+            request_id,
+            request,
+            mcp_discovery_response_frame_cap_bytes,
+            .{
+                .timeout_ms = server.config.operation_timeout_ms,
+                .deadline = deadline,
+                .cancel_flag = cancel_flag,
+                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+                .precommit = &precommit,
+            },
+        );
+        const received_at_ms = clockMillis();
+        defer alloc.free(response);
+        var page = try tools_feature.parseListPage(
+            alloc,
+            response,
+            featureProtocol(server.stdio_protocol),
+            .{},
+        );
+        defer page.deinit(alloc);
+        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
+        try builder.appendPage(alloc, &page, received_at_ms, .{});
+        if (cursor == null) return builder.finish(alloc);
+    }
 }
 
 const HttpRequestIds = union(enum) {
@@ -8762,169 +8284,6 @@ const HttpRequestIds = union(enum) {
         };
     }
 };
-
-const ToolCatalogTransport = union(enum) {
-    stdio: *stdio_dispatcher.StdioDispatcher,
-    modern_http: *HttpRequestIds,
-    legacy_http: *legacy_streamable_http.Client,
-    legacy_sse: *legacy_http_sse.Client,
-
-    fn protocol(self: ToolCatalogTransport, server: *const McpServer) StdioProtocol {
-        return switch (self) {
-            .stdio => server.stdio_protocol,
-            .modern_http => .modern,
-            .legacy_http, .legacy_sse => .legacy,
-        };
-    }
-
-    fn next_request_id(self: *ToolCatalogTransport, server: *McpServer) !u64 {
-        return switch (self.*) {
-            .stdio => |dispatcher| dispatcher.reserveRequestId(),
-            .modern_http => |request_ids| request_ids.next(),
-            .legacy_http, .legacy_sse => reserveHttpRequestId(server),
-        };
-    }
-
-    fn request_page(
-        self: ToolCatalogTransport,
-        alloc: Allocator,
-        runtime: *McpRuntime,
-        server: *McpServer,
-        request_id: u64,
-        request: []const u8,
-        deadline: std.Io.Clock.Timestamp,
-        cancel_flag: ?*std.atomic.Value(bool),
-        access: tool_mcp_runtime.Access,
-        precommit: *mcp_contract.TransportPrecommit,
-    ) !FeatureResponse {
-        return switch (self) {
-            .stdio => |dispatcher| .{ .body = try dispatcher.request(
-                alloc,
-                request_id,
-                request,
-                mcp_discovery_response_frame_cap_bytes,
-                .{
-                    .timeout_ms = server.config.operation_timeout_ms,
-                    .deadline = deadline,
-                    .cancel_flag = cancel_flag,
-                    .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-                    .precommit = precommit,
-                },
-            ) },
-            .modern_http => {
-                var auth_identity: feature_cache.Digest = undefined;
-                const response = try authenticatedPost(alloc, alloc, server, .{
-                    .url = try server.config.remoteUrl(),
-                    .request_body = request,
-                    .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
-                    .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
-                    .precommit = precommit,
-                    .control = .{
-                        .deadline = deadline,
-                        .cancel_flag = cancel_flag,
-                        .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-                    },
-                }, .{
-                    .runtime = runtime,
-                    .access = access,
-                    .target = .{ .tool_server = server.config.name },
-                }, .safe, &auth_identity);
-                if (response.www_authenticate) |value| alloc.free(value);
-                return .{
-                    .body = response.body,
-                    .auth_identity = auth_identity,
-                };
-            },
-            .legacy_http => |client| .{ .body = try client.request(alloc, .{
-                .request_id = request_id,
-                .request_body = request,
-                .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
-                .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
-                .precommit = precommit,
-                .control = .{
-                    .deadline = deadline,
-                    .cancel_flag = cancel_flag,
-                    .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-                },
-            }) },
-            .legacy_sse => |client| .{ .body = try client.request(
-                alloc,
-                request_id,
-                request,
-                mcp_discovery_response_frame_cap_bytes,
-                .{
-                    .deadline = deadline,
-                    .cancel_flag = cancel_flag,
-                    .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-                    .precommit = precommit,
-                },
-            ) },
-        };
-    }
-};
-
-fn fetch_tool_catalog_pages(
-    alloc: Allocator,
-    runtime: *McpRuntime,
-    server: *McpServer,
-    initial_transport: ToolCatalogTransport,
-    deadline: std.Io.Clock.Timestamp,
-    cancel_flag: ?*std.atomic.Value(bool),
-    access: tool_mcp_runtime.Access,
-) !FetchedToolCatalog {
-    var transport = initial_transport;
-    const protocol = transport.protocol(server);
-    var pages = ToolCatalogPages.init(alloc, featureProtocol(protocol));
-    defer pages.deinit(alloc);
-    var producing_identity: ?feature_cache.Digest = null;
-    while (true) {
-        try reauthorizeOperation(
-            runtime,
-            access,
-            .{ .tool_server = server.config.name },
-        );
-        const request_id = try transport.next_request_id(server);
-        const request = try buildToolsListRequest(alloc, request_id, protocol, pages.cursor);
-        defer alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = runtime,
-            .target = .{ .tool_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        var response = try transport.request_page(
-            alloc,
-            runtime,
-            server,
-            request_id,
-            request,
-            deadline,
-            cancel_flag,
-            access,
-            &precommit,
-        );
-        const received_at_ms = clockMillis();
-        defer response.deinit(alloc);
-        if (response.auth_identity) |page_identity| {
-            if (producing_identity) |identity| {
-                if (!std.mem.eql(u8, &identity, &page_identity)) {
-                    return error.McpAuthIdentityChangedDuringPagination;
-                }
-            } else {
-                producing_identity = page_identity;
-            }
-        }
-        if (try pages.append_response(
-            alloc,
-            response.body,
-            received_at_ms,
-            .preserve_until_owned,
-        )) return .{
-            .catalog = try pages.finish(alloc),
-            .auth_identity = producing_identity,
-        };
-    }
-}
 
 fn fetchModernHttpToolCatalogWithIds(
     alloc: Allocator,
@@ -8972,15 +8331,61 @@ fn fetchModernHttpToolCatalogAttempt(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !FetchedToolCatalog {
-    return fetch_tool_catalog_pages(
-        alloc,
-        runtime,
-        server,
-        .{ .modern_http = request_ids },
-        deadline,
-        cancel_flag,
-        access,
-    );
+    var builder = tools_feature.CatalogBuilder.init(alloc, .modern);
+    defer builder.deinit(alloc);
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| alloc.free(value);
+    var producing_identity: ?feature_cache.Digest = null;
+    while (true) {
+        try reauthorizeOperation(
+            runtime,
+            access,
+            .{ .tool_server = server.config.name },
+        );
+        const request_id = try request_ids.next();
+        const request = try buildToolsListRequest(alloc, request_id, .modern, cursor);
+        defer alloc.free(request);
+        var guard = ServerAccessPrecommit{
+            .runtime = runtime,
+            .target = .{ .tool_server = server.config.name },
+            .access = access,
+        };
+        var precommit = guard.transport();
+        var page_identity: feature_cache.Digest = undefined;
+        var response = try authenticatedPost(alloc, alloc, server, .{
+            .url = try server.config.remoteUrl(),
+            .request_body = request,
+            .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
+            .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
+            .precommit = &precommit,
+            .control = .{
+                .deadline = deadline,
+                .cancel_flag = cancel_flag,
+                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+            },
+        }, .{
+            .runtime = runtime,
+            .access = access,
+            .target = .{ .tool_server = server.config.name },
+        }, .safe, &page_identity);
+        const received_at_ms = clockMillis();
+        defer response.deinit(alloc);
+        if (producing_identity) |identity| {
+            if (!std.mem.eql(u8, &identity, &page_identity)) {
+                return error.McpAuthIdentityChangedDuringPagination;
+            }
+        } else {
+            producing_identity = page_identity;
+        }
+        var page = try tools_feature.parseListPage(alloc, response.body, .modern, .{});
+        defer page.deinit(alloc);
+        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
+        try builder.appendPage(alloc, &page, received_at_ms, .{});
+        if (cursor == null) return .{
+            .catalog = try builder.finish(alloc),
+            .auth_identity = producing_identity,
+        };
+    }
 }
 
 fn fetchModernHttpToolCatalog(
@@ -9010,16 +8415,45 @@ fn fetchLegacyHttpToolCatalog(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !tools_feature.Catalog {
-    const fetched = try fetch_tool_catalog_pages(
-        alloc,
-        server.runtime.?,
-        server,
-        .{ .legacy_http = client },
-        deadline,
-        cancel_flag,
-        access,
-    );
-    return fetched.catalog;
+    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
+    defer builder.deinit(alloc);
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| alloc.free(value);
+    while (true) {
+        try reauthorizeOperation(
+            server.runtime.?,
+            access,
+            .{ .tool_server = server.config.name },
+        );
+        const request_id = try reserveHttpRequestId(server);
+        const request = try buildToolsListRequest(alloc, request_id, .legacy, cursor);
+        defer alloc.free(request);
+        var guard = ServerAccessPrecommit{
+            .runtime = server.runtime.?,
+            .target = .{ .tool_server = server.config.name },
+            .access = access,
+        };
+        var precommit = guard.transport();
+        const response = try client.request(alloc, .{
+            .request_id = request_id,
+            .request_body = request,
+            .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
+            .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
+            .precommit = &precommit,
+            .control = .{
+                .deadline = deadline,
+                .cancel_flag = cancel_flag,
+                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+            },
+        });
+        const received_at_ms = clockMillis();
+        defer alloc.free(response);
+        var page = try tools_feature.parseListPage(alloc, response, .legacy, .{});
+        defer page.deinit(alloc);
+        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
+        try builder.appendPage(alloc, &page, received_at_ms, .{});
+        if (cursor == null) return builder.finish(alloc);
+    }
 }
 
 fn fetchLegacySseToolCatalog(
@@ -9030,27 +8464,54 @@ fn fetchLegacySseToolCatalog(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !tools_feature.Catalog {
-    const fetched = try fetch_tool_catalog_pages(
-        alloc,
-        server.runtime.?,
-        server,
-        .{ .legacy_sse = client },
-        deadline,
-        cancel_flag,
-        access,
-    );
-    return fetched.catalog;
+    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
+    defer builder.deinit(alloc);
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| alloc.free(value);
+    while (true) {
+        try reauthorizeOperation(
+            server.runtime.?,
+            access,
+            .{ .tool_server = server.config.name },
+        );
+        const request_id = try reserveHttpRequestId(server);
+        const request = try buildToolsListRequest(alloc, request_id, .legacy, cursor);
+        defer alloc.free(request);
+        var guard = ServerAccessPrecommit{
+            .runtime = server.runtime.?,
+            .target = .{ .tool_server = server.config.name },
+            .access = access,
+        };
+        var precommit = guard.transport();
+        const response = try client.request(
+            alloc,
+            request_id,
+            request,
+            mcp_discovery_response_frame_cap_bytes,
+            .{
+                .deadline = deadline,
+                .cancel_flag = cancel_flag,
+                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+                .precommit = &precommit,
+            },
+        );
+        const received_at_ms = clockMillis();
+        defer alloc.free(response);
+        var page = try tools_feature.parseListPage(alloc, response, .legacy, .{});
+        defer page.deinit(alloc);
+        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
+        try builder.appendPage(alloc, &page, received_at_ms, .{});
+        if (cursor == null) return builder.finish(alloc);
+    }
 }
 
 fn renderAuthenticationRequired(
     alloc: Allocator,
     servers: []McpServer,
     access: *const OperationAccessGuard,
-    query: []const u8,
 ) !?[]u8 {
     for (servers) |*server| {
         if (!access.allows(.{ .tool_server = server.config.name })) continue;
-        if (!queryContainsCompleteIdentity(query, server.config.name)) continue;
         server.status_lock.lockUncancelable(io_mod.getIo());
         const failed = server.state == .failed;
         server.status_lock.unlock(io_mod.getIo());
@@ -9071,7 +8532,7 @@ fn renderAuthenticationRequired(
         try writeEncodedJsonScalar(alloc, &out.writer, server.config.name);
         switch (mode) {
             .oauth => try out.writer.writeAll(
-                ",\"interactive\":true,\"message\":\"Run /mcp auth for this server in an interactive fx session.\"",
+                ",\"interactive\":true,\"message\":\"Run /mcp auth for this server in an interactive Fx session.\"",
             ),
             .bearer_environment => {
                 try out.writer.writeAll(
@@ -9083,7 +8544,7 @@ fn renderAuthenticationRequired(
                     server.config.bearer_token_env.?,
                 );
                 try out.writer.writeAll(
-                    ",\"message\":\"Set this environment variable before starting fx.\"",
+                    ",\"message\":\"Set this environment variable before starting Fx.\"",
                 );
             },
         }
@@ -9178,11 +8639,13 @@ test "MRTR tool snapshots bind server schemas and both generations" {
         .content_digest = feature_cache.authIdentity(&.{}),
     };
     try server.tool_catalog.tools.append(alloc, .{
+        .server_name = "fixture",
         .original_name = @constCast("echo"),
         .prefixed_name = @constCast("mcp_fixture_echo"),
         .description = @constCast("Echo"),
         .input_schema_json = @constCast("{\"type\":\"object\"}"),
         .tags = &.{},
+        .search_text = @constCast("echo"),
     });
     try runtime.servers.append(alloc, server);
     defer runtime.servers.items[0].tool_catalog.tools.deinit(alloc);
@@ -9272,32 +8735,21 @@ test "private catalog visibility is bound to the producing auth generation" {
 
 test "interactive authentication publishes only to its live auth generation" {
     var runtime = McpRuntime.init(std.testing.allocator);
-    var caller_cancelled = std.atomic.Value(bool).init(false);
     var server = McpServer{
         .config = .{ .name = "fixture" },
         .auth_generation = .init(7),
     };
-    const cancellation = operation_control.CancellationSources{
-        .caller = &caller_cancelled,
-        .runtime = &runtime.retiring,
-    };
 
-    try McpRuntime.validateInteractiveAuthPublication(&server, 7, cancellation);
-    caller_cancelled.store(true, .release);
-    try std.testing.expectError(
-        error.Cancelled,
-        McpRuntime.validateInteractiveAuthPublication(&server, 7, cancellation),
-    );
-    caller_cancelled.store(false, .release);
+    try runtime.validateInteractiveAuthPublication(&server, 7);
     server.auth_generation.store(8, .release);
     try std.testing.expectError(
         error.McpAuthorityChanged,
-        McpRuntime.validateInteractiveAuthPublication(&server, 7, cancellation),
+        runtime.validateInteractiveAuthPublication(&server, 7),
     );
     runtime.retiring.store(true, .release);
     try std.testing.expectError(
         error.Cancelled,
-        McpRuntime.validateInteractiveAuthPublication(&server, 8, cancellation),
+        runtime.validateInteractiveAuthPublication(&server, 8),
     );
 }
 
@@ -9328,28 +8780,12 @@ test "a newer pending challenge invalidates interactive authentication publicati
     try std.testing.expectEqual(@as(u64, 8), server.auth_generation.load(.acquire));
     try std.testing.expectError(
         error.McpAuthorityChanged,
-        McpRuntime.validateInteractiveAuthPublication(
-            &server,
-            interactive_generation,
-            .{ .runtime = &runtime.retiring },
-        ),
+        runtime.validateInteractiveAuthPublication(&server, interactive_generation),
     );
     try std.testing.expect(server.pending_auth_challenge != null);
     try std.testing.expectEqualStrings(
         "files:write",
         server.pending_auth_challenge.?.scope.?,
-    );
-}
-
-test "pending authentication challenge overrides stored credential health" {
-    const server = McpServer{
-        .config = .{ .name = "fixture" },
-        .auth_credentials_present = .init(true),
-        .auth_challenge_present = .init(true),
-    };
-    try std.testing.expectEqual(
-        health.AuthenticationState.required,
-        serverAuthenticationState(&server),
     );
 }
 
@@ -9872,7 +9308,7 @@ test "scoped stdio recovery rejects revoked authority before state changes" {
     defer runtime.deinit();
     try runtime.addServer(.{
         .name = try alloc.dupe(u8, "fixture"),
-        .command = try alloc.dupe(u8, "/definitely/not/an/fx-mcp-fixture"),
+        .command = try alloc.dupe(u8, "/definitely/not/an/ffx-mcp-fixture"),
     });
     const server = &runtime.servers.items[0];
     server.state = .ready;
@@ -9938,7 +9374,7 @@ test "failed recovery leaves its remaining generation budget reachable" {
     var runtime = McpRuntime.init(std.testing.allocator);
     var server = McpServer{ .config = .{
         .name = "fixture",
-        .command = "/definitely/not/an/fx-mcp-fixture",
+        .command = "/definitely/not/an/ffx-mcp-fixture",
         .restart_limit = 2,
     } };
     defer if (server.last_error) |message| std.testing.allocator.free(message);
@@ -10312,12 +9748,8 @@ fn connectServer(
         existing.deinit();
         server.env_map = null;
     }
-    defer {
-        if (server.env_map) |*environment| environment.deinit();
-        server.env_map = null;
-    }
     if (server.config.env.len > 0) {
-        server.env_map = try io_mod.cloneEnvironMap(alloc);
+        server.env_map = EnvMap.init(alloc);
         for (server.config.env) |entry| {
             try server.env_map.?.put(entry.key, entry.value);
         }
@@ -10506,17 +9938,8 @@ fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const 
     const generation = server.next_generation;
     server.next_generation = std.math.add(u64, generation, 1) catch
         return error.McpGenerationExhausted;
-    var prepared = try docker_run.prepare(alloc, argv);
-    defer prepared.deinit(alloc);
-    var docker_cleanup = prepared.takeCleanup();
-    defer if (docker_cleanup) |*cleanup| cleanup.deinit(alloc);
-    if (docker_cleanup) |*cleanup| {
-        if (server.env_map) |*environment| {
-            try cleanup.cloneEnvironment(alloc, environment);
-        }
-    }
     const child = try std.process.spawn(io_mod.getIo(), .{
-        .argv = prepared.argv,
+        .argv = argv,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -10524,20 +9947,13 @@ fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const 
         .pgid = if (builtin.os.tag == .windows) null else 0,
     });
 
-    server.dispatcher = stdio_dispatcher.StdioDispatcher.create(
+    server.dispatcher = try stdio_dispatcher.StdioDispatcher.create(
         alloc,
         std.heap.c_allocator,
         child,
         generation,
         mcp_discovery_response_frame_cap_bytes,
-    ) catch |err| {
-        if (docker_cleanup) |*cleanup| cleanup.run(alloc);
-        return err;
-    };
-    if (docker_cleanup) |cleanup| {
-        server.dispatcher.?.installDockerCleanup(cleanup);
-        docker_cleanup = null;
-    }
+    );
 }
 
 fn connectServerLegacy(
@@ -10679,11 +10095,13 @@ fn discoverServerTools(
     control: ConnectionControl,
 ) !void {
     const dispatcher = server.dispatcher orelse return error.McpConnectionClosed;
-    var pages = ToolCatalogPages.init(alloc, featureProtocol(protocol));
-    defer pages.deinit(alloc);
+    var builder = tools_feature.CatalogBuilder.init(alloc, featureProtocol(protocol));
+    defer builder.deinit(alloc);
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| alloc.free(value);
     while (true) {
         const request_id = try dispatcher.reserveRequestId();
-        const tools_request = try buildToolsListRequest(alloc, request_id, protocol, pages.cursor);
+        const tools_request = try buildToolsListRequest(alloc, request_id, protocol, cursor);
         defer alloc.free(tools_request);
         const tools_response = dispatcher.request(
             alloc,
@@ -10706,14 +10124,14 @@ fn discoverServerTools(
         };
         const received_at_ms = clockMillis();
         defer alloc.free(tools_response);
-        if (try pages.append_response(
-            alloc,
-            tools_response,
-            received_at_ms,
-            .release_before_alloc,
-        )) break;
+        var page = try tools_feature.parseListPage(alloc, tools_response, featureProtocol(protocol), .{});
+        defer page.deinit(alloc);
+        if (cursor) |value| alloc.free(value);
+        cursor = if (page.next_cursor) |value| try alloc.dupe(u8, value) else null;
+        try builder.appendPage(alloc, &page, received_at_ms, .{});
+        if (cursor == null) break;
     }
-    var catalog = try pages.finish(alloc);
+    var catalog = try builder.finish(alloc);
     defer catalog.deinit(alloc);
     try storeProtocolTools(alloc, server, tool_registry, catalog, used_tool_names, protocol, null);
     try startToolSubscription(alloc, server, control);
@@ -10762,44 +10180,23 @@ fn parseAndStoreServerIdentity(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, response, .{}) catch
         return error.McpInvalidJson;
     defer parsed.deinit();
-    const identity = try parseServerIdentity(parsed.value);
-    const name = if (identity.name) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (name) |value| alloc.free(value);
-    const version = if (identity.version) |value| try alloc.dupe(u8, value) else null;
+    try mcp_contract.validateJsonRpcResponseEnvelope(parsed.value);
+    const result = parsed.value.object.get("result") orelse return error.McpInvalidResult;
+    if (result != .object) return error.McpInvalidResult;
+    const info = result.object.get("serverInfo") orelse return;
+    if (info != .object) return error.McpInvalidResult;
+    const name_value = info.object.get("name") orelse return;
+    const version_value = info.object.get("version") orelse return;
+    if (name_value != .string or version_value != .string) {
+        return error.McpInvalidResult;
+    }
+    const name = try alloc.dupe(u8, name_value.string);
+    errdefer alloc.free(name);
+    const version = try alloc.dupe(u8, version_value.string);
     if (server.negotiated_server_name) |old| alloc.free(old);
     if (server.negotiated_server_version) |old| alloc.free(old);
     server.negotiated_server_name = name;
     server.negotiated_server_version = version;
-}
-
-const ParsedServerIdentity = struct {
-    name: ?[]const u8 = null,
-    version: ?[]const u8 = null,
-};
-
-fn parseServerIdentity(value: std.json.Value) !ParsedServerIdentity {
-    try mcp_contract.validateJsonRpcResponseEnvelope(value);
-    const result = value.object.get("result") orelse return error.McpInvalidResult;
-    if (result != .object) return error.McpInvalidResult;
-    const info = blk: {
-        if (result.object.get("_meta")) |meta| {
-            if (meta != .object) return error.McpInvalidResult;
-            if (meta.object.get("io.modelcontextprotocol/serverInfo")) |modern| {
-                break :blk modern;
-            }
-        }
-        break :blk result.object.get("serverInfo") orelse return .{};
-    };
-    if (info != .object) return error.McpInvalidResult;
-    const name = if (info.object.get("name")) |field| blk: {
-        if (field != .string) return error.McpInvalidResult;
-        break :blk if (field.string.len > 0) field.string else null;
-    } else null;
-    const version = if (info.object.get("version")) |field| blk: {
-        if (field != .string) return error.McpInvalidResult;
-        break :blk if (field.string.len > 0) field.string else null;
-    } else null;
-    return .{ .name = name, .version = version };
 }
 
 fn parseToolsListChangedCapability(value: std.json.Value) !bool {
@@ -11037,6 +10434,9 @@ fn buildProtocolTools(
         const tags = try buildToolTags(alloc, server.config.name, name);
         errdefer freeOwnedStrings(alloc, tags);
 
+        const search_text = try buildSearchText(alloc, server.config.name, name, description, input_schema_json, tags);
+        errdefer alloc.free(search_text);
+
         const title = if (protocol_tool.title) |value| try alloc.dupe(u8, value) else null;
         errdefer if (title) |value| alloc.free(value);
         const output_schema_json = if (protocol_tool.output_schema_json) |value| try alloc.dupe(u8, value) else null;
@@ -11051,6 +10451,7 @@ fn buildProtocolTools(
         try result.tools.ensureUnusedCapacity(alloc, 1);
         try used_tool_names.put(prefixed_name, {});
         result.tools.appendAssumeCapacity(.{
+            .server_name = server.config.name,
             .original_name = original_name,
             .prefixed_name = prefixed_name,
             .title = title,
@@ -11061,6 +10462,8 @@ fn buildProtocolTools(
             .annotations_json = annotations_json,
             .metadata_json = metadata_json,
             .tags = tags,
+            .search_text = search_text,
+            .server_instructions = server.instructions,
         });
     }
     return result;
@@ -11717,9 +11120,9 @@ fn serverHasSnapshotTool(
     server: *const McpServer,
     snapshot: *const ToolCallSnapshot,
 ) bool {
-    if (!std.mem.eql(u8, server.config.name, snapshot.server_name)) return false;
     for (server.tool_catalog.tools.items) |tool| {
-        if (std.mem.eql(u8, tool.original_name, snapshot.original_name) and
+        if (std.mem.eql(u8, tool.server_name, snapshot.server_name) and
+            std.mem.eql(u8, tool.original_name, snapshot.original_name) and
             std.mem.eql(u8, tool.prefixed_name, snapshot.prefixed_name) and
             std.mem.eql(u8, tool.input_schema_json, snapshot.input_schema_json) and
             optionalBytesEqual(tool.output_schema_json, snapshot.output_schema_json))
@@ -11798,7 +11201,6 @@ fn buildToolSchemaJsonWithLimitMarker(
     tool: McpTool,
     instructions: ?[]const u8,
     instructions_truncated: bool,
-    instruction_observed_bytes: usize,
     limit: context_limits.Resolved,
 ) ![]u8 {
     const encoded_description = try encodeScalarAlloc(alloc, tool.description);
@@ -11810,14 +11212,14 @@ fn buildToolSchemaJsonWithLimitMarker(
             try std.fmt.allocPrint(
                 alloc,
                 "{s}\n\nServer instructions: {s}\n<context_limit name=\"mcp_server_instructions_bytes\" action=\"truncated\" observed_bytes=\"{d}\" effective_bytes=\"{d}\" source=\"{s}\" override=\"--context-limit mcp_server_instructions_bytes=BYTES|off\" />",
-                .{ encoded_description, encoded_instructions.?, instruction_observed_bytes, limit.effectiveBytes(), limit.source.label() },
+                .{ encoded_description, encoded_instructions.?, tool.server_instructions.?.len, limit.effectiveBytes(), limit.source.label() },
             )
         else
             try std.fmt.allocPrint(alloc, "{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions.? })
     else
         try alloc.dupe(u8, encoded_description);
     defer alloc.free(merged_description);
-    return model_tool_schema.dynamicFunctionSchemaJsonAlloc(
+    return gateway_schema.dynamicFunctionSchemaJsonAlloc(
         alloc,
         tool.prefixed_name,
         merged_description,
@@ -11825,34 +11227,25 @@ fn buildToolSchemaJsonWithLimitMarker(
     );
 }
 
-const ToolSearchMatch = struct {
-    server: *McpServer,
-    tool: *const McpTool,
-};
-
 fn renderSearchResult(
     alloc: Allocator,
-    matches: []const ToolSearchMatch,
+    matches: []const McpTool,
     selected_count: usize,
-    total_matches: usize,
-    next_cursor: ?[]const u8,
     description_limit: context_limits.Resolved,
     result_limit: context_limits.Resolved,
     observed_bytes: usize,
     limit_triggered: bool,
+    more_available: bool,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"tools\":[");
-    for (matches[0..selected_count], 0..) |match, index| {
+    for (matches[0..selected_count], 0..) |tool, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try writeToolMetadataJson(alloc, &out.writer, match, description_limit);
+        try writeToolMetadataJson(alloc, &out.writer, tool, description_limit);
     }
-    try out.writer.print(
-        "],\"count\":{d},\"total_matches\":{d},\"more_available\":{s},\"next_cursor\":",
-        .{ selected_count, total_matches, if (next_cursor != null) "true" else "false" },
-    );
-    try std.json.Stringify.value(next_cursor, .{}, &out.writer);
+    try out.writer.print("],\"count\":{d}", .{selected_count});
+    if (more_available) try out.writer.writeAll(",\"more_available\":true");
     if (limit_triggered) {
         try out.writer.print(
             ",\"context_limit\":{{\"name\":\"mcp_search_result_bytes\",\"action\":\"omitted\",\"omitted_count\":{d},\"observed_bytes\":{d},\"effective_bytes\":{d},\"source\":",
@@ -11867,7 +11260,7 @@ fn renderSearchResult(
 
 fn renderSearchNotice(
     alloc: Allocator,
-    matches: []const ToolSearchMatch,
+    matches: []const McpTool,
     selected_count: usize,
     limits: context_limits.Values,
     observed_bytes: usize,
@@ -11875,8 +11268,7 @@ fn renderSearchNotice(
 ) !?[]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    for (matches[0..selected_count]) |match| {
-        const tool = match.tool;
+    for (matches[0..selected_count]) |tool| {
         const encoded_description = try encodeScalarAlloc(alloc, tool.description);
         defer alloc.free(encoded_description);
         if (encoded_description.len <= limits.mcp_description_bytes.effectiveBytes()) continue;
@@ -11889,9 +11281,9 @@ fn renderSearchNotice(
     }
     if (result_limit_triggered) {
         try out.writer.print("[context] MCP search omitted {d} tool(s) (", .{matches.len - selected_count});
-        for (matches[selected_count..], 0..) |match, index| {
+        for (matches[selected_count..], 0..) |tool, index| {
             if (index > 0) try out.writer.writeAll(", ");
-            try model_context_encoding.writeScalar(&out.writer, match.tool.prefixed_name);
+            try model_context_encoding.writeScalar(&out.writer, tool.prefixed_name);
         }
         try out.writer.print(
             "): observed={d} bytes effective={d} bytes source={s}; override with --context-limit mcp_search_result_bytes=BYTES|off",
@@ -11923,10 +11315,9 @@ fn renderSchemaNotice(
 fn writeToolMetadataJson(
     alloc: Allocator,
     writer: *std.Io.Writer,
-    match: ToolSearchMatch,
+    tool: McpTool,
     description_limit: context_limits.Resolved,
 ) !void {
-    const tool = match.tool;
     const bounded = try boundedEncodedScalar(
         alloc,
         tool.description,
@@ -11936,7 +11327,7 @@ fn writeToolMetadataJson(
     try writer.writeAll("{\"name\":");
     try writeEncodedJsonScalar(alloc, writer, tool.prefixed_name);
     try writer.writeAll(",\"server\":");
-    try writeEncodedJsonScalar(alloc, writer, match.server.config.name);
+    try writeEncodedJsonScalar(alloc, writer, tool.server_name);
     try writer.writeAll(",\"description\":");
     try std.json.Stringify.value(bounded.text, .{}, writer);
     try writer.writeAll(",\"purpose\":");
@@ -11989,18 +11380,29 @@ fn writeEncodedJsonScalar(alloc: Allocator, writer: *std.Io.Writer, value: []con
     try std.json.Stringify.value(encoded, .{}, writer);
 }
 
-fn queryContainsCompleteIdentity(query: []const u8, identity: []const u8) bool {
-    if (identity.len == 0 or identity.len > query.len) return false;
-
-    var start: usize = 0;
-    while (start <= query.len - identity.len) : (start += 1) {
-        const end = start + identity.len;
-        if (!std.ascii.eqlIgnoreCase(query[start..end], identity)) continue;
-        if (start > 0 and isSearchByte(query[start - 1])) continue;
-        if (end < query.len and isSearchByte(query[end])) continue;
-        return true;
+fn toolMatchesQuery(tool: McpTool, server_instructions: []const u8, query: []const u8) bool {
+    var found_token = false;
+    var start: ?usize = null;
+    for (query, 0..) |byte, index| {
+        if (isSearchByte(byte)) {
+            if (start == null) start = index;
+            continue;
+        }
+        if (start) |s| {
+            found_token = true;
+            const token = query[s..index];
+            if (!text_utils.containsIgnoreCase(tool.search_text, token) and
+                !text_utils.containsIgnoreCase(server_instructions, token)) return false;
+            start = null;
+        }
     }
-    return false;
+    if (start) |s| {
+        found_token = true;
+        const token = query[s..];
+        if (!text_utils.containsIgnoreCase(tool.search_text, token) and
+            !text_utils.containsIgnoreCase(server_instructions, token)) return false;
+    }
+    return found_token or query.len == 0;
 }
 
 fn buildToolTags(alloc: Allocator, server_name: []const u8, tool_name: []const u8) ![]const []u8 {
@@ -12045,6 +11447,24 @@ fn appendTag(alloc: Allocator, tags: *std.ArrayList([]u8), raw: []const u8) !voi
 
 fn isSearchByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
+}
+
+fn buildSearchText(
+    alloc: Allocator,
+    server_name: []const u8,
+    tool_name: []const u8,
+    description: []const u8,
+    input_schema_json: []const u8,
+    tags: []const []u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    try out.writer.print("{s} {s} {s} {s}", .{ server_name, tool_name, description, input_schema_json });
+    for (tags) |tag| try out.writer.print(" {s}", .{tag});
+    const text = try out.toOwnedSlice();
+    defer alloc.free(text);
+    return try std.ascii.allocLowerString(alloc, text);
 }
 
 fn retainFeatureProtocolDiagnostic(
@@ -12169,7 +11589,7 @@ fn writeModernRequestMetadataWithProgress(
 ) !void {
     try writer.writeAll("{\"io.modelcontextprotocol/protocolVersion\":\"");
     try writer.writeAll(modern_protocol_version);
-    try writer.writeAll("\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"fx\",\"version\":");
+    try writer.writeAll("\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"ffx\",\"version\":");
     try std.json.Stringify.value(build_options.app_version, .{}, writer);
     try writer.writeAll("},\"io.modelcontextprotocol/clientCapabilities\":{");
     if (capabilities.any()) {
@@ -12451,16 +11871,7 @@ fn refreshSharedCredentials(
     {
         return false;
     }
-    const save_result = try mcp_auth_store.save(
-        alloc,
-        server.config.name,
-        refreshed,
-    );
-    traceCredentialStoreRepair(
-        "refresh",
-        server.config.name,
-        save_result.repaired_entries,
-    );
+    try mcp_auth_store.save(alloc, server.config.name, refreshed);
     installAuthCredentials(alloc, server, &refreshed);
     transferred = true;
     return true;
@@ -12553,12 +11964,8 @@ fn authorizeForChallenge(
         .credentials => |credentials| credentials,
         .issuer_mismatch => |owned_mismatch| {
             var mismatch = owned_mismatch;
-            const err = switch (mismatch.source) {
-                .authorization_metadata => error.AuthorizationMetadataIssuerMismatch,
-                .authorization_response => error.AuthorizationResponseIssuerMismatch,
-            };
             mismatch.deinit();
-            return err;
+            return error.AuthorizationMetadataIssuerMismatch;
         },
     };
     var credentials_transferred = false;
@@ -12571,34 +11978,9 @@ fn authorizeForChallenge(
         credentials.deinit(alloc);
         return;
     }
-    const save_result = try mcp_auth_store.save(
-        alloc,
-        server.config.name,
-        credentials,
-    );
-    traceCredentialStoreRepair(
-        "automated_auth",
-        server.config.name,
-        save_result.repaired_entries,
-    );
+    try mcp_auth_store.save(alloc, server.config.name, credentials);
     installAuthCredentials(alloc, server, &credentials);
-    if (server.pending_auth_challenge) |*pending| pending.deinit(alloc);
-    server.pending_auth_challenge = null;
-    server.auth_challenge_present.store(false, .release);
     credentials_transferred = true;
-}
-
-fn traceCredentialStoreRepair(
-    actor: []const u8,
-    server_name: []const u8,
-    repaired_entries: usize,
-) void {
-    if (repaired_entries == 0) return;
-    debug_trace.logf(
-        "mcp",
-        "removed unreadable MCP credential entries actor={s} server={s} count={d}",
-        .{ actor, server_name, repaired_entries },
-    );
 }
 
 fn installAuthCredentials(
@@ -12646,7 +12028,7 @@ fn advanceAuthGenerationLocked(server: *McpServer) void {
 
 fn automatedAuthorizationEnabled(endpoint: []const u8) bool {
     if (!mcp_auth.isLoopbackEndpoint(endpoint)) return false;
-    const value = io_mod.getenv("FX_E2E_MCP_AUTH_AUTOMATE") orelse return false;
+    const value = io_mod.getenv("FFX_E2E_MCP_AUTH_AUTOMATE") orelse return false;
     return std.mem.eql(u8, value, "1") or
         std.ascii.eqlIgnoreCase(value, "true");
 }
@@ -12925,13 +12307,15 @@ fn connectServerLegacyHttp(
         return err;
     };
 
-    var pages = ToolCatalogPages.init(alloc, .legacy);
-    defer pages.deinit(alloc);
+    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
+    defer builder.deinit(alloc);
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| alloc.free(value);
     while (true) {
         const tools_id = next_request_id.*;
         next_request_id.* = std.math.add(u64, tools_id, 1) catch
             return error.McpRequestIdExhausted;
-        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, pages.cursor);
+        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, cursor);
         defer alloc.free(tools_request);
         const tools_response = initialized.client.request(alloc, .{
             .request_id = tools_id,
@@ -12960,14 +12344,14 @@ fn connectServerLegacyHttp(
         };
         const received_at_ms = clockMillis();
         defer alloc.free(tools_response);
-        if (try pages.append_response(
-            alloc,
-            tools_response,
-            received_at_ms,
-            .release_before_alloc,
-        )) break;
+        var page = try tools_feature.parseListPage(alloc, tools_response, .legacy, .{});
+        defer page.deinit(alloc);
+        if (cursor) |value| alloc.free(value);
+        cursor = if (page.next_cursor) |value| try alloc.dupe(u8, value) else null;
+        try builder.appendPage(alloc, &page, received_at_ms, .{});
+        if (cursor == null) break;
     }
-    var catalog = try pages.finish(alloc);
+    var catalog = try builder.finish(alloc);
     defer catalog.deinit(alloc);
     try storeProtocolTools(alloc, server, tool_registry, catalog, used_tool_names, .legacy, null);
 
@@ -13005,7 +12389,7 @@ fn buildLegacyInitializeRequest(
     } else if (negotiated_wire == .legacy_mcp_2025_11 and elicitation_capabilities.url) {
         try out.writer.writeAll("\"elicitation\":{\"url\":{}}");
     }
-    try out.writer.writeAll("},\"clientInfo\":{\"name\":\"fx\",\"version\":");
+    try out.writer.writeAll("},\"clientInfo\":{\"name\":\"ffx\",\"version\":");
     try std.json.Stringify.value(build_options.app_version, .{}, &out.writer);
     try out.writer.writeAll("}}}");
     return out.toOwnedSlice();
@@ -14337,13 +13721,15 @@ fn connectServerSse(
         return err;
     };
 
-    var pages = ToolCatalogPages.init(alloc, .legacy);
-    defer pages.deinit(alloc);
+    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
+    defer builder.deinit(alloc);
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| alloc.free(value);
     while (true) {
         const tools_id = next_request_id;
         next_request_id = std.math.add(u64, tools_id, 1) catch
             return error.McpRequestIdExhausted;
-        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, pages.cursor);
+        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, cursor);
         defer alloc.free(tools_request);
         const tools_response = client.request(
             alloc,
@@ -14372,14 +13758,14 @@ fn connectServerSse(
         };
         const received_at_ms = clockMillis();
         defer alloc.free(tools_response);
-        if (try pages.append_response(
-            alloc,
-            tools_response,
-            received_at_ms,
-            .release_before_alloc,
-        )) break;
+        var page = try tools_feature.parseListPage(alloc, tools_response, .legacy, .{});
+        defer page.deinit(alloc);
+        if (cursor) |value| alloc.free(value);
+        cursor = if (page.next_cursor) |value| try alloc.dupe(u8, value) else null;
+        try builder.appendPage(alloc, &page, received_at_ms, .{});
+        if (cursor == null) break;
     }
-    var catalog = try pages.finish(alloc);
+    var catalog = try builder.finish(alloc);
     defer catalog.deinit(alloc);
     try storeProtocolTools(alloc, server, tool_registry, catalog, used_tool_names, .legacy, null);
 
@@ -16169,14 +15555,11 @@ test "legacy stdio initialization transitions are bounded and monotonic" {
         .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
         .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2024_11_05 }, .expected = .{ .accept = .v2024_11_05 } },
         .{ .offered = .v2025_06_18, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
-        .{ .offered = .v2025_03_26, .observation = .{ .accepted = .v2025_03_26 }, .expected = .{ .accept = .v2025_03_26 } },
         .{ .offered = .v2025_11_25, .observation = .connection_closed, .expected = .{ .retry = .v2025_06_18 } },
-        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2025_03_26 } },
-        .{ .offered = .v2025_03_26, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2024_11_05, .observation = .connection_closed, .expected = .fail },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_06_18 } },
-        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_03_26 } },
-        .{ .offered = .v2025_03_26, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2024_11_05, .observation = .{ .unsupported = null }, .expected = .fail },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2024_11_05 }, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2025_11_25 }, .expected = .fail },
@@ -16416,7 +15799,7 @@ test "modern request builders share required request metadata" {
     const alloc = std.testing.allocator;
     const metadata = try std.fmt.allocPrint(
         alloc,
-        "\"_meta\":{{\"io.modelcontextprotocol/protocolVersion\":\"{s}\",\"io.modelcontextprotocol/clientInfo\":{{\"name\":\"fx\",\"version\":\"{s}\"}},\"io.modelcontextprotocol/clientCapabilities\":{{}}}}",
+        "\"_meta\":{{\"io.modelcontextprotocol/protocolVersion\":\"{s}\",\"io.modelcontextprotocol/clientInfo\":{{\"name\":\"ffx\",\"version\":\"{s}\"}},\"io.modelcontextprotocol/clientCapabilities\":{{}}}}",
         .{ modern_protocol_version, build_options.app_version },
     );
     defer alloc.free(metadata);
@@ -16671,7 +16054,7 @@ test "connectServer discovers and calls a modern NDJSON tool" {
         \\      exit 2
         \\      ;;
         \\    *'"method":"server/discover"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*'"io.modelcontextprotocol/clientCapabilities":{}'*)
-        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"instructions":"Use echo.","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-identity"}}}}'
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"instructions":"Use echo."}}'
         \\      ;;
         \\    *'"method":"tools/list"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*)
         \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","ttlMs":60000,"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}'
@@ -16695,15 +16078,6 @@ test "connectServer discovers and calls a modern NDJSON tool" {
     try std.testing.expectEqual(ServerState.ready, server.state);
     try std.testing.expectEqual(StdioProtocol.modern, server.stdio_protocol);
     try std.testing.expectEqualStrings("Use echo.", server.instructions.?);
-    try std.testing.expectEqualStrings("modern-identity", server.negotiated_server_name.?);
-    try std.testing.expectEqual(@as(?[]u8, null), server.negotiated_server_version);
-    const listing = try runtime.listServersAndTools(alloc);
-    defer alloc.free(listing);
-    try std.testing.expect(std.mem.find(
-        u8,
-        listing,
-        "negotiated_name=modern-identity negotiated_version=unavailable protocol=2026-07-28",
-    ) != null);
 
     const result = (try runtime.callToolByName(
         alloc,
@@ -16715,68 +16089,6 @@ test "connectServer discovers and calls a modern NDJSON tool" {
     try std.testing.expect(std.mem.find(u8, result.model_output, "modern echo") != null);
 
     server.disconnect();
-}
-
-test "server identity projection preserves independently optional modern fields" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        json: []const u8,
-        name: ?[]const u8,
-        version: ?[]const u8,
-    }{
-        .{
-            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"modern-meta\",\"version\":\"2.0.0\"}}}}",
-            .name = "modern-meta",
-            .version = "2.0.0",
-        },
-        .{
-            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"AWSKnowledgeMCP\",\"version\":\"\"}}}}",
-            .name = "AWSKnowledgeMCP",
-            .version = null,
-        },
-        .{
-            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"name-only\"}}}",
-            .name = "name-only",
-            .version = null,
-        },
-        .{
-            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"version\":\"1.2.3\"}}}",
-            .name = null,
-            .version = "1.2.3",
-        },
-        .{
-            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
-            .name = null,
-            .version = null,
-        },
-    };
-    for (cases) |case| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
-        defer parsed.deinit();
-        const identity = try parseServerIdentity(parsed.value);
-        if (case.name) |expected| {
-            try std.testing.expectEqualStrings(expected, identity.name.?);
-        } else {
-            try std.testing.expect(identity.name == null);
-        }
-        if (case.version) |expected| {
-            try std.testing.expectEqualStrings(expected, identity.version.?);
-        } else {
-            try std.testing.expect(identity.version == null);
-        }
-    }
-
-    var invalid = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":1}}}",
-        .{},
-    );
-    defer invalid.deinit();
-    try std.testing.expectError(
-        error.McpInvalidResult,
-        parseServerIdentity(invalid.value),
-    );
 }
 
 test "modern MCP calls delegate unsupported schema assertions to the server" {
@@ -16808,16 +16120,15 @@ test "modern MCP calls delegate unsupported schema assertions to the server" {
     const server = &runtime.servers.items[0];
     try std.testing.expectEqual(ServerState.ready, server.state);
     try std.testing.expectEqual(@as(usize, 2), server.tool_catalog.tools.items.len);
-    const valid = try runtime.validateToolArgumentsByName(
-        alloc,
-        "mcp_provider_provider_pattern",
-        \\{"email":"person@example.com"}
-        ,
+    try std.testing.expectEqual(
+        tool_mcp_runtime.ValidationResult.valid,
+        try runtime.validateToolArgumentsByName(
+            alloc,
+            "mcp_provider_provider_pattern",
+            \\{"email":"person@example.com"}
+            ,
+        ),
     );
-    switch (valid) {
-        .valid => |generation| try std.testing.expectEqual(runtime.generation, generation),
-        .invalid, .not_available => return error.TestUnexpectedResult,
-    }
     try std.testing.expectError(
         error.McpInvalidToolArguments,
         runtime.callToolByName(
@@ -17838,7 +17149,7 @@ fn checkHealthSnapshotAllocationFailures(alloc: Allocator) !void {
     defer snapshot.deinit(alloc);
 }
 
-test "MCP health reads only lock-free state during discovery" {
+test "MCP health reads only immutable configuration during discovery" {
     const alloc = std.testing.allocator;
     var runtime = McpRuntime.init(alloc);
     defer runtime.deinit();
@@ -17876,7 +17187,7 @@ test "MCP health reads only lock-free state during discovery" {
     try std.testing.expectEqual(@as(usize, 2), loading.servers.len);
     const loading_active = loading.servers[0];
     try std.testing.expectEqual(health.ConnectionState.connecting, loading_active.connection);
-    try std.testing.expectEqual(health.AuthenticationState.authenticated, loading_active.authentication);
+    try std.testing.expectEqual(health.AuthenticationState.none, loading_active.authentication);
     try std.testing.expectEqual(@as(?[]u8, null), loading_active.negotiated_name);
     try std.testing.expectEqual(@as(?[]u8, null), loading_active.negotiated_version);
     try std.testing.expectEqual(@as(?[]u8, null), loading_active.protocol_version);
@@ -18114,13 +17425,19 @@ test "tool name allocation sanitizes truncates and deconflicts" {
 test "MCP tool name allocation reserves registered tool names" {
     const builtin_tools = @import("../../builtins/tools.zig");
     const alloc = std.testing.allocator;
-    const registry = tool_dispatch.Registry{ .tools = &.{builtin_tools.mcp_select_tool} };
+    const registry = tool_dispatch.Registry{ .tools = &.{
+        builtin_tools.mcp_search_tools,
+        builtin_tools.mcp_select_tool,
+    } };
     var used = std.StringHashMap(void).init(alloc);
     defer used.deinit();
 
+    const search_name = try allocateToolName(alloc, registry, &used, "search", "tools");
+    defer alloc.free(search_name);
     const select_name = try allocateToolName(alloc, registry, &used, "select", "tool");
     defer alloc.free(select_name);
 
+    try std.testing.expectEqualStrings("mcp_search_tools_2", search_name);
     try std.testing.expectEqualStrings("mcp_select_tool_2", select_name);
 }
 
@@ -18257,346 +17574,6 @@ test "parseAndStoreTools duplicates original_name for owned cleanup" {
     try std.testing.expectEqualStrings("read", server.tool_catalog.tools.items[0].original_name);
 }
 
-test "MCP tool catalog retains only tool-owned search data" {
-    try std.testing.expect(!@hasField(McpTool, "server_name"));
-    try std.testing.expect(!@hasField(McpTool, "server_instructions"));
-    try std.testing.expect(!@hasField(McpTool, "search_text"));
-    try std.testing.expectEqual(@as(usize, 160), @sizeOf(McpTool));
-}
-
-test "MCP search matches each retained source field" {
-    const alloc = std.testing.allocator;
-    var runtime = McpRuntime.init(alloc);
-    defer runtime.deinit();
-
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "git-hub"),
-        .command = try alloc.dupe(u8, "fixture"),
-    });
-    runtime.servers.items[0].state = .ready;
-    runtime.servers.items[0].instructions = try alloc.dupe(u8, "workflow guide");
-
-    var used = std.StringHashMap(void).init(alloc);
-    defer used.deinit();
-    try parseAndStoreTools(
-        alloc,
-        &runtime.servers.items[0],
-        .{},
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_issue","description":"Create ticket","inputSchema":{"type":"object","properties":{"repository_slug":{"type":"string"}}}}]}}
-    ,
-        &used,
-    );
-
-    const cases = [_][]const u8{
-        "mcp",
-        "GIT-HUB",
-        "create_issue",
-        "ticket repository_slug",
-        "workflow ticket",
-        "git-hub repository_slug",
-    };
-    const expected_output =
-        "{\"tools\":[{\"name\":\"mcp_git-hub_create_issue\",\"server\":\"git-hub\",\"description\":\"Create ticket\",\"purpose\":\"Create ticket\",\"usage\":[\"mcp\",\"git-hub\",\"create_issue\"]}],\"count\":1,\"total_matches\":1,\"more_available\":false,\"next_cursor\":null}";
-    for (cases) |query| {
-        var result = try runtime.searchTools(alloc, query, 5, .{}, .{}, .unrestricted);
-        defer result.deinit(alloc);
-        try std.testing.expectEqualStrings(expected_output, result.model_output);
-        try std.testing.expect(result.notice == null);
-
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
-        defer parsed.deinit();
-        const tools = parsed.value.object.get("tools").?.array.items;
-        try std.testing.expectEqual(@as(usize, 1), tools.len);
-        const usage = tools[0].object.get("usage").?.array.items;
-        try std.testing.expectEqual(@as(usize, 3), usage.len);
-        try std.testing.expectEqualStrings("mcp", usage[0].string);
-        try std.testing.expectEqualStrings("git-hub", usage[1].string);
-        try std.testing.expectEqualStrings("create_issue", usage[2].string);
-    }
-
-    var missing = try runtime.searchTools(
-        alloc,
-        "missing-token",
-        5,
-        .{},
-        .{},
-        .unrestricted,
-    );
-    defer missing.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null}",
-        missing.model_output,
-    );
-    try std.testing.expect(missing.notice == null);
-}
-
-test "MCP search bounds untrusted description and schema fields" {
-    const alloc = std.testing.allocator;
-    var runtime = McpRuntime.init(alloc);
-    defer runtime.deinit();
-
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "bounded"),
-        .command = try alloc.dupe(u8, "fixture"),
-    });
-    runtime.servers.items[0].state = .ready;
-
-    var used = std.StringHashMap(void).init(alloc);
-    defer used.deinit();
-    try parseAndStoreTools(
-        alloc,
-        &runtime.servers.items[0],
-        .{},
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"probe","description":"initial","inputSchema":{"type":"object"}}]}}
-    ,
-        &used,
-    );
-
-    const description = "zearly123 " ++ ("x" ** mcp_tool_description_search_bytes) ++ " zlate987";
-    const schema =
-        "{\"type\":\"object\",\"properties\":{\"zearly456\":{\"type\":\"string\"},\"padding\":{\"description\":\"" ++
-        ("x" ** mcp_tool_schema_search_bytes) ++
-        "zlate654\"}}}";
-    const tool = &runtime.servers.items[0].tool_catalog.tools.items[0];
-    alloc.free(tool.description);
-    tool.description = try alloc.dupe(u8, description);
-    alloc.free(tool.input_schema_json);
-    tool.input_schema_json = try alloc.dupe(u8, schema);
-
-    const cases = [_]struct {
-        query: []const u8,
-        expected_match: bool,
-    }{
-        .{ .query = "zearly123 zearly456", .expected_match = true },
-        .{ .query = "zlate987 zearly456", .expected_match = false },
-        .{ .query = "zearly123 zlate654", .expected_match = false },
-        .{ .query = "zlate987 zlate654", .expected_match = false },
-    };
-    for (cases) |case| {
-        var result = try runtime.searchTools(alloc, case.query, 5, .{}, .{}, .unrestricted);
-        defer result.deinit(alloc);
-        try std.testing.expectEqual(
-            case.expected_match,
-            std.mem.find(u8, result.model_output, "mcp_bounded_probe") != null,
-        );
-    }
-}
-
-test "MCP search releases request-scoped ranking allocations" {
-    const alloc = std.testing.allocator;
-    var runtime = McpRuntime.init(alloc);
-    defer runtime.deinit();
-
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "github"),
-        .command = try alloc.dupe(u8, "fixture"),
-    });
-    runtime.servers.items[0].state = .ready;
-
-    var used = std.StringHashMap(void).init(alloc);
-    defer used.deinit();
-    try parseAndStoreTools(
-        alloc,
-        &runtime.servers.items[0],
-        .{},
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_issue","description":"Create issue","inputSchema":{"type":"object"}}]}}
-    ,
-        &used,
-    );
-
-    var counting = std.testing.FailingAllocator.init(alloc, .{});
-    const search_alloc = counting.allocator();
-    var result = try runtime.searchTools(
-        search_alloc,
-        "github issue",
-        max_mcp_search_limit,
-        .{},
-        .{},
-        .unrestricted,
-    );
-    defer result.deinit(search_alloc);
-
-    try std.testing.expectEqualStrings(
-        "{\"tools\":[{\"name\":\"mcp_github_create_issue\",\"server\":\"github\",\"description\":\"Create issue\",\"purpose\":\"Create issue\",\"usage\":[\"mcp\",\"github\",\"create_issue\"]}],\"count\":1,\"total_matches\":1,\"more_available\":false,\"next_cursor\":null}",
-        result.model_output,
-    );
-    try std.testing.expect(counting.allocations > 0);
-}
-
-test "MCP search keeps the globally strongest matches across servers" {
-    const alloc = std.testing.allocator;
-    var runtime = McpRuntime.init(alloc);
-    defer runtime.deinit();
-
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "first"),
-        .command = try alloc.dupe(u8, "fixture"),
-    });
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "linear"),
-        .command = try alloc.dupe(u8, "fixture"),
-    });
-    for (runtime.servers.items) |*server| server.state = .ready;
-
-    var used = std.StringHashMap(void).init(alloc);
-    defer used.deinit();
-    try parseAndStoreTools(
-        alloc,
-        &runtime.servers.items[0],
-        .{},
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"launch","description":"Deploy Linear infrastructure","inputSchema":{"type":"object"}}]}}
-    ,
-        &used,
-    );
-    try parseAndStoreTools(
-        alloc,
-        &runtime.servers.items[1],
-        .{},
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Deploy Linear data","inputSchema":{"type":"object"}}]}}
-    ,
-        &used,
-    );
-
-    var result = try runtime.searchTools(alloc, "linear deploy", 1, .{}, .{}, .unrestricted);
-    defer result.deinit(alloc);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        "mcp_linear_echo",
-        parsed.value.object.get("tools").?.array.items[0].object.get("name").?.string,
-    );
-    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("total_matches").?.integer);
-    try std.testing.expect(parsed.value.object.get("more_available").?.bool);
-    try std.testing.expect(parsed.value.object.get("next_cursor").? == .string);
-}
-
-test "MCP search applies exact server scope before ranking" {
-    const alloc = std.testing.allocator;
-    var runtime = McpRuntime.init(alloc);
-    defer runtime.deinit();
-
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "datadog"),
-        .command = try alloc.dupe(u8, "fixture"),
-    });
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "grafana"),
-        .command = try alloc.dupe(u8, "fixture"),
-    });
-    for (runtime.servers.items) |*server| server.state = .ready;
-
-    var used = std.StringHashMap(void).init(alloc);
-    defer used.deinit();
-    const response =
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"list_monitors","description":"List service monitors","inputSchema":{"type":"object"}}]}}
-    ;
-    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
-    try parseAndStoreTools(alloc, &runtime.servers.items[1], .{}, response, &used);
-
-    const inventory = try lexical_relevance.prepare("");
-    var scoped = try runtime.searchToolsPrepared(
-        alloc,
-        .{
-            .query = &inventory,
-            .kind = .mcp,
-            .server = "datadog",
-            .limit = 20,
-        },
-        .{},
-        .{},
-        .unrestricted,
-    );
-    defer scoped.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, scoped.model_output, "mcp_datadog_list_monitors") != null);
-    try std.testing.expect(std.mem.find(u8, scoped.model_output, "mcp_grafana_list_monitors") == null);
-
-    var missing = try runtime.searchToolsPrepared(
-        alloc,
-        .{
-            .query = &inventory,
-            .kind = .mcp,
-            .server = "missing",
-            .limit = 20,
-        },
-        .{},
-        .{},
-        .unrestricted,
-    );
-    defer missing.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, missing.model_output, "\"state\":\"server_not_found\"") != null);
-}
-
-test "MCP search preserves exact identities and scopes authentication guidance" {
-    const alloc = std.testing.allocator;
-    var runtime = McpRuntime.init(alloc);
-    defer runtime.deinit();
-
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "linear"),
-        .command = try alloc.dupe(u8, "cmd"),
-    });
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "slack"),
-        .command = try alloc.dupe(u8, "cmd"),
-        .bearer_token_env = try alloc.dupe(u8, "SLACK_TOKEN"),
-    });
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "a/b"),
-        .command = try alloc.dupe(u8, "cmd"),
-        .bearer_token_env = try alloc.dupe(u8, "PUNCTUATED_TOKEN"),
-    });
-    runtime.servers.items[0].state = .ready;
-    runtime.servers.items[1].state = .failed;
-    runtime.servers.items[2].state = .failed;
-
-    var used = std.StringHashMap(void).init(alloc);
-    defer used.deinit();
-    const response =
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo Linear data","inputSchema":{"type":"object"}},{"name":"read/file","description":"Read a Linear file","inputSchema":{"type":"object"}}]}}
-    ;
-    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
-
-    const cases = [_]struct {
-        query: []const u8,
-        expected_tool: []const u8,
-    }{
-        .{ .query = "Please use MCP_LINEAR_ECHO for this request", .expected_tool = "mcp_linear_echo" },
-        .{ .query = "Please use read/file for this request", .expected_tool = "mcp_linear_read_file" },
-    };
-    for (cases) |case| {
-        var result = try runtime.searchTools(alloc, case.query, 5, .{}, .{}, .unrestricted);
-        defer result.deinit(alloc);
-        try std.testing.expect(std.mem.find(u8, result.model_output, case.expected_tool) != null);
-        try std.testing.expect(std.mem.find(u8, result.model_output, "authentication_required") == null);
-    }
-
-    var partial = try runtime.searchTools(alloc, "mcp_linear_echoes", 5, .{}, .{}, .unrestricted);
-    defer partial.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, partial.model_output, "authentication_required") == null);
-
-    var noisy = try runtime.searchTools(alloc, "linear issue", 5, .{}, .{}, .unrestricted);
-    defer noisy.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, noisy.model_output, "mcp_linear_echo") != null);
-
-    var auth_collision = try runtime.searchTools(alloc, "slack data", 5, .{}, .{}, .unrestricted);
-    defer auth_collision.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, auth_collision.model_output, "\"server\":\"slack\"") != null);
-    try std.testing.expect(std.mem.find(u8, auth_collision.model_output, "mcp_linear_echo") == null);
-
-    var targeted = try runtime.searchTools(alloc, "authenticate slack now", 5, .{}, .{}, .unrestricted);
-    defer targeted.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, targeted.model_output, "\"server\":\"slack\"") != null);
-    try std.testing.expect(std.mem.find(u8, targeted.model_output, "SLACK_TOKEN") != null);
-
-    var punctuated = try runtime.searchTools(alloc, "authenticate a/b now", 5, .{}, .{}, .unrestricted);
-    defer punctuated.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, punctuated.model_output, "\"server\":\"a/b\"") != null);
-
-    var adjacent = try runtime.searchTools(alloc, "authenticate xa/by now", 5, .{}, .{}, .unrestricted);
-    defer adjacent.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, adjacent.model_output, "authentication_required") == null);
-}
-
 test "MCP search returns metadata without advertising every executable schema" {
     const alloc = std.testing.allocator;
     var runtime = McpRuntime.init(alloc);
@@ -18664,14 +17641,12 @@ test "MCP search reports an authorized match beyond the count cap" {
     defer broad_json.deinit();
     try std.testing.expectEqual(@as(i64, 20), broad_json.value.object.get("count").?.integer);
     try std.testing.expect(broad_json.value.object.get("more_available").?.bool);
-    try std.testing.expect(broad_json.value.object.get("next_cursor").? == .string);
 
     var targeted = try runtime.searchTools(alloc, "item00", 20, .{}, .{}, .unrestricted);
     defer targeted.deinit(alloc);
     var targeted_json = try std.json.parseFromSlice(std.json.Value, alloc, targeted.model_output, .{});
     defer targeted_json.deinit();
-    try std.testing.expect(!targeted_json.value.object.get("more_available").?.bool);
-    try std.testing.expect(targeted_json.value.object.get("next_cursor").? == .null);
+    try std.testing.expect(targeted_json.value.object.get("more_available") == null);
 }
 
 test "scoped MCP cached tool and feature operations reject authority revoked after admission" {
@@ -18816,22 +17791,6 @@ test "scoped MCP cached tool and feature operations reject authority revoked aft
             &.{},
             null,
             access,
-        ),
-    );
-}
-
-test "MCP tool call rejects mismatched expected runtime generation before lookup" {
-    var runtime = McpRuntime.init(std.testing.allocator);
-    defer runtime.deinit();
-
-    try std.testing.expectError(
-        error.McpAuthorityChanged,
-        runtime.callToolByNameWithOptions(
-            std.testing.allocator,
-            "mcp_fixture_echo",
-            "{}",
-            1024,
-            .{ .expected_runtime_generation = runtime.generation + 1 },
         ),
     );
 }
@@ -19125,7 +18084,6 @@ test "scoped MCP authentication rendering excludes denied servers" {
         alloc,
         runtime.servers.items,
         &scoped,
-        "denied",
     ) == null);
 
     var root = try OperationAccessGuard.init(alloc, .unrestricted, runtime.generation);
@@ -19134,7 +18092,6 @@ test "scoped MCP authentication rendering excludes denied servers" {
         alloc,
         runtime.servers.items,
         &root,
-        "denied",
     )).?;
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "denied") != null);
@@ -19162,6 +18119,9 @@ test "MCP server instructions are captured from initialize and exposed only when
     ;
     try parseAndStoreTools(alloc, &server, .{}, tools_response, &used);
     try std.testing.expectEqual(@as(usize, 2), server.tool_catalog.tools.items.len);
+    for (server.tool_catalog.tools.items) |tool| {
+        try std.testing.expect(std.mem.find(u8, tool.search_text, "github issue workflows") == null);
+    }
     server.state = .ready;
 
     var runtime = McpRuntime.init(alloc);
@@ -19174,7 +18134,7 @@ test "MCP server instructions are captured from initialize and exposed only when
     try std.testing.expect(std.mem.find(u8, results.model_output, "server_instructions") == null);
     try std.testing.expect(std.mem.find(u8, results.model_output, "GitHub issue workflows") == null);
 
-    var instruction_results = try runtime.searchTools(alloc, "issue workflows", 5, .{}, .{}, .unrestricted);
+    var instruction_results = try runtime.searchTools(alloc, "workflows", 5, .{}, .{}, .unrestricted);
     defer instruction_results.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, instruction_results.model_output, "mcp_github_create_issue") != null);
     try std.testing.expect(std.mem.find(u8, instruction_results.model_output, "mcp_github_close_issue") != null);
@@ -19214,7 +18174,7 @@ test "MCP exact selection returns one executable schema by prefixed name" {
     try std.testing.expect(std.mem.find(u8, schema, "\"name\":\"mcp_fs_read\"") != null);
     try std.testing.expect(std.mem.find(u8, schema, "\"inputSchema\"") != null);
     try std.testing.expect(std.mem.find(u8, schema, "instruction tail") != null);
-    try std.testing.expect(std.mem.find(u8, schema, model_tool_schema.truncation_marker) == null);
+    try std.testing.expect(std.mem.find(u8, schema, gateway_schema.truncation_marker) == null);
     try std.testing.expect((try runtime.toolSchemaJsonByName(alloc, "mcp_missing", .{}, .{})) == null);
 }
 
@@ -19289,7 +18249,7 @@ test "MCP metadata caps encoded descriptions and preserves ready-server tool ord
 
     var limits = context_limits.Values{};
     limits.mcp_description_bytes = .{ .value = .{ .bytes = 12 }, .source = .user_global };
-    limits.mcp_search_result_bytes = .{ .value = .{ .bytes = 1024 }, .source = .command_line };
+    limits.mcp_search_result_bytes = .{ .value = .{ .bytes = 650 }, .source = .command_line };
     var results = try runtime.searchTools(alloc, "", 10, .{}, limits, .unrestricted);
     defer results.deinit(alloc);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, results.model_output, .{});
@@ -19319,78 +18279,6 @@ test "MCP metadata caps encoded descriptions and preserves ready-server tool ord
     try std.testing.expect(tiny.notice != null);
 }
 
-test "runtime rejects source and workspace admission mismatches before installation" {
-    const alloc = std.testing.allocator;
-    var runtime = McpRuntime.init(alloc);
-    defer runtime.deinit();
-
-    var missing: McpServerConfig = .{
-        .name = try alloc.dupe(u8, "missing"),
-        .source = .workspace,
-        .scope = .workspace,
-        .command = try alloc.dupe(u8, "cmd"),
-    };
-    try std.testing.expectError(error.McpConfigAdmissionMismatch, runtime.addServer(missing));
-    missing.deinit(alloc);
-
-    var synthetic: McpServerConfig = .{
-        .name = try alloc.dupe(u8, "synthetic"),
-        .source = .profile,
-        .scope = .profile,
-        .command = try alloc.dupe(u8, "cmd"),
-        .workspace_admission = .approved,
-    };
-    try std.testing.expectError(error.McpConfigAdmissionMismatch, runtime.addServer(synthetic));
-    synthetic.deinit(alloc);
-}
-
-test "interactive authentication requires approved workspace admission" {
-    const alloc = std.testing.allocator;
-    var runtime = McpRuntime.init(alloc);
-    defer runtime.deinit();
-
-    for ([_]mcp_contract.WorkspaceAdmission{ .pending, .rejected, .approved }) |admission| {
-        const name = @tagName(admission);
-        try runtime.addServer(.{
-            .name = try alloc.dupe(u8, name),
-            .source = .workspace,
-            .scope = .workspace,
-            .transport = .http,
-            .url = try alloc.dupe(u8, "https://example.test/mcp"),
-            .workspace_admission = admission,
-        });
-    }
-
-    try std.testing.expectError(
-        error.McpWorkspaceApprovalRequired,
-        runtime.validateAuthenticationServer("pending"),
-    );
-    try std.testing.expectError(
-        error.McpWorkspaceApprovalRequired,
-        runtime.validateAuthenticationServer("rejected"),
-    );
-    try runtime.validateAuthenticationServer("approved");
-    try std.testing.expectError(
-        error.McpWorkspaceApprovalRequired,
-        runtime.listResources(
-            alloc,
-            "pending",
-            false,
-            null,
-            .unrestricted,
-        ),
-    );
-    try std.testing.expectError(
-        error.McpWorkspaceApprovalRequired,
-        runtime.listPrompts(
-            alloc,
-            "rejected",
-            null,
-            .unrestricted,
-        ),
-    );
-}
-
 test "tool schema uses prefixed name and call request uses raw name" {
     const alloc = std.testing.allocator;
     var used = std.StringHashMap(void).init(alloc);
@@ -19412,7 +18300,6 @@ test "tool schema uses prefixed name and call request uses raw name" {
         tool,
         null,
         false,
-        0,
         (context_limits.Values{}).mcp_server_instructions_bytes,
     );
     defer alloc.free(schema);

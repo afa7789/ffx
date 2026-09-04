@@ -5,21 +5,22 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
-const credentials = @import("../auth/credentials.zig");
-const process_provider = @import("../execution/process_provider.zig");
+const background_process_provider = @import(
+    "../execution/background_process_provider.zig",
+);
 const gateway_provider = @import("../gateway/gateway_provider.zig");
-const provider_set = @import("../gateway/provider_set.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
+const agent_stream_provider = @import("../agent/stream_provider.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
+const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
-const mcp_command_provider = @import("../mcp/command_provider.zig");
-const mcp_health = @import("../mcp/health.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -34,40 +35,10 @@ else
 
 const Allocator = std.mem.Allocator;
 
-const GracefulExitSigintGuard = if (host_target.is_wasm) struct {
-    fn install(_: bool) @This() {
-        return .{};
-    }
-
-    fn deinit(_: *@This()) void {}
-} else struct {
-    saved_action: ?std.posix.Sigaction = null,
-
-    fn install(enabled: bool) @This() {
-        if (!enabled) return .{};
-
-        const ignore_action: std.posix.Sigaction = .{
-            .handler = .{ .handler = std.posix.SIG.IGN },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        var saved_action: std.posix.Sigaction = undefined;
-        std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &saved_action);
-        return .{ .saved_action = saved_action };
-    }
-
-    fn deinit(self: *@This()) void {
-        const saved_action = self.saved_action orelse return;
-        std.posix.sigaction(std.posix.SIG.INT, &saved_action, null);
-        self.saved_action = null;
-    }
-};
-
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
     build_channel: update_target.Channel = .stable,
-    auth_mode: credentials.AuthMode = .local,
     command_catalog: command_specs.TopLevelRegistry,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -75,8 +46,14 @@ pub const Config = struct {
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     gateway_provider: gateway_provider.Provider,
-    provider_set: provider_set.Set,
-    process_provider: process_provider.Provider = process_provider.unavailable_provider,
+    codex_agent_stream: ?agent_stream_provider.Provider = null,
+    codex_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    codex_model_catalog: ?model_catalog.Provider = null,
+    grok_agent_stream: ?agent_stream_provider.Provider = null,
+    grok_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    grok_model_catalog: ?model_catalog.Provider = null,
+    background_process_provider: background_process_provider.Provider =
+        background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
     secret_store: host.SecretStore,
     prompt_policy: prompt_policy.Policy,
@@ -93,14 +70,11 @@ pub const Config = struct {
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
-    inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
-        mcp_health.inspectLocalConfigUnavailable,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
-    add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
-        mcp_command_provider.addProfileServerUnavailable,
-    remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
-        mcp_command_provider.removeProfileServerUnavailable,
     acp_runner: acp_runner.Runner,
+    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
 
 pub fn run(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config) !void {
@@ -162,10 +136,14 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
         .exit => |code| return .{ .exit = code },
     }
 
-    return runInteractiveWithDeps(App, false, alloc, &launch, cfg.auth_mode, deps);
+    return runInteractiveWithDeps(App, false, alloc, &launch, deps);
 }
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
+    _ = cli_surface.recordRequested(args) catch {
+        writeStderr(.{}, cli_surface.record_modifier_usage);
+        return .{ .exit = 1 };
+    };
     const run_result = cli_surface.runIfRequested(alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = 1 },
         else => {
@@ -187,6 +165,10 @@ pub fn runNoConfigBeforeInteractive(
 }
 
 fn runBeforeInteractiveWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !BeforeInteractiveResult {
+    _ = cli_surface.recordRequested(args) catch {
+        writeStderr(deps, cli_surface.record_modifier_usage);
+        return .{ .exit = 1 };
+    };
     const run_result = deps.run_if_requested(deps.cli_ctx, alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = 1 },
         else => {
@@ -195,7 +177,7 @@ fn runBeforeInteractiveWithDeps(alloc: Allocator, args: []const [:0]const u8, cf
         },
     };
 
-    return beforeInteractiveResultFromRunResult(alloc, run_result, deps.getenv(deps.env_ctx, "FX_BENCH") != null);
+    return beforeInteractiveResultFromRunResult(alloc, run_result, deps.getenv(deps.env_ctx, "FFX_BENCH") != null);
 }
 
 fn beforeInteractiveResultFromRunResult(alloc: Allocator, run_result: cli_surface.RunResult, bench: bool) BeforeInteractiveResult {
@@ -216,73 +198,73 @@ fn beforeInteractiveResultFromRunResult(alloc: Allocator, run_result: cli_surfac
 
 fn benchEnabled() bool {
     if (comptime builtin.link_libc) {
-        return std.c.getenv("FX_BENCH") != null;
+        return std.c.getenv("FFX_BENCH") != null;
     }
-    return io_mod.getenv("FX_BENCH") != null;
+    return io_mod.getenv("FFX_BENCH") != null;
 }
 
-pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
-    return runInteractiveWithDeps(App, false, alloc, launch, auth_mode, .{});
+pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !RunOutcome {
+    return runInteractiveWithDeps(App, false, alloc, launch, .{});
 }
 
 /// Runs the interactive product without native CLI dispatch, process replacement,
 /// or a worker thread. Single-threaded hosts must arrange cooperative prompt work.
-pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
-    return runInteractiveWithDeps(App, true, alloc, launch, auth_mode, .{});
+pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !RunOutcome {
+    return runInteractiveWithDeps(App, true, alloc, launch, .{});
 }
 
 fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8, _: cli_surface.Config) anyerror!cli_surface.RunResult {
     return error.UnknownCliCommand;
 }
 
-fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
+fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, deps: RunDeps) !RunOutcome {
     const resume_requested = launch.requested_resume != null;
-    var app = App.init(alloc, launch, auth_mode) catch |err| {
+    var app = App.init(alloc, launch) catch |err| {
         switch (err) {
             error.NotATerminal => {
-                writeStderr(deps, "fx requires an interactive terminal (TTY).\n");
+                writeStderr(deps, "ffx requires an interactive terminal (TTY).\n");
                 return .{ .exit = 1 };
             },
             error.TerminalTooSmall => {
-                writeStderr(deps, "fx needs at least 5 terminal rows.\n");
+                writeStderr(deps, "ffx needs at least 5 terminal rows.\n");
                 return .returned;
             },
             error.RecordingStartFailed => {
-                writeStderr(deps, "fx: unable to start terminal recording.\n");
+                writeStderr(deps, "ffx: unable to start terminal recording.\n");
                 return .{ .exit = 1 };
             },
             error.NoSavedSessions => {
-                writeStderr(deps, "fx: no saved sessions for this workspace.\n");
+                writeStderr(deps, "ffx: no saved sessions for this workspace.\n");
                 return .{ .exit = 1 };
             },
             error.SessionNotFound => {
-                writeStderr(deps, "fx: saved session not found.\n");
+                writeStderr(deps, "ffx: saved session not found.\n");
                 return .{ .exit = 1 };
             },
             error.SessionBusy => {
-                writeStderr(deps, "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
+                writeStderr(deps, "ffx: another Fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
                 return .{ .exit = 1 };
             },
             error.SessionLockUnsupported => {
-                writeStderr(deps, "fx: the filesystem cannot provide the required session lock\n");
+                writeStderr(deps, "ffx: the filesystem cannot provide the required session lock\n");
                 return .{ .exit = 1 };
             },
             error.SessionAuthorityBoundaryUnavailable,
             error.SessionCommitBoundaryUnavailable,
             => {
-                writeStderr(deps, "fx: this session is being updated; wait a moment and retry\n");
+                writeStderr(deps, "ffx: this session is being updated; wait a moment and retry\n");
                 return .{ .exit = 1 };
             },
             error.OneOffSessionNotResumable => {
-                writeStderr(deps, "fx: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n");
+                writeStderr(deps, "ffx: one-off child sessions cannot accept additional prompts; create a persistent child to continue the conversation\n");
                 return .{ .exit = 1 };
             },
             error.InvalidSessionFormat => {
-                writeStderr(deps, "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n");
+                writeStderr(deps, "ffx: saved session is unreadable. Run `ffx doctor`; if it is recoverable, use `ffx session recover <id>`.\n");
                 return .{ .exit = 1 };
             },
             error.UnsupportedSessionSchema => {
-                writeStderr(deps, "fx: saved session uses an unsupported version and cannot be resumed by this fx build.\n");
+                writeStderr(deps, "ffx: saved session uses an unsupported version and cannot be resumed by this ffx build.\n");
                 return .{ .exit = 1 };
             },
             else => {
@@ -334,10 +316,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.resumeHandoffColumns()
     else
         0;
-    var graceful_exit_sigint_guard = GracefulExitSigintGuard.install(
-        !cooperative and relaunch_request == null,
-    );
-    defer graceful_exit_sigint_guard.deinit();
     app_needs_deinit = false;
     const handoff_value = if (comptime cooperative) blk: {
         app.deinit();
@@ -352,19 +330,17 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 "resume",
                 handoff.session_id,
                 cli_surface.upgrade_relaunch_arg,
-                request.previousRevision() orelse "",
             };
-            const argv_slice = if (request.previousRevision() == null) argv[0..4] else argv[0..5];
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = argv_slice },
+                .{ .argv = &argv },
             );
             writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
         } else {
             writeStderr(
                 deps,
-                "fx: upgrade installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
+                "ffx: upgrade installed, but no validated resume handoff was available. Your conversation remains on disk; run `ffx doctor`.\n",
             );
         }
         return .{ .exit = 1 };
@@ -402,9 +378,9 @@ fn writeUpgradeRelaunchFailure(
     var buffer: [768]u8 = undefined;
     const message = std.fmt.bufPrint(
         &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
+        "ffx: upgrade installed, but relaunch failed: {s}\nContinue session with: ffx --resume {s}\n",
         .{ @errorName(err), session_id },
-    ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
+    ) catch "ffx: upgrade installed, but relaunch failed; run `ffx doctor`.\n";
     writeStderr(deps, message);
 }
 
@@ -413,7 +389,6 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .version = cfg.version,
         .revision = cfg.revision,
         .build_channel = cfg.build_channel,
-        .auth_mode = cfg.auth_mode,
         .command_catalog = cfg.command_catalog,
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,
@@ -421,8 +396,13 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
         .gateway_provider = cfg.gateway_provider,
-        .provider_set = cfg.provider_set,
-        .process_provider = cfg.process_provider,
+        .codex_agent_stream = cfg.codex_agent_stream,
+        .codex_cli_model_catalog = cfg.codex_cli_model_catalog,
+        .codex_model_catalog = cfg.codex_model_catalog,
+        .grok_agent_stream = cfg.grok_agent_stream,
+        .grok_cli_model_catalog = cfg.grok_cli_model_catalog,
+        .grok_model_catalog = cfg.grok_model_catalog,
+        .background_process_provider = cfg.background_process_provider,
         .url_opener = cfg.url_opener,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,
@@ -439,11 +419,11 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .mode_registry = cfg.mode_registry,
         .tool_set = cfg.tool_set,
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
-        .inspect_mcp_local_config = cfg.inspect_mcp_local_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
-        .add_mcp_profile_server = cfg.add_mcp_profile_server,
-        .remove_mcp_profile_server = cfg.remove_mcp_profile_server,
         .acp_runner = cfg.acp_runner,
+        .permission_reviewer_provider = cfg.permission_reviewer_provider,
+        .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
+        .grok_permission_reviewer_provider = cfg.grok_permission_reviewer_provider,
     };
 }
 
@@ -477,13 +457,13 @@ fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
 fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
     return std.fmt.bufPrint(
         buffer,
-        "Continue session with: fx --resume {s}\n",
+        "Continue session with: ffx --resume {s}\n",
         .{session_id},
     );
 }
 
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "fx: {s}\n", .{@errorName(err)});
+    return std.fmt.bufPrint(buffer, "ffx: {s}\n", .{@errorName(err)});
 }
 
 fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
@@ -497,7 +477,7 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
 }
 
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
-    writeStderr(deps, "fx: ");
+    writeStderr(deps, "ffx: ");
     writeStderr(deps, @errorName(err));
     writeStderr(deps, "\n");
 }
@@ -518,7 +498,7 @@ const test_entry_context_registry = context_contract.Registry{ .default_provider
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn noMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -542,7 +522,6 @@ fn testConfig() Config {
         .gateway_retry_count = 2,
         .gateway_chat_url = "https://gateway/chat",
         .gateway_provider = test_builtin_gateway.provider,
-        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .url_opener = host.unavailable_url_opener,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "system" },
@@ -572,11 +551,6 @@ var test_events: [16][]const u8 = undefined;
 var test_event_count: usize = 0;
 var test_init_event_buf: [128]u8 = undefined;
 var active_capture: ?*TestCapture = null;
-var test_sigint_count = std.atomic.Value(usize).init(0);
-
-fn testSigintHandler(_: std.posix.SIG) callconv(.c) void {
-    _ = test_sigint_count.fetchAdd(1, .seq_cst);
-}
 
 fn resetTestEvents() void {
     test_event_count = 0;
@@ -623,14 +597,12 @@ const TestCapture = struct {
     record_stderr_event: bool = false,
     record_stdout_event: bool = false,
     resume_handoff_id: ?[]const u8 = null,
-    raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
-    upgrade_previous_revision: ?[]const u8 = null,
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [5][128]u8 = undefined,
-    replace_arg_lens: [5]usize = .{ 0, 0, 0, 0, 0 },
+    replace_arg_bufs: [4][128]u8 = undefined,
+    replace_arg_lens: [4]usize = .{ 0, 0, 0, 0 },
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -684,7 +656,7 @@ fn runIfRequestedForTest(ctx: ?*anyopaque, _: Allocator, _: []const [:0]const u8
 
 fn getenvForTest(ctx: ?*anyopaque, key: []const u8) ?[]const u8 {
     const capture: *TestCapture = @ptrCast(@alignCast(ctx.?));
-    if (std.mem.eql(u8, key, "FX_BENCH")) return capture.bench_value;
+    if (std.mem.eql(u8, key, "FFX_BENCH")) return capture.bench_value;
     return null;
 }
 
@@ -737,7 +709,7 @@ const TestApp = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
     terminal_released: bool = false,
 
-    fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch, _: credentials.AuthMode) !TestApp {
+    fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch) !TestApp {
         appendInitEvent(launch);
         if (active_capture.?.init_error) |err| return err;
 
@@ -764,9 +736,6 @@ const TestApp = struct {
             };
             break :blk .{ .session_id = session_id };
         } else null;
-        if (active_capture.?.raise_sigint_during_deinit) {
-            _ = std.c.raise(std.posix.SIG.INT);
-        }
         self.deinit();
         return handoff;
     }
@@ -777,10 +746,6 @@ const TestApp = struct {
             .executable_path_len = path.len,
         };
         @memcpy(request.executable_path_buf[0..path.len], path);
-        if (active_capture.?.upgrade_previous_revision) |revision| {
-            @memcpy(request.previous_revision_buf[0..revision.len], revision);
-            request.previous_revision_len = @intCast(revision.len);
-        }
         return request;
     }
 
@@ -844,9 +809,13 @@ test "app entry returns after handled CLI success without initializing app" {
     try std.testing.expectEqualStrings("entry_test_tool", capture.seen_config.?.tool_set.order[0]);
     try std.testing.expectEqualStrings("skills", capture.seen_config.?.skill_root_policy.workspace_roots[0].path);
     try std.testing.expect(capture.seen_config.?.gateway_provider.chat_url.resolve_fn == test_builtin_gateway.chat_url_provider.resolve_fn);
-    try std.testing.expect(capture.seen_config.?.provider_set.gateway.cli_model_catalog.?.fetch_fn == test_builtin_gateway.cli_model_catalog_provider.fetch_fn);
-    try std.testing.expect(capture.seen_config.?.provider_set.gateway.fx_search.?.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
-    try std.testing.expect(capture.seen_config.?.provider_set.gateway.model_catalog.?.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
+    try std.testing.expect(capture.seen_config.?.gateway_provider.cli_model_catalog.fetch_fn == test_builtin_gateway.cli_model_catalog_provider.fetch_fn);
+    try std.testing.expect(capture.seen_config.?.gateway_provider.web_search.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
+    try std.testing.expect(capture.seen_config.?.gateway_provider.model_catalog.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
+    try std.testing.expect(
+        capture.seen_config.?.background_process_provider.spawn_prepared_fn ==
+            cfg.background_process_provider.spawn_prepared_fn,
+    );
     try std.testing.expect(capture.seen_config.?.url_opener.context == cfg.url_opener.context);
     try std.testing.expect(capture.seen_config.?.url_opener.open_fn == cfg.url_opener.open_fn);
     try std.testing.expect(capture.seen_config.?.secret_store.context == cfg.secret_store.context);
@@ -888,7 +857,7 @@ test "app entry returns after handled zero exit without initializing app" {
     try std.testing.expectEqual(@as(usize, 0), test_event_count);
 }
 
-test "app entry honors FX_BENCH before app initialization" {
+test "app entry honors FFX_BENCH before app initialization" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.{ .interactive = .{} });
     defer capture.deinit();
@@ -922,7 +891,7 @@ test "app entry writes exact resume handoff after interactive teardown" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqualStrings(
-        "Continue session with: fx --resume session-123\n",
+        "Continue session with: ffx --resume session-123\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqual(@as(usize, 1), capture.stdout_calls);
@@ -942,42 +911,12 @@ test "app entry writes exact resume handoff after interactive teardown" {
     });
 }
 
-test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
-    const alloc = std.testing.allocator;
-    var original_action: std.posix.Sigaction = undefined;
-    const test_action: std.posix.Sigaction = .{
-        .handler = .{ .handler = testSigintHandler },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &test_action, &original_action);
-    defer std.posix.sigaction(std.posix.SIG.INT, &original_action, null);
-    test_sigint_count.store(0, .seq_cst);
-
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.resume_handoff_id = "session-123";
-    capture.raise_sigint_during_deinit = true;
-
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try std.testing.expectEqualStrings(
-        "Continue session with: fx --resume session-123\n",
-        capture.stdout.written(),
-    );
-    try std.testing.expectEqual(@as(usize, 0), test_sigint_count.load(.seq_cst));
-
-    _ = std.c.raise(std.posix.SIG.INT);
-    try std.testing.expectEqual(@as(usize, 1), test_sigint_count.load(.seq_cst));
-}
-
 test "app entry relaunches only after teardown with the validated handoff" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.{ .interactive = .{} });
     defer capture.deinit();
     capture.resume_handoff_id = "session-123";
-    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+    capture.upgrade_relaunch_path = "/tmp/ffx-upgraded";
     capture.record_stderr_event = true;
 
     const outcome = try runWithDeps(
@@ -991,7 +930,7 @@ test "app entry relaunches only after teardown with the validated handoff" {
     try std.testing.expectEqual(@as(u8, 1), outcome.exit);
     try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
     try std.testing.expectEqual(@as(usize, 4), capture.replace_arg_count);
-    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("/tmp/ffx-upgraded", capture.replaceArg(0));
     try std.testing.expectEqualStrings("resume", capture.replaceArg(1));
     try std.testing.expectEqualStrings("session-123", capture.replaceArg(2));
     try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(3));
@@ -1003,7 +942,7 @@ test "app entry relaunches only after teardown with the validated handoff" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --resume session-123",
+        "ffx --resume session-123",
     ) != null);
     try expectEvents(&.{
         "init:none",
@@ -1020,35 +959,11 @@ test "app entry relaunches only after teardown with the validated handoff" {
     });
 }
 
-test "app entry carries the previous revision through upgrade relaunch" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.resume_handoff_id = "session-123";
-    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
-    capture.upgrade_previous_revision = "1111111111111111111111111111111111111111";
-
-    _ = try runWithDeps(
-        TestApp,
-        alloc,
-        &.{},
-        testConfig(),
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
-    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(3));
-    try std.testing.expectEqualStrings(
-        "1111111111111111111111111111111111111111",
-        capture.replaceArg(4),
-    );
-}
-
 test "app entry never relaunches without a validated handoff" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.{ .interactive = .{} });
     defer capture.deinit();
-    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+    capture.upgrade_relaunch_path = "/tmp/ffx-upgraded";
 
     const outcome = try runWithDeps(
         TestApp,
@@ -1095,7 +1010,7 @@ test "app entry reports unexpected init errors once and preserves identity" {
     capture.record_stderr_event = true;
 
     try std.testing.expectError(error.TestInitFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestInitFailed\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("ffx: TestInitFailed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try expectEvents(&.{ "init:none", "stderr-attempt" });
 }
@@ -1108,7 +1023,7 @@ test "app entry releases terminal before reporting worker start errors" {
     capture.record_stderr_event = true;
 
     try std.testing.expectError(error.TestWorkerStartFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestWorkerStartFailed\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("ffx: TestWorkerStartFailed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
 }
@@ -1134,7 +1049,7 @@ test "app entry releases terminal before reporting initial context failures exac
         var expected_stderr_buf: [64]u8 = undefined;
         const expected_stderr = try std.fmt.bufPrint(
             &expected_stderr_buf,
-            "fx: {s}\n",
+            "ffx: {s}\n",
             .{@errorName(expected_error)},
         );
         try std.testing.expectEqualStrings(expected_stderr, capture.stderr.written());
@@ -1163,7 +1078,7 @@ test "app entry reports run errors before deinit and outer cleanup" {
     capture.record_stderr_event = true;
 
     try std.testing.expectError(error.TestRunFailed, runWithOuterCleanup(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestRunFailed\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("ffx: TestRunFailed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
@@ -1249,7 +1164,7 @@ test "app entry maps noninteractive terminal startup to exit one" {
     const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
 
     try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqualStrings("fx requires an interactive terminal (TTY).\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("ffx requires an interactive terminal (TTY).\n", capture.stderr.written());
     try expectEvents(&.{"init:none"});
 }
 
@@ -1261,7 +1176,7 @@ test "app entry maps missing saved sessions to exit one" {
     const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
 
     try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqualStrings("fx: no saved sessions for this workspace.\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("ffx: no saved sessions for this workspace.\n", capture.stderr.written());
 }
 
 test "app entry maps unavailable session state to one expected startup failure" {
@@ -1272,23 +1187,23 @@ test "app entry maps unavailable session state to one expected startup failure" 
     }{
         .{
             .init_error = error.SessionBusy,
-            .message = "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
+            .message = "ffx: another Fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
         },
         .{
             .init_error = error.SessionLockUnsupported,
-            .message = "fx: the filesystem cannot provide the required session lock\n",
+            .message = "ffx: the filesystem cannot provide the required session lock\n",
         },
         .{
             .init_error = error.SessionAuthorityBoundaryUnavailable,
-            .message = "fx: this session is being updated; wait a moment and retry\n",
+            .message = "ffx: this session is being updated; wait a moment and retry\n",
         },
         .{
             .init_error = error.SessionCommitBoundaryUnavailable,
-            .message = "fx: this session is being updated; wait a moment and retry\n",
+            .message = "ffx: this session is being updated; wait a moment and retry\n",
         },
         .{
             .init_error = error.OneOffSessionNotResumable,
-            .message = "fx: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
+            .message = "ffx: one-off child sessions cannot accept additional prompts; create a persistent child to continue the conversation\n",
         },
     };
 

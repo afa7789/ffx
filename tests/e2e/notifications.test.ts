@@ -11,11 +11,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FFX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
-  fakeShellRun,
+  fakeGatewayToolCall,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -27,10 +27,10 @@ const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
 function createNotificationRoot(
   notifications = { turn_end: true, attention_required: true },
 ) {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-notifications-")));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-notifications-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  const profile = join(home, ".fx");
+  const profile = join(home, ".ffx");
   mkdirSync(profile, { recursive: true, mode: 0o700 });
   mkdirSync(workspace, { recursive: true });
   chmodSync(profile, 0o700);
@@ -54,17 +54,17 @@ function notificationEnv(
 ) {
   return {
     HOME: home,
-    AI_GATEWAY_API_KEY: "fake-notification-key",
+    FFX_PROVIDER_API_KEY: "fake-notification-key",
     VERCEL_OIDC_TOKEN: undefined,
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: FAKE_GATEWAY_MODEL,
-    FX_AUTO_UPGRADE: "0",
-    // Sound behavior under test: skip the harness-wide FX_SOUND=0 default so
+    FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_MODEL: FAKE_GATEWAY_MODEL,
+    FFX_AUTO_UPGRADE: "0",
+    // Sound behavior under test: skip the harness-wide FFX_SOUND=0 default so
     // the fixture settings and platform default stay authoritative.
-    FX_SOUND: undefined,
-    FX_TRACE_LOG: tracePath,
-    FX_TRACE_SCOPES: "hooks,notifications",
+    FFX_SOUND: undefined,
+    FFX_TRACE_LOG: tracePath,
+    FFX_TRACE_SCOPES: "hooks,notifications",
     NO_COLOR: "1",
   };
 }
@@ -134,12 +134,12 @@ test.skipIf(!tmuxAvailable())(
     ]);
     const tracePath = join(fixture.root, "trace.log");
     const stderrPath = join(fixture.root, "stderr.log");
-    const settingsPath = join(fixture.home, ".fx", "settings.json");
+    const settingsPath = join(fixture.home, ".ffx", "settings.json");
     writeFileSync(stderrPath, "");
     let session: TmuxSession | null = null;
     try {
       session = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: fixture.workspace,
         env: notificationEnv(fixture.home, gateway, tracePath),
         stderrPath,
@@ -187,7 +187,7 @@ test.skipIf(!tmuxAvailable())(
       );
 
       expect(handlerStartCount(trace, "PostTurnEnd")).toBe(1);
-      expect(trace).toContain("handler=fx.sound.turn_end");
+      expect(trace).toContain("handler=ffx.sound.turn_end");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       if (session) await session.kill();
@@ -211,7 +211,7 @@ test.skipIf(!tmuxAvailable())(
     let session: TmuxSession | null = null;
     try {
       session = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: fixture.workspace,
         env: notificationEnv(fixture.home, gateway, tracePath),
         stderrPath,
@@ -225,7 +225,7 @@ test.skipIf(!tmuxAvailable())(
       );
 
       expect(handlerStartCount(trace, "PostTurnEnd")).toBe(1);
-      expect(trace).toContain("handler=fx.sound.turn_end");
+      expect(trace).toContain("handler=ffx.sound.turn_end");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       if (session) await session.kill();
@@ -237,7 +237,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test(
-  "fx ask keeps redirected stdout JSON and stderr byte-clean with notifications enabled",
+  "ffx ask keeps redirected stdout JSON and stderr byte-clean with notifications enabled",
   async () => {
     const fixture = createNotificationRoot();
     const gateway = startFakeGateway([
@@ -271,13 +271,15 @@ test(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "fx ask correlates permission attention and turn-end notifications",
+  "ffx ask correlates permission attention and turn-end notifications",
   async () => {
     const fixture = createNotificationRoot();
     const marker = join(fixture.workspace, "ask-permission-marker.txt");
     const gateway = startFakeGateway([
-      fakeShellRun("ask_permission_1", "touch ask-permission-marker.txt", {
+      fakeGatewayToolCall("ask_permission_1", "terminal", {
+        action: "exec",
         timeout_ms: 600_000,
+        command: "touch ask-permission-marker.txt",
       }),
       fakeGatewayFinalText("NOTIFICATION_ASK_PERMISSION_COMPLETE"),
     ]);
@@ -285,7 +287,7 @@ test.skipIf(!tmuxAvailable())(
     let session: TmuxSession | null = null;
     try {
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} ask --no-save "Try the prepared command."`,
+        cmd: `${FFX_BIN} ask --no-save "Try the prepared command."`,
         cwd: fixture.workspace,
         env: notificationEnv(fixture.home, gateway, tracePath),
         remainOnExit: true,
@@ -327,8 +329,10 @@ test.skipIf(!tmuxAvailable())(
     });
     const marker = join(fixture.workspace, "permission-marker.txt");
     const gateway = startFakeGateway([
-      fakeShellRun("permission_1", "touch permission-marker.txt", {
+      fakeGatewayToolCall("permission_1", "terminal", {
+        action: "exec",
         timeout_ms: 600_000,
+        command: "touch permission-marker.txt",
       }),
       fakeGatewayFinalText("NOTIFICATION_PERMISSION_COMPLETE"),
     ]);
@@ -340,7 +344,7 @@ test.skipIf(!tmuxAvailable())(
     let session: TmuxSession | null = null;
     try {
       session = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: fixture.workspace,
         env: notificationEnv(fixture.home, gateway, tracePath),
         stderrPath,
@@ -355,7 +359,7 @@ test.skipIf(!tmuxAvailable())(
       );
 
       expect(handlerStartCount(waitingTrace, "AttentionRequired")).toBe(1);
-      expect(waitingTrace).toContain("handler=fx.sound.attention_required");
+      expect(waitingTrace).toContain("handler=ffx.sound.attention_required");
       expect(existsSync(marker)).toBe(false);
       await waitForBellCount(paneOutputPath, 1);
       await Bun.sleep(250);

@@ -388,36 +388,13 @@ pub fn getenv(key: []const u8) ?[]const u8 {
 }
 
 pub fn e2eFailIfDurableMutationAttempted() void {
-    const enabled = getenv("FX_E2E_FAIL_ON_DURABLE_MUTATION") orelse return;
+    const enabled = getenv("FFX_E2E_FAIL_ON_DURABLE_MUTATION") orelse return;
     if (!std.mem.eql(u8, enabled, "1")) return;
     std.process.exit(86);
 }
 
 pub fn environMap() ?*const std.process.Environ.Map {
     return global_environ;
-}
-
-pub const CloneEnvironMapError = std.mem.Allocator.Error ||
-    std.process.Environ.CreateMapError ||
-    error{EnvironmentUnavailable};
-
-pub fn cloneEnvironMap(
-    alloc: std.mem.Allocator,
-) CloneEnvironMapError!std.process.Environ.Map {
-    if (global_environ) |map| return map.clone(alloc);
-    if (global_environ_block) |block| {
-        return std.process.Environ.createMap(.{ .block = block }, alloc);
-    }
-    if (global_raw_environ) |raw| {
-        var len: usize = 0;
-        while (raw[len] != null) : (len += 1) {}
-        const entries: []const [*:0]const u8 = @ptrCast(raw[0..len]);
-        var map = std.process.Environ.Map.init(alloc);
-        errdefer map.deinit();
-        try map.putPosixBlock(.{ .slice = entries });
-        return map;
-    }
-    return error.EnvironmentUnavailable;
 }
 
 fn getenvFromBlock(block: std.process.Environ.Block, key: []const u8) ?[]const u8 {
@@ -990,7 +967,7 @@ test "getenv returns null before setEnvironMap" {
     global_environ = null;
     defer global_environ = previous;
 
-    try std.testing.expect(getenv("FX_IO_TEST") == null);
+    try std.testing.expect(getenv("FFX_IO_TEST") == null);
 }
 
 test "getenv returns set value after setEnvironMap" {
@@ -1000,10 +977,10 @@ test "getenv returns set value after setEnvironMap" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    try environ.put("FX_IO_TEST", "present");
+    try environ.put("FFX_IO_TEST", "present");
 
     setEnvironMap(&environ);
-    try std.testing.expectEqualStrings("present", getenv("FX_IO_TEST").?);
+    try std.testing.expectEqualStrings("present", getenv("FFX_IO_TEST").?);
     global_environ = null;
 }
 
@@ -1014,77 +991,12 @@ test "environMap returns borrowed process environment map" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    try environ.put("FX_CORE2_IO_TEST", "present");
+    try environ.put("FFX_CORE2_IO_TEST", "present");
 
     setEnvironMap(&environ);
     const borrowed = environMap().?;
-    try std.testing.expectEqualStrings("present", borrowed.get("FX_CORE2_IO_TEST").?);
+    try std.testing.expectEqualStrings("present", borrowed.get("FFX_CORE2_IO_TEST").?);
     global_environ = null;
-}
-
-test "cloneEnvironMap owns an independent copy of map environment state" {
-    const previous_map = global_environ;
-    const previous_block = global_environ_block;
-    const previous_raw = global_raw_environ;
-    defer {
-        global_environ = previous_map;
-        global_environ_block = previous_block;
-        global_raw_environ = previous_raw;
-    }
-
-    var source = std.process.Environ.Map.init(std.testing.allocator);
-    defer source.deinit();
-    try source.put("PATH", "/map/bin");
-    setEnvironMap(&source);
-
-    var cloned = try cloneEnvironMap(std.testing.allocator);
-    defer cloned.deinit();
-    try source.put("PATH", "/changed");
-    try std.testing.expectEqualStrings("/map/bin", cloned.get("PATH").?);
-}
-
-test "cloneEnvironMap copies installed block environment state" {
-    const previous_map = global_environ;
-    const previous_block = global_environ_block;
-    const previous_raw = global_raw_environ;
-    defer {
-        global_environ = previous_map;
-        global_environ_block = previous_block;
-        global_raw_environ = previous_raw;
-    }
-
-    var source = std.process.Environ.Map.init(std.testing.allocator);
-    defer source.deinit();
-    try source.put("HOME", "/block/home");
-    const block = try source.createPosixBlock(std.testing.allocator, .{});
-    defer block.deinit(std.testing.allocator);
-    setEnvironBlock(block);
-
-    var cloned = try cloneEnvironMap(std.testing.allocator);
-    defer cloned.deinit();
-    try std.testing.expectEqualStrings("/block/home", cloned.get("HOME").?);
-}
-
-test "cloneEnvironMap copies installed raw environment state" {
-    const previous_map = global_environ;
-    const previous_block = global_environ_block;
-    const previous_raw = global_raw_environ;
-    defer {
-        global_environ = previous_map;
-        global_environ_block = previous_block;
-        global_raw_environ = previous_raw;
-    }
-
-    const raw_entries = [_:null]?[*:0]const u8{
-        "PATH=/raw/bin",
-        "HOME=/raw/home",
-    };
-    setRawEnviron(@ptrCast(&raw_entries));
-
-    var cloned = try cloneEnvironMap(std.testing.allocator);
-    defer cloned.deinit();
-    try std.testing.expectEqualStrings("/raw/bin", cloned.get("PATH").?);
-    try std.testing.expectEqualStrings("/raw/home", cloned.get("HOME").?);
 }
 
 test "readFileToEnd: file under cap returns full content" {

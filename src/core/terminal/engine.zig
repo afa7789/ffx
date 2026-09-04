@@ -219,21 +219,6 @@ const SavedScreen = struct {
     }
 };
 
-inline fn failGrid(err: anytype) @TypeOf(err)!Grid {
-    return @errorCast(failGridDynamic(err));
-}
-
-noinline fn failGridDynamic(err: anyerror) anyerror!Grid {
-    return err;
-}
-
-test "grid failures preserve exact error types and identities" {
-    const invalid = failGrid(error.InvalidGridSize);
-    try std.testing.expect(@TypeOf(invalid) == error{InvalidGridSize}!Grid);
-    try std.testing.expectError(error.InvalidGridSize, invalid);
-    try std.testing.expectError(error.OutOfMemory, failGrid(error.OutOfMemory));
-}
-
 pub const Grid = struct {
     alloc: Allocator,
     rows: u16,
@@ -317,14 +302,14 @@ pub const Grid = struct {
     feed_result: ?*FeedResult = null,
 
     pub fn init(alloc: Allocator, cols: u16, rows: u16) !Grid {
-        if (cols == 0 or rows == 0) return failGrid(error.InvalidGridSize);
+        if (cols == 0 or rows == 0) return error.InvalidGridSize;
         const cell_count = std.math.mul(
             usize,
             @intCast(cols),
             @intCast(rows),
-        ) catch return failGrid(error.InvalidGridSize);
+        ) catch return error.InvalidGridSize;
         if (cell_count > contracts.max_render_cells) {
-            return failGrid(error.InvalidGridSize);
+            return error.InvalidGridSize;
         }
         const cells = try alloc.alloc(Cell, cell_count);
         errdefer alloc.free(cells);
@@ -366,7 +351,7 @@ pub const Grid = struct {
     /// Resize the grid. Keeps top-left content, clips anything outside
     /// the new bounds, fills any grown area with blanks. Matches what a
     /// real terminal does when the pane shrinks or grows — content is
-    /// not auto-cleared, so the caller (fx) is responsible for
+    /// not auto-cleared, so the caller (ffx) is responsible for
     /// repainting.
     pub fn resize(self: *Grid, cols: u16, rows: u16) !void {
         if (cols == 0 or rows == 0) return error.InvalidGridSize;
@@ -1521,7 +1506,7 @@ pub const Grid = struct {
 
     /// Produce a blank cell in the current erase-style — space
     /// glyph with default fg/flags but the cursor's active bg.
-    /// Real terminals extend the current bg into erased cells; fx's
+    /// Real terminals extend the current bg into erased cells; ffx's
     /// user-message card relies on that behaviour to draw the bar
     /// without having to pad with literal spaces.
     fn blankCell(self: Grid) Cell {
@@ -1978,19 +1963,19 @@ pub const Grid = struct {
     /// reply effects. Callers replay later journal bytes observationally.
     pub fn restoreCheckpoint(alloc: Allocator, payload: []const u8) !Grid {
         if (payload.len > contracts.max_checkpoint_payload_bytes) {
-            return failGrid(error.CheckpointTooLarge);
+            return error.CheckpointTooLarge;
         }
         var decoder = CheckpointDecoder.init(payload);
         const magic = try decoder.fixed(checkpoint_magic.len);
         if (!std.mem.eql(u8, magic, checkpoint_magic)) {
-            return failGrid(error.InvalidEngineCheckpoint);
+            return error.InvalidEngineCheckpoint;
         }
         if (try decoder.int(u16) != checkpoint_schema_revision) {
-            return failGrid(error.UnsupportedEngineRevision);
+            return error.UnsupportedEngineRevision;
         }
         var grid = try decodeGridState(alloc, &decoder);
         errdefer grid.deinit();
-        if (!decoder.finished()) return failGrid(error.InvalidEngineCheckpoint);
+        if (!decoder.finished()) return error.InvalidEngineCheckpoint;
         try grid.validateCheckpointState();
         return grid;
     }
@@ -2956,6 +2941,100 @@ fn renderColor(color: Color) contracts.CellColor {
     };
 }
 
+/// Paint an immutable engine snapshot as the complete outer terminal
+/// viewport. This deliberately does not add ffx chrome: every visible cell,
+/// cursor fact, and interactive terminal mode comes from the hosted child.
+pub fn writeFullSnapshot(
+    snapshot: contracts.RenderSnapshot,
+    out: *std.Io.Writer,
+) !void {
+    try snapshot.validate();
+    try out.writeAll(
+        "\x1b[?2026h\x1b[?25l\x1b[?6l\x1b[4l\x1b[?7l" ++
+            "\x1b[0m\x1b[H\x1b[2J",
+    );
+
+    var current_style = contracts.CellStyle{};
+    var row: u16 = 0;
+    while (row < snapshot.dimensions.rows) : (row += 1) {
+        try out.print("\x1b[{d};1H", .{row + 1});
+        var column: u16 = 0;
+        while (column < snapshot.dimensions.columns) : (column += 1) {
+            const index = @as(usize, row) * snapshot.dimensions.columns + column;
+            const cell = snapshot.cells[index];
+            if (cell.kind == .continuation) continue;
+            if (!std.meta.eql(current_style, cell.style)) {
+                try emitSnapshotStyle(out, cell.style);
+                current_style = cell.style;
+            }
+            switch (cell.kind) {
+                .blank => try out.writeByte(' '),
+                .single, .wide => try out.writeAll(cell.text),
+                .continuation => unreachable,
+            }
+        }
+    }
+
+    if (!std.meta.eql(current_style, contracts.CellStyle{})) {
+        try out.writeAll("\x1b[0m");
+    }
+    try out.print("\x1b[{d};{d}H", .{
+        snapshot.cursor.row + 1,
+        snapshot.cursor.column + 1,
+    });
+    try writeCursorShape(out, snapshot.cursor);
+    try writeSnapshotModes(out, snapshot.modes);
+    try out.writeAll(if (snapshot.cursor.visible) "\x1b[?25h" else "\x1b[?25l");
+    try out.writeAll("\x1b[?2026l");
+}
+
+fn emitSnapshotStyle(out: *std.Io.Writer, style: contracts.CellStyle) !void {
+    try emitSgrTransition(out, .{
+        .fg = snapshotColor(style.foreground),
+        .bg = snapshotColor(style.background),
+        .flags = .{
+            .bold = style.bold,
+            .dim = style.faint,
+            .italic = style.italic,
+            .underline = style.underline,
+            .reverse = style.inverse,
+            .strike = style.strikethrough,
+        },
+    });
+}
+
+fn snapshotColor(color: contracts.CellColor) Color {
+    return switch (color) {
+        .default => .default,
+        .indexed => |index| .{ .indexed = index },
+        .rgb => |rgb| .{ .rgb = .{ .r = rgb.red, .g = rgb.green, .b = rgb.blue } },
+    };
+}
+
+fn writeCursorShape(out: *std.Io.Writer, cursor: contracts.RenderCursor) !void {
+    const shape: u8 = switch (cursor.shape) {
+        .block => if (cursor.blinking) 1 else 2,
+        .underline => if (cursor.blinking) 3 else 4,
+        .bar => if (cursor.blinking) 5 else 6,
+    };
+    try out.print("\x1b[{d} q", .{shape});
+}
+
+fn writeSnapshotModes(out: *std.Io.Writer, modes: contracts.TerminalModes) !void {
+    try out.writeAll(if (modes.origin) "\x1b[?6h" else "\x1b[?6l");
+    try out.writeAll(if (modes.insert) "\x1b[4h" else "\x1b[4l");
+    try out.writeAll(if (modes.autowrap) "\x1b[?7h" else "\x1b[?7l");
+    try out.writeAll(if (modes.bracketed_paste) "\x1b[?2004h" else "\x1b[?2004l");
+    try out.writeAll(if (modes.mouse_tracking)
+        "\x1b[?1002h\x1b[?1006h"
+    else
+        "\x1b[?1000l\x1b[?1002l\x1b[?1006l");
+    try out.writeAll(if (modes.focus_tracking) "\x1b[?1004h" else "\x1b[?1004l");
+    try out.writeAll(if (modes.application_cursor_keys) "\x1b[?1h" else "\x1b[?1l");
+    try out.writeAll(if (modes.application_keypad) "\x1b=" else "\x1b>");
+    try out.writeAll(if (modes.keyboard_protocol) "\x1b[>1u" else "\x1b[<u");
+}
+
 fn physicalRowIndex(origin: u16, logical_row: u16, rows: u16) usize {
     std.debug.assert(rows > 0);
     std.debug.assert(origin < rows);
@@ -3799,13 +3878,13 @@ test "presentation boundary resumes and steadies strikethrough" {
 test "presentation resume preserves OSC 8 parameters and close clears them" {
     var source = try Grid.init(testing.allocator, 4, 1);
     defer source.deinit();
-    try source.feed("\x1b]8;id=fx-42;https://example.com\x1b\\x");
+    try source.feed("\x1b]8;id=ffx-42;https://example.com\x1b\\x");
 
     var resume_writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer resume_writer.deinit();
     try source.writePresentationResume(&resume_writer.writer);
     try testing.expectEqualStrings(
-        "\x1b]8;id=fx-42;https://example.com\x1b\\",
+        "\x1b]8;id=ffx-42;https://example.com\x1b\\",
         resume_writer.written(),
     );
 
@@ -3826,13 +3905,13 @@ test "OSC 8 parameter replacement is atomic on allocation failure" {
     const alloc = failing.allocator();
     var source = try Grid.init(alloc, 4, 1);
     defer source.deinit();
-    try source.feed("\x1b]8;id=fx-old;https://example.com\x1b\\");
+    try source.feed("\x1b]8;id=ffx-old;https://example.com\x1b\\");
     try source.osc_buffer.ensureTotalCapacity(alloc, 128);
 
     failing.fail_index = failing.alloc_index;
     try testing.expectError(
         error.OutOfMemory,
-        source.feed("\x1b]8;id=fx-new;https://example.com\x1b\\"),
+        source.feed("\x1b]8;id=ffx-new;https://example.com\x1b\\"),
     );
     try testing.expect(source.atControlSequenceBoundary());
 
@@ -3840,19 +3919,19 @@ test "OSC 8 parameter replacement is atomic on allocation failure" {
     var old_resume: std.Io.Writer = .fixed(&old_resume_buf);
     try source.writePresentationResume(&old_resume);
     try testing.expectEqualStrings(
-        "\x1b]8;id=fx-old;https://example.com\x1b\\",
+        "\x1b]8;id=ffx-old;https://example.com\x1b\\",
         old_resume.buffered(),
     );
 
     failing.fail_index = std.math.maxInt(usize);
-    try source.feed("\x1b]8;id=fx-new;https://example.com\x1b\\");
+    try source.feed("\x1b]8;id=ffx-new;https://example.com\x1b\\");
     try testing.expectEqual(@as(usize, 1), source.hyperlink_pool.items.len);
 
     var new_resume_buf: [128]u8 = undefined;
     var new_resume: std.Io.Writer = .fixed(&new_resume_buf);
     try source.writePresentationResume(&new_resume);
     try testing.expectEqualStrings(
-        "\x1b]8;id=fx-new;https://example.com\x1b\\",
+        "\x1b]8;id=ffx-new;https://example.com\x1b\\",
         new_resume.buffered(),
     );
 }
@@ -4446,4 +4525,52 @@ test "bounded deterministic corrupt checkpoint fuzz" {
         ) catch continue;
         restored.deinit();
     }
+}
+
+test "full snapshot painter owns the viewport without Fx chrome" {
+    const cells = [_]contracts.RenderCell{
+        .{ .kind = .single, .text = "A", .style = .{
+            .foreground = .{ .rgb = .{ .red = 1, .green = 2, .blue = 3 } },
+            .bold = true,
+        } },
+        .{ .kind = .blank },
+        .{ .kind = .single, .text = "Z" },
+        .{ .kind = .wide, .text = "界", .style = .{
+            .background = .{ .indexed = 4 },
+        } },
+        .{ .kind = .continuation },
+        .{ .kind = .blank },
+    };
+    const snapshot = contracts.RenderSnapshot{
+        .dimensions = .{ .rows = 2, .columns = 3 },
+        .cursor = .{
+            .row = 1,
+            .column = 1,
+            .shape = .bar,
+            .blinking = false,
+        },
+        .modes = .{
+            .bracketed_paste = true,
+            .mouse_tracking = true,
+            .focus_tracking = true,
+            .application_cursor_keys = true,
+            .application_keypad = true,
+        },
+        .cells = &cells,
+    };
+    var output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
+
+    try writeFullSnapshot(snapshot, &output.writer);
+
+    try testing.expect(std.mem.find(u8, output.written(), "A") != null);
+    try testing.expect(std.mem.find(u8, output.written(), "界") != null);
+    try testing.expect(std.mem.find(u8, output.written(), "Z") != null);
+    try testing.expect(std.mem.find(u8, output.written(), "\x1b[38;2;1;2;3m") != null);
+    try testing.expect(std.mem.find(u8, output.written(), "\x1b[44m") != null);
+    try testing.expect(std.mem.find(u8, output.written(), "\x1b[6 q") != null);
+    try testing.expect(std.mem.find(u8, output.written(), "\x1b[?2004h") != null);
+    try testing.expect(std.mem.find(u8, output.written(), "\x1b[?1004h") != null);
+    try testing.expect(std.mem.find(u8, output.written(), "Subagent") == null);
+    try testing.expect(std.mem.find(u8, output.written(), "Ctrl-") == null);
 }

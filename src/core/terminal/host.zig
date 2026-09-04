@@ -10,26 +10,24 @@ const host_capabilities = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const process_provider_mod = @import(
-    "../execution/process_provider.zig",
+const background_process_provider = @import(
+    "../execution/background_process_provider.zig",
 );
-const process_identity = @import("../execution/process_identity.zig");
+const process_supervisor = @import("../background/process_supervisor.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const internal_mode = "--fx-internal-terminal-host";
+pub const internal_mode = "--ffx-internal-terminal-host";
 pub const endpoint_name = "host.sock";
 pub const lock_name = "host.lock";
 const identity_name = "host.json";
-const host_dir_name = "terminal-host-v7";
+const host_dir_name = "terminal-host";
 const default_idle_grace_ms: u64 = 30_000;
 const identity_max_bytes: usize = 1024;
-// macOS GUI apps commonly inherit 256, below the host's 64-session budget.
-const desired_file_descriptor_limit: u64 = 1024;
 const max_connection_requests: usize = 32;
 const listener_poll_ms = 50;
 const transport_hash_bytes: usize = 16;
-const transport_hash_context = "fx.terminal.transport.v3\x00";
+const transport_hash_context = "ffx.terminal.transport.v1\x00";
 const socket_permissions: std.Io.File.Permissions = switch (builtin.os.tag) {
     .macos, .linux => .fromMode(0o600),
     else => .default_file,
@@ -136,7 +134,7 @@ fn resolveEndpointSelection(
     );
     const runtime_name = try std.fmt.allocPrint(
         alloc,
-        "fx-terminal-{d}-{s}",
+        "ffx-terminal-{d}-{s}",
         .{ uid, digest_hex },
     );
     defer alloc.free(runtime_name);
@@ -160,8 +158,8 @@ fn resolveEndpointSelection(
 }
 
 pub const Config = struct {
-    process_provider: process_provider_mod.Provider =
-        process_provider_mod.unavailable_provider,
+    process_provider: background_process_provider.Provider =
+        background_process_provider.unavailable_provider,
     hello: contracts.ProtocolHello = .{
         .range = contracts.local_protocol_range,
         .capabilities = contracts.known_protocol_capabilities,
@@ -169,19 +167,19 @@ pub const Config = struct {
     idle_grace_ms: u64 = default_idle_grace_ms,
 
     pub fn fromEnvironment(
-        process_provider: process_provider_mod.Provider,
+        process_provider: background_process_provider.Provider,
     ) !Config {
         var config: Config = .{ .process_provider = process_provider };
-        if (io_mod.getenv("FX_TERMINAL_HOST_PROTOCOL_MIN")) |value| {
+        if (io_mod.getenv("FFX_TERMINAL_HOST_PROTOCOL_MIN")) |value| {
             config.hello.range.minimum = try std.fmt.parseInt(u16, value, 10);
         }
-        if (io_mod.getenv("FX_TERMINAL_HOST_PROTOCOL_CURRENT")) |value| {
+        if (io_mod.getenv("FFX_TERMINAL_HOST_PROTOCOL_CURRENT")) |value| {
             config.hello.range.current = try std.fmt.parseInt(u16, value, 10);
         }
-        if (io_mod.getenv("FX_TERMINAL_HOST_PROTOCOL_CAPABILITIES")) |value| {
+        if (io_mod.getenv("FFX_TERMINAL_HOST_PROTOCOL_CAPABILITIES")) |value| {
             config.hello.capabilities = try std.fmt.parseInt(u64, value, 10);
         }
-        if (io_mod.getenv("FX_TERMINAL_HOST_IDLE_MS")) |value| {
+        if (io_mod.getenv("FFX_TERMINAL_HOST_IDLE_MS")) |value| {
             config.idle_grace_ms = try std.fmt.parseInt(u64, value, 10);
         }
         try config.hello.validate();
@@ -379,50 +377,7 @@ const IdentityRecord = struct {
 
 pub fn run(alloc: Allocator, config: Config) !void {
     if (comptime !isSupported()) return error.TerminalHostUnsupported;
-    ensureFileDescriptorBudget();
-    return runSupported(alloc, config) catch |err| {
-        debug_trace.logf(
-            "terminal_host",
-            "host startup failed err={s}",
-            .{@errorName(err)},
-        );
-        return err;
-    };
-}
-
-fn fileDescriptorLimitTarget(current: u64, maximum: u64) ?u64 {
-    const target = @min(maximum, desired_file_descriptor_limit);
-    return if (current < target) target else null;
-}
-
-fn ensureFileDescriptorBudget() void {
-    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return;
-    var limits = std.posix.getrlimit(.NOFILE) catch |err| {
-        debug_trace.logf(
-            "terminal_host",
-            "host file descriptor limit unavailable err={s}",
-            .{@errorName(err)},
-        );
-        return;
-    };
-    const target = fileDescriptorLimitTarget(
-        @intCast(limits.cur),
-        @intCast(limits.max),
-    ) orelse return;
-    limits.cur = @intCast(target);
-    std.posix.setrlimit(.NOFILE, limits) catch |err| {
-        debug_trace.logf(
-            "terminal_host",
-            "host file descriptor limit unchanged target={d} err={s}",
-            .{ target, @errorName(err) },
-        );
-        return;
-    };
-    debug_trace.logf(
-        "terminal_host",
-        "host file descriptor limit raised soft={d}",
-        .{target},
-    );
+    return runSupported(alloc, config);
 }
 
 fn runSupported(alloc: Allocator, config: Config) !void {
@@ -480,85 +435,18 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     var state = HostState{
         .idle_grace_ms = config.idle_grace_ms,
     };
-    var startup = HostStartup{};
-    var accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{
-        alloc,
-        &server,
-        config.process_provider,
-        config.hello,
-        &state,
-        &startup,
-    });
-    var startup_complete = false;
-    var accept_joined = false;
-    errdefer if (!startup_complete) {
-        state.stopping.store(true, .release);
-        startup.ready.set(io_mod.getIo());
-        accept_thread.join();
-        accept_joined = true;
-        if (!drainConnectedClients(&state, client_drain_timeout_ms)) {
-            debug_trace.logf(
-                "terminal_host",
-                "host startup failed with {d} client thread(s) still running; preserving shared state until process exit",
-                .{state.connected_clients.load(.acquire)},
-            );
-            std.process.exit(1);
-        }
-    };
-
-    debug_trace.logf(
-        "terminal_host",
-        "host listening pid={d} protocol={d}-{d}",
-        .{ std.c.getpid(), config.hello.range.minimum, config.hello.range.current },
-    );
-    maybeDelayForTest("FX_TERMINAL_TEST_STARTUP_RECOVERY_DELAY_MS");
-    if (io_mod.getenv("FX_TERMINAL_TEST_STARTUP_RECOVERY_FAILURE") != null) {
-        return error.TerminalHostStartupRecoveryFailed;
-    }
     var persistent_store = try terminal_store.ProfileStore.init(
         alloc,
         home,
         config.process_provider,
     );
-    // Both of these are reached by detached client threads through `state` and
-    // `registry`, so they may only be torn down once those threads are gone.
-    // On a path that exits with clients still live, leaving them allocated is
-    // strictly safer than freeing memory another thread is still reading; the
-    // process is on its way out and the OS reclaims it.
-    var clients_drained = false;
-    defer if (clients_drained) persistent_store.deinit();
+    defer persistent_store.deinit();
     var registry = try native_session.Registry.init(alloc, .{
         .context = &state,
         .update_fn = updateLiveWork,
+        .monitor_update_fn = updateMonitorWork,
     }, &persistent_store, &host_instance, paths.authority_root_path, paths.transport_root_path);
-    defer if (clients_drained) registry.deinit();
-    defer {
-        clients_drained = drainConnectedClients(&state, client_drain_timeout_ms);
-        if (!clients_drained) {
-            debug_trace.logf(
-                "terminal_host",
-                "host exiting immediately with {d} client thread(s) still running; preserving shared state until process exit",
-                .{state.connected_clients.load(.acquire)},
-            );
-            // The registry cannot be freed while detached clients still hold
-            // pointers into this frame. Signal its child processes, then stop
-            // this dedicated host process before returning through the stack or
-            // deinitializing the threaded I/O runtime that those clients use.
-            // The next host startup removes the stale endpoint and identity.
-            registry.shutdownSessionsOnly();
-            std.process.exit(1);
-        }
-    }
-    defer if (!accept_joined) {
-        state.stopping.store(true, .release);
-        state.changed.set(io_mod.getIo());
-        startup.ready.set(io_mod.getIo());
-        accept_thread.join();
-        accept_joined = true;
-    };
-    startup.registry = &registry;
-    startup.ready.set(io_mod.getIo());
-    startup_complete = true;
+    defer registry.deinit();
     var idle_thread = try std.Thread.spawn(.{}, idleOwner, .{&state});
     defer {
         state.stopping.store(true, .release);
@@ -566,15 +454,43 @@ fn runSupported(alloc: Allocator, config: Config) !void {
         idle_thread.join();
     }
 
-    debug_trace.logf("terminal_host", "host recovery ready", .{});
-    accept_thread.join();
-    accept_joined = true;
-    if (startup.accept_failed.load(.acquire)) {
-        return error.HostAcceptFailed;
+    debug_trace.logf(
+        "terminal_host",
+        "host listening pid={d} protocol={d}-{d}",
+        .{ std.c.getpid(), config.hello.range.minimum, config.hello.range.current },
+    );
+
+    while (!state.stopping.load(.acquire)) {
+        if (!try listenerReady(server.socket.handle)) continue;
+        if (state.stopping.load(.acquire)) break;
+        var stream = server.accept(io_mod.getIo()) catch |err| switch (err) {
+            error.SocketNotListening => break,
+            else => return err,
+        };
+        if (state.stopping.load(.acquire)) {
+            stream.close(io_mod.getIo());
+            break;
+        }
+        _ = state.connected_clients.fetchAdd(1, .acq_rel);
+        state.noteChanged();
+        var thread = std.Thread.spawn(.{}, clientMain, .{
+            alloc,
+            stream,
+            config.process_provider,
+            config.hello,
+            &state,
+            &registry,
+        }) catch |err| {
+            stream.close(io_mod.getIo());
+            _ = state.connected_clients.fetchSub(1, .acq_rel);
+            state.noteChanged();
+            return err;
+        };
+        thread.detach();
     }
 
     debug_trace.logf("terminal_host", "host retiring idle=true", .{});
-    maybeDelayForTest("FX_TERMINAL_TEST_IDLE_EXIT_DELAY_MS");
+    maybeDelayForTest("FFX_TERMINAL_TEST_IDLE_EXIT_DELAY_MS");
     identity_created = false;
     cleanupIdentity(&paths.host_dir);
     endpoint_created = false;
@@ -582,16 +498,12 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     debug_trace.logf("terminal_host", "host exited idle=true", .{});
 }
 
-/// How long a fatal host exit waits for client threads before giving up on
-/// freeing the state they share. Long enough for a client mid-request to
-/// finish, short enough that a broken host still exits.
-const client_drain_timeout_ms: u64 = 2_000;
-
 const HostState = struct {
     idle_grace_ms: u64,
     connected_clients: std.atomic.Value(usize) = .init(0),
     pending_requests: std.atomic.Value(usize) = .init(0),
     live_work: std.atomic.Value(usize) = .init(0),
+    monitor_required: std.atomic.Value(usize) = .init(0),
     generation: std.atomic.Value(u64) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     changed: std.Io.Event = .unset,
@@ -605,6 +517,7 @@ const HostState = struct {
             .connected_clients = self.connected_clients.load(.acquire),
             .pending_requests = self.pending_requests.load(.acquire),
             .live_work = self.live_work.load(.acquire),
+            .monitor_required = self.monitor_required.load(.acquire) != 0,
         };
     }
 
@@ -646,78 +559,6 @@ const HostState = struct {
     }
 };
 
-const HostStartup = struct {
-    ready: std.Io.Event = .unset,
-    registry: ?*native_session.Registry = null,
-    accept_failed: std.atomic.Value(bool) = .init(false),
-};
-
-fn acceptLoop(
-    alloc: Allocator,
-    server: *std.Io.net.Server,
-    process_provider: process_provider_mod.Provider,
-    hello: contracts.ProtocolHello,
-    state: *HostState,
-    startup: *HostStartup,
-) void {
-    while (!state.stopping.load(.acquire)) {
-        if (testAcceptFailureRequested()) {
-            startup.accept_failed.store(true, .release);
-            state.stopping.store(true, .release);
-            return;
-        }
-        if (!(listenerReady(server.socket.handle) catch |err| {
-            debug_trace.logf(
-                "terminal_host",
-                "host listener failed err={s}",
-                .{@errorName(err)},
-            );
-            startup.accept_failed.store(true, .release);
-            state.stopping.store(true, .release);
-            return;
-        })) continue;
-        if (state.stopping.load(.acquire)) break;
-        var stream = server.accept(io_mod.getIo()) catch |err| switch (err) {
-            error.SocketNotListening => break,
-            else => {
-                debug_trace.logf(
-                    "terminal_host",
-                    "host accept failed err={s}",
-                    .{@errorName(err)},
-                );
-                startup.accept_failed.store(true, .release);
-                state.stopping.store(true, .release);
-                return;
-            },
-        };
-        if (state.stopping.load(.acquire)) {
-            stream.close(io_mod.getIo());
-            break;
-        }
-        _ = state.connected_clients.fetchAdd(1, .acq_rel);
-        state.noteChanged();
-        var thread = std.Thread.spawn(.{}, clientMain, .{
-            alloc,
-            stream,
-            process_provider,
-            hello,
-            state,
-            startup,
-        }) catch |err| {
-            stream.close(io_mod.getIo());
-            _ = state.connected_clients.fetchSub(1, .acq_rel);
-            state.noteChanged();
-            debug_trace.logf(
-                "terminal_host",
-                "host client thread failed err={s}",
-                .{@errorName(err)},
-            );
-            continue;
-        };
-        thread.detach();
-    }
-}
-
 fn updateLiveWork(raw: ?*anyopaque, live: bool) void {
     const state: *HostState = @ptrCast(@alignCast(raw.?));
     if (live) {
@@ -729,33 +570,15 @@ fn updateLiveWork(raw: ?*anyopaque, live: bool) void {
     state.noteChanged();
 }
 
-/// Waits for every client thread to leave before the host frame that owns their
-/// shared state is destroyed. Client threads are detached and hold pointers to
-/// `HostState` and the session registry, so freeing either while one is still
-/// running is a use-after-free.
-///
-/// Bounded on purpose: a client parked in `readFrame` does not observe `stopping`
-/// until its peer speaks or disconnects, and a fatal host path must not hang
-/// waiting for it. Returns whether the drain completed; the caller keeps the
-/// shared state alive when it did not.
-fn drainConnectedClients(state: *HostState, timeout_ms: u64) bool {
-    state.stopping.store(true, .release);
-    state.noteChanged();
-
-    const poll_ns: u64 = 5 * std.time.ns_per_ms;
-    var waited_ns: u64 = 0;
-    const limit_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch
-        std.math.maxInt(u64);
-    while (true) {
-        if (state.connected_clients.load(.acquire) == 0) return true;
-        if (waited_ns >= limit_ns) return false;
-        std.Io.sleep(
-            io_mod.getIo(),
-            .{ .nanoseconds = @intCast(@min(poll_ns, limit_ns - waited_ns)) },
-            .awake,
-        ) catch return state.connected_clients.load(.acquire) == 0;
-        waited_ns += poll_ns;
+fn updateMonitorWork(raw: ?*anyopaque, required: bool) void {
+    const state: *HostState = @ptrCast(@alignCast(raw.?));
+    if (required) {
+        _ = state.monitor_required.fetchAdd(1, .acq_rel);
+    } else {
+        const previous = state.monitor_required.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
     }
+    state.noteChanged();
 }
 
 fn idleOwner(state: *HostState) void {
@@ -804,10 +627,10 @@ fn listenerReady(handle: std.Io.net.Socket.Handle) !bool {
 fn clientMain(
     alloc: Allocator,
     stream: std.Io.net.Stream,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     host_hello: contracts.ProtocolHello,
     state: *HostState,
-    startup: *HostStartup,
+    registry: *native_session.Registry,
 ) void {
     defer {
         _ = state.connected_clients.fetchSub(1, .acq_rel);
@@ -819,7 +642,7 @@ fn clientMain(
         process_provider,
         host_hello,
         state,
-        startup,
+        registry,
     ) catch |err| {
         debug_trace.logf(
             "terminal_host",
@@ -832,10 +655,10 @@ fn clientMain(
 fn handleClient(
     alloc: Allocator,
     stream: std.Io.net.Stream,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     host_hello: contracts.ProtocolHello,
     state: *HostState,
-    startup: *HostStartup,
+    registry: *native_session.Registry,
 ) !void {
     defer stream.close(io_mod.getIo());
     if (!peerMatchesCurrentUser(stream.socket.handle)) {
@@ -881,8 +704,6 @@ fn handleClient(
         .compatible => |compatible| compatible,
         .incompatible => return,
     };
-    startup.ready.waitUncancelable(io_mod.getIo());
-    const registry = startup.registry orelse return error.TerminalHostStartupFailed;
 
     var connection = Connection{
         .alloc = alloc,
@@ -1252,11 +1073,11 @@ fn testRequestFailureRequested(
     point: []const u8,
     correlation_id: contracts.CorrelationId,
 ) bool {
-    const requested_point = io_mod.getenv("FX_TERMINAL_TEST_HOST_FAILURE_POINT") orelse
+    const requested_point = io_mod.getenv("FFX_TERMINAL_TEST_HOST_FAILURE_POINT") orelse
         return false;
     if (!std.mem.eql(u8, requested_point, point)) return false;
     const requested_correlation = io_mod.getenv(
-        "FX_TERMINAL_TEST_HOST_FAILURE_CORRELATION",
+        "FFX_TERMINAL_TEST_HOST_FAILURE_CORRELATION",
     ) orelse return false;
     const value = std.fmt.parseInt(u64, requested_correlation, 10) catch return false;
     return value == correlation_id.value;
@@ -1273,15 +1094,8 @@ fn maybeDelayForTest(name: []const u8) void {
     io_mod.sleep(delay_ns);
 }
 
-fn testAcceptFailureRequested() bool {
-    const path = io_mod.getenv("FX_TERMINAL_TEST_ACCEPT_FAILURE_PATH") orelse
-        return false;
-    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
-    return true;
-}
-
 fn noteTestOrderedAdmission(correlation_id: contracts.CorrelationId) !void {
-    const prefix = io_mod.getenv("FX_TERMINAL_TEST_ORDER_BARRIER") orelse return;
+    const prefix = io_mod.getenv("FFX_TERMINAL_TEST_ORDER_BARRIER") orelse return;
     var path_buffer: [4096]u8 = undefined;
     const path = try std.fmt.bufPrint(
         &path_buffer,
@@ -1296,12 +1110,12 @@ fn awaitTestOrderedBoundary(
     correlation_id: contracts.CorrelationId,
     cancelled: *const std.atomic.Value(bool),
 ) !void {
-    const prefix = io_mod.getenv("FX_TERMINAL_TEST_ORDER_BARRIER") orelse return;
+    const prefix = io_mod.getenv("FFX_TERMINAL_TEST_ORDER_BARRIER") orelse return;
     const first_target = testCorrelationFromEnvironment(
-        "FX_TERMINAL_TEST_ORDER_HOLD_CORRELATION",
+        "FFX_TERMINAL_TEST_ORDER_HOLD_CORRELATION",
     );
     const second_target = testCorrelationFromEnvironment(
-        "FX_TERMINAL_TEST_ORDER_HOLD_CORRELATION_2",
+        "FFX_TERMINAL_TEST_ORDER_HOLD_CORRELATION_2",
     );
     if ((first_target == null or first_target.? != correlation_id.value) and
         (second_target == null or second_target.? != correlation_id.value))
@@ -1393,7 +1207,7 @@ fn peerMatchesCurrentUser(handle: std.Io.net.Socket.Handle) bool {
 
 fn peerProcessOwner(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     handle: std.Io.net.Socket.Handle,
 ) !contracts.ProcessOwner {
     const pid: std.c.pid_t = if (comptime builtin.os.tag == .macos) blk: {
@@ -1441,7 +1255,7 @@ fn peerProcessOwner(
 
 fn writeIdentity(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     host_dir: *io_mod.VerifiedDir,
     range: contracts.ProtocolRange,
     instance: []const u8,
@@ -1472,7 +1286,7 @@ fn writeIdentity(
 
 pub fn identityEvidence(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     host_dir: *io_mod.VerifiedDir,
 ) policy.IdentityEvidence {
     var file = host_dir.dir.openFile(io_mod.getIo(), identity_name, .{
@@ -1499,7 +1313,7 @@ pub fn identityEvidence(
         .{ .allocate = .alloc_always },
     ) catch return .unverifiable;
     defer parsed.deinit();
-    const token = process_identity.ProcessInstanceToken.parse(
+    const token = process_supervisor.ProcessInstanceToken.parse(
         parsed.value.process_token,
     ) catch return .unverifiable;
     return switch (process_provider.matchToken(
@@ -1557,11 +1371,11 @@ fn verifyEndpointPermissions(host_dir: *io_mod.VerifiedDir) !void {
 }
 
 test "hidden host mode is exact and remains private" {
-    const exact = [_][*:0]const u8{ "fx", internal_mode };
+    const exact = [_][*:0]const u8{ "ffx", internal_mode };
     try std.testing.expect(isInternalModeRaw(&exact));
-    const public_like = [_][*:0]const u8{ "fx", "terminal-host" };
+    const public_like = [_][*:0]const u8{ "ffx", "terminal-host" };
     try std.testing.expect(!isInternalModeRaw(&public_like));
-    const extra = [_][*:0]const u8{ "fx", internal_mode, "extra" };
+    const extra = [_][*:0]const u8{ "ffx", internal_mode, "extra" };
     try std.testing.expect(!isInternalModeRaw(&extra));
 }
 
@@ -1583,44 +1397,38 @@ test "terminal host selection follows canonical platform support" {
     try std.testing.expectEqual(isSupportedForOs(builtin.os.tag), isSupported());
 }
 
-test "terminal host file descriptor target is bounded by the hard limit" {
-    try std.testing.expectEqual(
-        @as(?u64, desired_file_descriptor_limit),
-        fileDescriptorLimitTarget(256, std.math.maxInt(u64)),
-    );
-    try std.testing.expectEqual(
-        @as(?u64, 512),
-        fileDescriptorLimitTarget(256, 512),
-    );
-    try std.testing.expectEqual(
-        @as(?u64, null),
-        fileDescriptorLimitTarget(desired_file_descriptor_limit, 4096),
-    );
-}
-
 test "host identity capture and reconciliation use the injected provider" {
     const Fake = struct {
         captures: usize = 0,
         matches: usize = 0,
-        match_result: process_identity.TokenMatch = .matched,
+        match_result: process_supervisor.TokenMatch = .matched,
 
-        fn provider(self: *@This()) process_provider_mod.Provider {
+        fn provider(self: *@This()) background_process_provider.Provider {
             return .{
                 .context = self,
+                .spawn_prepared_fn = spawnPrepared,
                 .capture_token_fn = captureToken,
                 .match_token_fn = matchToken,
                 .signal_process_fn = signalProcess,
             };
         }
 
+        fn spawnPrepared(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: background_process_provider.SpawnRequest,
+        ) background_process_provider.ProviderError!background_process_provider.PreparedProcess {
+            return error.Unsupported;
+        }
+
         fn captureToken(
             raw: ?*anyopaque,
             _: Allocator,
             _: []const u8,
-        ) process_provider_mod.ProviderError!process_identity.ProcessInstanceToken {
+        ) background_process_provider.ProviderError!process_supervisor.ProcessInstanceToken {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.captures += 1;
-            return process_identity.ProcessInstanceToken.parse(
+            return process_supervisor.ProcessInstanceToken.parse(
                 "macos:00000000000000000000000000000000:1:2",
             ) catch unreachable;
         }
@@ -1629,8 +1437,8 @@ test "host identity capture and reconciliation use the injected provider" {
             raw: ?*anyopaque,
             _: Allocator,
             _: []const u8,
-            _: process_identity.ProcessInstanceToken,
-        ) process_identity.TokenMatch {
+            _: process_supervisor.ProcessInstanceToken,
+        ) process_supervisor.TokenMatch {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.matches += 1;
             return self.match_result;
@@ -1640,8 +1448,8 @@ test "host identity capture and reconciliation use the injected provider" {
             _: ?*anyopaque,
             _: Allocator,
             _: []const u8,
-            _: process_identity.ProcessInstanceToken,
-        ) process_provider_mod.ProviderError!void {
+            _: process_supervisor.ProcessInstanceToken,
+        ) background_process_provider.ProviderError!void {
             return error.Unsupported;
         }
     };
@@ -1689,7 +1497,7 @@ test "host identity capture and reconciliation use the injected provider" {
         error.Unsupported,
         writeIdentity(
             std.testing.allocator,
-            process_provider_mod.unavailable_provider,
+            background_process_provider.unavailable_provider,
             &host_dir,
             contracts.local_protocol_range,
             "test-instance",
@@ -1758,7 +1566,7 @@ test "endpoint selection preserves short homes and deterministically separates l
     try std.testing.expect(std.mem.endsWith(
         u8,
         first.authority_root,
-        "/.fx/terminal-host-v7",
+        "/.ffx/terminal-host",
     ));
     try std.testing.expect(!std.mem.eql(
         u8,
@@ -1867,41 +1675,4 @@ test "runtime transport directories reject symlinks non-private modes and foreig
         error.RuntimeDirectoryUnsafe,
         openVerifiedPrivateRuntimeDir(tmp.dir, "linked", std.c.getuid()),
     );
-}
-
-test "client drain reports success only when every client thread has left" {
-    var state = HostState{ .idle_grace_ms = 0 };
-
-    // No clients: the happy path, and it must not wait.
-    try std.testing.expect(drainConnectedClients(&state, 50));
-    try std.testing.expect(state.stopping.load(.acquire));
-
-    // A client that never leaves: the drain is bounded and reports failure
-    // rather than blocking the host forever on a fatal path.
-    state.stopping.store(false, .release);
-    _ = state.connected_clients.fetchAdd(1, .acq_rel);
-    try std.testing.expect(!drainConnectedClients(&state, 50));
-    try std.testing.expect(state.stopping.load(.acquire));
-
-    // The same client leaving makes the drain succeed.
-    _ = state.connected_clients.fetchSub(1, .acq_rel);
-    try std.testing.expect(drainConnectedClients(&state, 50));
-}
-
-test "a client that leaves during the drain window still drains" {
-    var state = HostState{ .idle_grace_ms = 0 };
-    _ = state.connected_clients.fetchAdd(1, .acq_rel);
-
-    const Departing = struct {
-        fn run(target: *HostState) void {
-            std.Io.sleep(io_mod.getIo(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
-            _ = target.connected_clients.fetchSub(1, .acq_rel);
-            target.noteChanged();
-        }
-    };
-    var thread = try std.Thread.spawn(.{}, Departing.run, .{&state});
-    defer thread.join();
-
-    try std.testing.expect(drainConnectedClients(&state, 2_000));
-    try std.testing.expectEqual(@as(usize, 0), state.connected_clients.load(.acquire));
 }

@@ -2,27 +2,27 @@ import { describe, expect, test } from "bun:test";
 import { buildEvalProcessEnv, shouldLoadDotEnv } from "./eval-helpers";
 
 describe("eval helpers", () => {
-  test("passes the selected eval model to fx through FX_MODEL", () => {
-    const previous = process.env.FX_MODEL;
-    process.env.FX_MODEL = "ambient/model";
+  test("passes the selected eval model to ffx through FFX_MODEL", () => {
+    const previous = process.env.FFX_MODEL;
+    process.env.FFX_MODEL = "ambient/model";
 
     try {
-      const env = buildEvalProcessEnv("/tmp/fx-eval-home-test", "selected/model");
+      const env = buildEvalProcessEnv("/tmp/ffx-eval-home-test", "selected/model");
 
-      expect(env.FX_MODEL).toBe("selected/model");
-      expect(env.HOME).toBe("/tmp/fx-eval-home-test");
+      expect(env.FFX_MODEL).toBe("selected/model");
+      expect(env.HOME).toBe("/tmp/ffx-eval-home-test");
       expect(env.NO_COLOR).toBe("1");
     } finally {
       if (previous === undefined) {
-        delete process.env.FX_MODEL;
+        delete process.env.FFX_MODEL;
       } else {
-        process.env.FX_MODEL = previous;
+        process.env.FFX_MODEL = previous;
       }
     }
   });
 
   test("does not load repository dotenv files in a hermetic run", () => {
-    expect(shouldLoadDotEnv({ FX_E2E_DISABLE_DOTENV: "1" })).toBe(false);
+    expect(shouldLoadDotEnv({ FFX_E2E_DISABLE_DOTENV: "1" })).toBe(false);
     expect(shouldLoadDotEnv({})).toBe(true);
   });
 });

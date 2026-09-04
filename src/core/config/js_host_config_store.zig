@@ -13,14 +13,14 @@ pub const SaveError = error{HostFailure};
 const initial_capacity = 256;
 const max_value_bytes = 16 * 1024;
 
-extern "fx" fn fx_config_get(
+extern "ffx" fn fx_config_get(
     id_ptr: [*]const u8,
     id_len: usize,
     out_ptr: [*]u8,
     out_cap: usize,
 ) i32;
 
-extern "fx" fn fx_config_set(
+extern "ffx" fn fx_config_set(
     id_ptr: [*]const u8,
     id_len: usize,
     value_ptr: [*]const u8,
@@ -54,7 +54,7 @@ pub fn load(alloc: Allocator, id: []const u8) LoadError!?[]u8 {
     return error.ValueTooLarge;
 }
 
-/// Persists a value only after fx has accepted and applied it.
+/// Persists a value only after ffx has accepted and applied it.
 pub fn setAccepted(id: []const u8, value: []const u8) SaveError!void {
     if (fx_config_set(id.ptr, id.len, value.ptr, value.len) != 0) {
         return error.HostFailure;

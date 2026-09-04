@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const mcp_auth = @import("mcp_auth.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
-const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("../auth/secret.zig");
 
@@ -96,26 +95,13 @@ fn nativeKeychainDelete(_: ?*anyopaque, alloc: Allocator) KeychainError!bool {
 fn selectStorageBackend(
     os_tag: std.Target.Os.Tag,
     keychain_disabled: bool,
-    keychain_available: bool,
 ) StorageBackend {
-    if (os_tag == .macos and !keychain_disabled and keychain_available) {
-        return .macos_keychain;
-    }
+    if (os_tag == .macos and !keychain_disabled) return .macos_keychain;
     return .profile_file;
 }
 
-fn storageBackend(
-    alloc: Allocator,
-    cancel_flag: ?*const std.atomic.Value(bool),
-) !StorageBackend {
-    const disabled = native_keychain.isDisabled();
-    const available = if (builtin.os.tag == .macos and !disabled) blk: {
-        break :blk if (cancel_flag) |flag|
-            try native_keychain.userDefaultKeychainAvailableCancellable(alloc, flag)
-        else
-            try native_keychain.userDefaultKeychainAvailable(alloc);
-    } else false;
-    return selectStorageBackend(builtin.os.tag, disabled, available);
+fn storageBackend() StorageBackend {
+    return selectStorageBackend(builtin.os.tag, native_keychain.isDisabled());
 }
 
 fn selectReadDecision(
@@ -136,13 +122,8 @@ pub const Status = enum {
     authenticated,
 };
 
-pub const SaveResult = struct {
-    repaired_entries: usize = 0,
-};
-
 pub const DeleteResult = struct {
     removed: usize = 0,
-    repaired_entries: usize = 0,
     durable: bool = true,
 };
 
@@ -159,7 +140,6 @@ const StoredCredential = struct {
 
 const Store = struct {
     credentials: std.ArrayList(StoredCredential) = .empty,
-    rejected_entries: usize = 0,
 
     fn deinit(self: *Store, alloc: Allocator) void {
         for (self.credentials.items) |*entry| entry.deinit(alloc);
@@ -222,7 +202,7 @@ fn loadControlled(
     configured_issuer: ?[]const u8,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !?mcp_auth.Credentials {
-    const backend = try storageBackend(alloc, cancel_flag);
+    const backend = storageBackend();
     var locked = (try openLockedDirForReadControlled(
         backend,
         cancel_flag,
@@ -286,8 +266,8 @@ pub fn save(
     alloc: Allocator,
     server_identity: []const u8,
     credentials: mcp_auth.Credentials,
-) !SaveResult {
-    const backend = try storageBackend(alloc, null);
+) !void {
+    const backend = storageBackend();
     var locked = try openOrCreateLockedDir();
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
@@ -306,12 +286,11 @@ pub fn save(
         entry.* = replacement;
         transferred = true;
         try writeStore(alloc, &locked.dir, store, backend, native_keychain_backend);
-        return .{ .repaired_entries = store.rejected_entries };
+        return;
     }
     try store.credentials.append(alloc, replacement);
     transferred = true;
     try writeStore(alloc, &locked.dir, store, backend, native_keychain_backend);
-    return .{ .repaired_entries = store.rejected_entries };
 }
 
 pub fn delete(
@@ -319,7 +298,7 @@ pub fn delete(
     server_identity: []const u8,
     endpoint: []const u8,
 ) !DeleteResult {
-    const backend = try storageBackend(alloc, null);
+    const backend = storageBackend();
     var locked = (try openLockedDirForRead(backend)) orelse return .{};
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
@@ -341,16 +320,13 @@ pub fn delete(
         deleted.deinit(alloc);
         removed += 1;
     }
-    if (removed == 0 and store.rejected_entries == 0) return .{};
+    if (removed == 0) return .{};
     if (store.credentials.items.len == 0) {
         try clearStore(alloc, &locked.dir, backend, native_keychain_backend);
     } else {
         try writeStore(alloc, &locked.dir, store, backend, native_keychain_backend);
     }
-    return .{
-        .removed = removed,
-        .repaired_entries = store.rejected_entries,
-    };
+    return .{ .removed = removed };
 }
 
 fn sameIdentity(
@@ -522,13 +498,6 @@ fn loadStoreControlled(
                 keychain,
                 cancel_flag,
             );
-            if (store.rejected_entries > 0) {
-                debug_trace.logf(
-                    "mcp",
-                    "removed unreadable MCP credential entries actor=migration count={d}",
-                    .{store.rejected_entries},
-                );
-            }
             try checkCancellation(cancel_flag);
             try deleteCredentialFile(dir);
             return store;
@@ -588,40 +557,18 @@ fn parseStore(alloc: Allocator, bytes: []const u8) !Store {
     var store: Store = .{};
     errdefer store.deinit(alloc);
     for (values.array.items) |value| {
-        if (value != .object) {
-            store.rejected_entries += 1;
-            continue;
-        }
+        if (value != .object) return error.InvalidMcpCredentialStore;
         const object = value.object;
-        const server_identity = dupeRequiredString(
-            alloc,
-            object,
-            "server_identity",
-        ) catch |err| switch (err) {
-            error.InvalidMcpCredentialStore => {
-                store.rejected_entries += 1;
-                continue;
-            },
-            else => |other| return other,
-        };
-        var credentials = parseCredentials(alloc, object) catch |err| {
-            alloc.free(server_identity);
-            switch (err) {
-                error.InvalidMcpCredentialStore => {
-                    store.rejected_entries += 1;
-                    continue;
-                },
-                else => |other| return other,
-            }
-        };
-        store.credentials.append(alloc, .{
+        const server_identity = try dupeRequiredString(alloc, object, "server_identity");
+        errdefer alloc.free(server_identity);
+        var credentials = try parseCredentials(alloc, object);
+        var credentials_transferred = false;
+        errdefer if (!credentials_transferred) credentials.deinit(alloc);
+        try store.credentials.append(alloc, .{
             .server_identity = server_identity,
             .credentials = credentials,
-        }) catch |err| {
-            alloc.free(server_identity);
-            credentials.deinit(alloc);
-            return err;
-        };
+        });
+        credentials_transferred = true;
     }
     return store;
 }
@@ -644,7 +591,7 @@ fn parseCredentials(
     errdefer secret.zeroAndFree(alloc, access_token);
     const refresh_token = try dupeOptionalString(alloc, object, "refresh_token");
     errdefer if (refresh_token) |value| secret.zeroAndFree(alloc, value);
-    const scope = try dupeStringAllowEmpty(alloc, object, "scope");
+    const scope = try dupeRequiredString(alloc, object, "scope");
     errdefer alloc.free(scope);
     const token_type = try dupeRequiredString(alloc, object, "token_type");
     errdefer alloc.free(token_type);
@@ -668,13 +615,9 @@ fn parseCredentials(
         "revocation_endpoint",
     );
     errdefer if (revocation_endpoint) |value| alloc.free(value);
-    const expires_at_value = object.get("expires_at_ms") orelse
+    const expires_at = object.get("expires_at_ms") orelse
         return error.InvalidMcpCredentialStore;
-    const expires_at_ms: i64 = switch (expires_at_value) {
-        .integer => |value| value,
-        .null => std.math.maxInt(i64),
-        else => return error.InvalidMcpCredentialStore,
-    };
+    if (expires_at != .integer) return error.InvalidMcpCredentialStore;
     return .{
         .endpoint = endpoint,
         .resource = resource,
@@ -686,7 +629,7 @@ fn parseCredentials(
         .scope = scope,
         .token_type = token_type,
         .token_endpoint_auth_method = token_endpoint_auth_method,
-        .expires_at_ms = expires_at_ms,
+        .expires_at_ms = expires_at.integer,
         .authorization_endpoint = authorization_endpoint,
         .token_endpoint = token_endpoint,
         .revocation_endpoint = revocation_endpoint,
@@ -860,16 +803,6 @@ fn dupeRequiredString(
     return alloc.dupe(u8, value.string);
 }
 
-fn dupeStringAllowEmpty(
-    alloc: Allocator,
-    object: std.json.ObjectMap,
-    key: []const u8,
-) ![]u8 {
-    const value = object.get(key) orelse return error.InvalidMcpCredentialStore;
-    if (value != .string) return error.InvalidMcpCredentialStore;
-    return alloc.dupe(u8, value.string);
-}
-
 fn dupeOptionalString(
     alloc: Allocator,
     object: std.json.ObjectMap,
@@ -904,165 +837,29 @@ test "credential store parser keeps distinct server and OAuth identities" {
     );
 }
 
-test "credential store round-trip accepts empty OAuth scope" {
-    const alloc = std.testing.allocator;
-    var credentials = try testCredentials(
-        alloc,
-        "https://mcp.example/no-scope",
-        "empty-scope-secret",
-    );
-    alloc.free(credentials.scope);
-    credentials.scope = try alloc.dupe(u8, "");
-
-    const server_identity = try alloc.dupe(u8, "no-scope");
-    var transferred = false;
-    defer if (!transferred) {
-        alloc.free(server_identity);
-        credentials.deinit(alloc);
-    };
-
-    var source: Store = .{};
-    defer source.deinit(alloc);
-    try source.credentials.append(alloc, .{
-        .server_identity = server_identity,
-        .credentials = credentials,
-    });
-    transferred = true;
-
-    const bytes = try serializeStore(alloc, source);
-    defer secret.zeroAndFree(alloc, bytes);
-    var decoded = try parseStore(alloc, bytes);
-    defer decoded.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), decoded.credentials.items.len);
-    try std.testing.expectEqualStrings(
-        "",
-        decoded.credentials.items[0].credentials.scope,
-    );
-}
-
-test "credential store isolates malformed entries from valid credentials" {
-    const json =
-        \\{"version":1,"credentials":[
-        \\{},
-        \\{"server_identity":"valid","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret","refresh_token":null,"scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":456,"authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
-        \\]}
-    ;
-    var store = try parseStore(std.testing.allocator, json);
-    defer store.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), store.credentials.items.len);
-    try std.testing.expectEqual(@as(usize, 1), store.rejected_entries);
-    try std.testing.expectEqualStrings(
-        "valid",
-        store.credentials.items[0].server_identity,
-    );
-}
-
-test "credential store skips an entry with missing identity fields" {
-    var store = try parseStore(
-        std.testing.allocator,
-        "{\"version\":1,\"credentials\":[{}]}",
-    );
-    defer store.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), store.credentials.items.len);
-    try std.testing.expectEqual(@as(usize, 1), store.rejected_entries);
-}
-
-test "credential store keeps top-level schema version strict" {
+test "credential store rejects missing identity fields" {
     try std.testing.expectError(
         error.InvalidMcpCredentialStore,
-        parseStore(
-            std.testing.allocator,
-            "{\"version\":2,\"credentials\":[]}",
-        ),
-    );
-}
-
-test "credential store loads a null expiry as a non-expiring grant" {
-    const alloc = std.testing.allocator;
-    const json =
-        \\{"version":1,"credentials":[
-        \\{"server_identity":"one","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret-one","refresh_token":"refresh-one","scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":null,"authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
-        \\]}
-    ;
-    var store = try parseStore(alloc, json);
-    defer store.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), store.credentials.items.len);
-    const credentials = store.credentials.items[0].credentials;
-    try std.testing.expectEqual(std.math.maxInt(i64), credentials.expires_at_ms);
-    try std.testing.expect(!credentials.needsRefresh(4_102_444_800_000));
-}
-
-test "credential store rejects a non-integer expiry" {
-    const alloc = std.testing.allocator;
-    const json =
-        \\{"version":1,"credentials":[
-        \\{"server_identity":"one","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret-one","refresh_token":"refresh-one","scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":"soon","authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
-        \\]}
-    ;
-    var store = try parseStore(alloc, json);
-    defer store.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 0), store.credentials.items.len);
-    try std.testing.expectEqual(@as(usize, 1), store.rejected_entries);
-}
-
-test "credential store rejects a missing expiry" {
-    const alloc = std.testing.allocator;
-    const json =
-        \\{"version":1,"credentials":[
-        \\{"server_identity":"one","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret-one","refresh_token":"refresh-one","scope":"read","token_type":"Bearer","token_endpoint_auth_method":"none","authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
-        \\]}
-    ;
-    var store = try parseStore(alloc, json);
-    defer store.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 0), store.credentials.items.len);
-    try std.testing.expectEqual(@as(usize, 1), store.rejected_entries);
-}
-
-fn checkCredentialStoreIsolationAllocationFailures(alloc: Allocator) !void {
-    const json =
-        \\{"version":1,"credentials":[
-        \\{},
-        \\{"server_identity":"valid","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret","refresh_token":null,"scope":"","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":456,"authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
-        \\]}
-    ;
-    var store = try parseStore(alloc, json);
-    defer store.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), store.credentials.items.len);
-    try std.testing.expectEqual(@as(usize, 1), store.rejected_entries);
-}
-
-test "credential store isolation cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkCredentialStoreIsolationAllocationFailures,
-        .{},
+        parseStore(std.testing.allocator, "{\"version\":1,\"credentials\":[{}]}"),
     );
 }
 
 test "credential backend selection is explicit and platform scoped" {
     try std.testing.expectEqual(
         StorageBackend.macos_keychain,
-        selectStorageBackend(.macos, false, true),
+        selectStorageBackend(.macos, false),
     );
     try std.testing.expectEqual(
         StorageBackend.profile_file,
-        selectStorageBackend(.macos, false, false),
+        selectStorageBackend(.macos, true),
     );
     try std.testing.expectEqual(
         StorageBackend.profile_file,
-        selectStorageBackend(.macos, true, true),
+        selectStorageBackend(.linux, false),
     );
     try std.testing.expectEqual(
         StorageBackend.profile_file,
-        selectStorageBackend(.linux, false, true),
-    );
-    try std.testing.expectEqual(
-        StorageBackend.profile_file,
-        selectStorageBackend(.windows, false, true),
+        selectStorageBackend(.windows, false),
     );
 }
 
@@ -1106,7 +903,7 @@ const TestHome = struct {
         };
         errdefer result.map.deinit();
         try result.map.put("HOME", home);
-        try result.map.put("FX_DISABLE_KEYCHAIN", "1");
+        try result.map.put("FFX_DISABLE_KEYCHAIN", "1");
         return result;
     }
 
@@ -1262,7 +1059,7 @@ test "Keychain migration publishes before deleting portable credentials" {
         "migration-secret",
     );
     defer credentials.deinit(alloc);
-    _ = try save(alloc, "server-one", credentials);
+    try save(alloc, "server-one", credentials);
 
     var fake = FakeKeychain{ .alloc = alloc };
     defer fake.deinit();
@@ -1315,7 +1112,7 @@ test "Keychain migration publishes before deleting portable credentials" {
         try std.testing.expect(fake.value == null);
     }
 
-    _ = try save(alloc, "server-one", credentials);
+    try save(alloc, "server-one", credentials);
     fake.fail_store = true;
     {
         var locked = (try openExistingLockedDir()).?;
@@ -1358,62 +1155,6 @@ test "Keychain migration publishes before deleting portable credentials" {
     }
 }
 
-test "Keychain migration sanitizes rejected entries after verified publication" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home");
-    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
-    defer alloc.free(home);
-    var test_home = try TestHome.init(home);
-    defer test_home.deinit();
-    test_home.activate();
-
-    const json =
-        \\{"version":1,"credentials":[
-        \\{},
-        \\{"server_identity":"valid","endpoint":"https://mcp.example/a","resource":"https://mcp.example/","issuer":"https://issuer.example","client_id":"client","client_secret":null,"access_token":"secret","refresh_token":null,"scope":"","token_type":"Bearer","token_endpoint_auth_method":"none","expires_at_ms":456,"authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","revocation_endpoint":null}
-        \\]}
-    ;
-    {
-        var locked = try openOrCreateLockedDir();
-        defer locked.deinit();
-        try io_mod.durableReplaceVerified(
-            alloc,
-            &locked.dir,
-            profile_paths.mcp_credentials_file_name,
-            json,
-        );
-    }
-
-    var fake = FakeKeychain{ .alloc = alloc };
-    defer fake.deinit();
-    var locked = (try openExistingLockedDir()).?;
-    defer locked.deinit();
-    var migrated = try loadStore(
-        alloc,
-        &locked.dir,
-        .macos_keychain,
-        fake.backend(),
-    );
-    defer migrated.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), migrated.rejected_entries);
-    try std.testing.expectEqual(@as(usize, 1), fake.store_calls);
-    try std.testing.expectError(
-        error.FileNotFound,
-        locked.dir.dir.statFile(
-            std.testing.io,
-            profile_paths.mcp_credentials_file_name,
-            .{},
-        ),
-    );
-
-    var published = try parseStore(alloc, fake.value.?);
-    defer published.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), published.credentials.items.len);
-    try std.testing.expectEqual(@as(usize, 0), published.rejected_entries);
-}
-
 test "credential store is private atomic and supports restart deletion" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1431,7 +1172,7 @@ test "credential store is private atomic and supports restart deletion" {
         "access-secret",
     );
     defer credentials.deinit(alloc);
-    _ = try save(alloc, "server-one", credentials);
+    try save(alloc, "server-one", credentials);
 
     var loaded = (try load(
         alloc,
@@ -1443,7 +1184,7 @@ test "credential store is private atomic and supports restart deletion" {
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("access-secret", loaded.access_token);
 
-    var root = try tmp.dir.openDir(std.testing.io, "home/.fx", .{ .iterate = true });
+    var root = try tmp.dir.openDir(std.testing.io, "home/.ffx", .{ .iterate = true });
     defer root.close(std.testing.io);
     const root_stat = try root.stat(std.testing.io);
     try std.testing.expectEqual(
@@ -1484,96 +1225,6 @@ test "credential store is private atomic and supports restart deletion" {
         null,
         null,
     )) == null);
-}
-
-test "credential delete sanitizes a store containing only rejected entries" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home");
-    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
-    defer alloc.free(home);
-    var test_home = try TestHome.init(home);
-    defer test_home.deinit();
-    test_home.activate();
-
-    {
-        var locked = try openOrCreateLockedDir();
-        defer locked.deinit();
-        try io_mod.durableReplaceVerified(
-            alloc,
-            &locked.dir,
-            profile_paths.mcp_credentials_file_name,
-            "{\"version\":1,\"credentials\":[{}]}",
-        );
-    }
-
-    const result = try delete(
-        alloc,
-        "fixture",
-        "https://mcp.example/service",
-    );
-    try std.testing.expectEqual(@as(usize, 0), result.removed);
-    try std.testing.expectEqual(@as(usize, 1), result.repaired_entries);
-
-    var locked = (try openExistingLockedDir()).?;
-    defer locked.deinit();
-    try std.testing.expectError(
-        error.FileNotFound,
-        locked.dir.dir.statFile(
-            std.testing.io,
-            profile_paths.mcp_credentials_file_name,
-            .{},
-        ),
-    );
-}
-
-test "credential save sanitizes rejected entries and reports the repair count" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home");
-    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
-    defer alloc.free(home);
-    var test_home = try TestHome.init(home);
-    defer test_home.deinit();
-    test_home.activate();
-
-    {
-        var locked = try openOrCreateLockedDir();
-        defer locked.deinit();
-        try io_mod.durableReplaceVerified(
-            alloc,
-            &locked.dir,
-            profile_paths.mcp_credentials_file_name,
-            "{\"version\":1,\"credentials\":[{}]}",
-        );
-    }
-
-    var credentials = try testCredentials(
-        alloc,
-        "https://mcp.example/service",
-        "replacement-secret",
-    );
-    defer credentials.deinit(alloc);
-    const result = try save(alloc, "fixture", credentials);
-    try std.testing.expectEqual(@as(usize, 1), result.repaired_entries);
-
-    var locked = (try openExistingLockedDir()).?;
-    defer locked.deinit();
-    var store = try loadStore(
-        alloc,
-        &locked.dir,
-        .profile_file,
-        native_keychain_backend,
-    );
-    defer store.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), store.credentials.items.len);
-    try std.testing.expectEqual(@as(usize, 0), store.rejected_entries);
-    try std.testing.expectEqualStrings(
-        "replacement-secret",
-        store.credentials.items[0].credentials.access_token,
-    );
 }
 
 test "credential load cancellation interrupts a held advisory lock" {
@@ -1677,7 +1328,7 @@ test "credential cancellation interrupts Keychain read and preserves migration s
         "migration-secret",
     );
     defer credentials.deinit(alloc);
-    _ = try save(alloc, "fixture", credentials);
+    try save(alloc, "fixture", credentials);
     {
         var locked = (try openExistingLockedDir()).?;
         defer locked.deinit();
@@ -1725,13 +1376,13 @@ test "credential load refuses an ambiguous discovered issuer identity" {
         "access-one",
     );
     defer first.deinit(alloc);
-    _ = try save(alloc, "server-one", first);
+    try save(alloc, "server-one", first);
 
     var migrated = try first.clone(alloc);
     defer migrated.deinit(alloc);
     alloc.free(migrated.issuer);
     migrated.issuer = try alloc.dupe(u8, "https://issuer-two.example");
-    _ = try save(alloc, "server-one", migrated);
+    try save(alloc, "server-one", migrated);
 
     try std.testing.expect((try load(
         alloc,
@@ -1780,9 +1431,8 @@ test "credential store serializes concurrent writers without dropping identities
                 return;
             };
             defer credentials.deinit(thread_alloc);
-            _ = save(thread_alloc, self.server, credentials) catch |err| {
+            save(thread_alloc, self.server, credentials) catch |err| {
                 self.failure = err;
-                return;
             };
         }
     };

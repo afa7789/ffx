@@ -123,7 +123,12 @@ pub fn collect(
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
     try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{
-        .model = if (detailed.settings.models.get(snapshot.provider)) |model| @constCast(model) else null,
+        .model = switch (snapshot.provider) {
+            .gateway => detailed.settings.model,
+            .codex => detailed.settings.codex_model,
+            .grok => detailed.settings.grok_model,
+            .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => detailed.settings.model,
+        },
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_model, default_agent_step_limit);
@@ -441,7 +446,7 @@ fn recoveryActionForSessionDiagnostic(
         .authority_transition_pending,
         .commit_intent_pending,
         .cleanup_candidate,
-        => "rerun fx doctor after active writers exit; cleanup is guarded",
+        => "rerun ffx doctor after active writers exit; cleanup is guarded",
 
         .canonical_log_large,
         .canonical_log_compaction_overdue,
@@ -462,7 +467,7 @@ fn recoveryActionForSessionDiagnostic(
         .commit_watermark_mismatched,
         => std.fmt.bufPrint(
             buffer,
-            "run fx session recover {s}; it creates a separate resumable copy and leaves the source unchanged",
+            "run ffx session recover {s}; it creates a separate resumable copy and leaves the source unchanged",
             .{session_id},
         ),
 
@@ -471,7 +476,7 @@ fn recoveryActionForSessionDiagnostic(
         .invalid_commit_intent,
         => std.fmt.bufPrint(
             buffer,
-            "back up ~/.fx/sessions, then inspect this session with fx session {s} --json",
+            "back up ~/.ffx/sessions, then inspect this session with ffx session {s} --json",
             .{session_id},
         ),
 
@@ -479,7 +484,7 @@ fn recoveryActionForSessionDiagnostic(
         .invalid_authority,
         .invalid_authority_transition,
         .unsafe_path,
-        => "back up ~/.fx/sessions and avoid opening this session until the path is repaired",
+        => "back up ~/.ffx/sessions and avoid opening this session until the path is repaired",
     };
 }
 
@@ -500,7 +505,7 @@ fn appendGhCheck(checks: *std.ArrayList(Check), alloc: Allocator) !void {
 }
 
 fn resolveModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) !ResolvedModel {
-    if (io_mod.getenv("FX_MODEL")) |model| {
+    if (io_mod.getenv("FFX_MODEL")) |model| {
         const trimmed = std.mem.trim(u8, model, " \t\r\n");
         if (trimmed.len > 0) return .{ .value = trimmed };
     }
@@ -515,7 +520,7 @@ fn resolveModel(alloc: Allocator, default_model: []const u8, configured: ?[]cons
 
 fn resolvePermissionMode(configured: ?types.PermissionMode) !types.PermissionMode {
     const fallback = configured orelse config_runtime.default_permission_mode;
-    const raw = io_mod.getenv("FX_PERMISSION_MODE") orelse return fallback;
+    const raw = io_mod.getenv("FFX_PERMISSION_MODE") orelse return fallback;
     return config_runtime.parsePermissionMode(raw) orelse fallback;
 }
 
@@ -523,7 +528,7 @@ fn resolveAgentStepLimit(fallback: usize, configured: ?usize) !usize {
     return agent_steps.resolveMaxAgentStepsWithOverride(
         configured,
         fallback,
-        io_mod.getenv("FX_MAX_AGENT_STEPS"),
+        io_mod.getenv("FFX_MAX_AGENT_STEPS"),
     );
 }
 
@@ -550,39 +555,16 @@ fn appendMcpConfigCheck(
     alloc: Allocator,
     diagnostic: mcp_contract.ProfileConfigDiagnostic,
 ) !void {
-    switch (diagnostic) {
+    const err = switch (diagnostic) {
         .clear => return,
-        .warning => |warning| {
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
-            try out.writer.print(
-                "~/.fx/mcp.json warning: {s}",
-                .{@tagName(warning.cause)},
-            );
-            if (warning.key()) |key| try out.writer.print(" key={s}", .{key});
-            try out.writer.print(
-                " additional_matches={d}",
-                .{warning.additional_matches},
-            );
-            try appendCheckOwned(
-                checks,
-                alloc,
-                "mcp_config",
-                .warn,
-                try out.toOwnedSlice(),
-            );
-            return;
-        },
-        .failed => |err| {
-            const detail = try std.fmt.allocPrint(
-                alloc,
-                "failed to load ~/.fx/mcp.json: {s}",
-                .{@errorName(err)},
-            );
-            try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
-            return;
-        },
-    }
+        .failed => |value| value,
+    };
+    const detail = try std.fmt.allocPrint(
+        alloc,
+        "failed to load ~/.ffx/mcp.json: {s}",
+        .{@errorName(err)},
+    );
+    try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
 }
 
 fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) ![]u8 {
@@ -594,11 +576,11 @@ fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) 
     if (user_exists) {
         if (!first) try out.writer.writeAll(", ");
         first = false;
-        try out.writer.writeAll("~/.fx/settings.json");
+        try out.writer.writeAll("~/.ffx/settings.json");
     }
     if (repo_exists) {
         if (!first) try out.writer.writeAll(", ");
-        try out.writer.writeAll(".fx.json");
+        try out.writer.writeAll(".ffx.json");
     }
     return try out.toOwnedSlice();
 }
@@ -689,7 +671,7 @@ test "format config presence names existing layers" {
     const detail = try formatConfigPresence(std.testing.allocator, true, false);
     defer std.testing.allocator.free(detail);
 
-    try std.testing.expectEqualStrings("loaded config from ~/.fx/settings.json", detail);
+    try std.testing.expectEqualStrings("loaded config from ~/.ffx/settings.json", detail);
 }
 
 test "MCP config diagnostic maps only failures to one doctor check" {
@@ -712,7 +694,7 @@ test "MCP config diagnostic maps only failures to one doctor check" {
     try std.testing.expectEqualStrings("mcp_config", checks.items[0].name);
     try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
     try std.testing.expectEqualStrings(
-        "failed to load ~/.fx/mcp.json: McpConfigInvalidJson",
+        "failed to load ~/.ffx/mcp.json: McpConfigInvalidJson",
         checks.items[0].detail,
     );
 }
@@ -721,10 +703,10 @@ test "config check handles user and workspace config files together" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeDoctorFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"ask\"}");
-    try writeDoctorFixtureFile(tmp.dir, "workspace/.fx.json", "{\"permission_mode\":\"auto\"}");
+    try writeDoctorFixtureFile(tmp.dir, "home/.ffx/settings.json", "{\"permission_mode\":\"ask\"}");
+    try writeDoctorFixtureFile(tmp.dir, "workspace/.ffx.json", "{\"permission_mode\":\"auto\"}");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -744,18 +726,18 @@ test "config check handles user and workspace config files together" {
 
     try std.testing.expectEqual(@as(usize, 1), checks.items.len);
     try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.fx/settings.json") != null);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".fx.json") != null);
+    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.ffx/settings.json") != null);
+    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".ffx.json") != null);
 }
 
 test "config check does not claim rejected user settings loaded" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeDoctorFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"ask\"}");
-    try writeDoctorFixtureFile(tmp.dir, "workspace/.fx.json", "{\"permission_mode\":\"auto\"}");
+    try writeDoctorFixtureFile(tmp.dir, "home/.ffx/settings.json", "{\"permission_mode\":\"ask\"}");
+    try writeDoctorFixtureFile(tmp.dir, "workspace/.ffx.json", "{\"permission_mode\":\"auto\"}");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -781,8 +763,8 @@ test "config check does not claim rejected user settings loaded" {
 
     try std.testing.expectEqual(@as(usize, 1), checks.items.len);
     try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.fx/settings.json") == null);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".fx.json") != null);
+    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.ffx/settings.json") == null);
+    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".ffx.json") != null);
 }
 
 test "session count check preserves empty and latest details" {
@@ -872,7 +854,7 @@ test "session doctor renders precise watermark and compaction diagnostics" {
     try std.testing.expect(std.mem.find(
         u8,
         checks.items[0].detail,
-        "fx session recover missing-watermark",
+        "ffx session recover missing-watermark",
     ) != null);
     try std.testing.expectEqual(CheckStatus.warn, checks.items[1].status);
     try std.testing.expect(std.mem.find(

@@ -2,7 +2,6 @@ const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_client = @import("client.zig");
-const credential_authority = @import("../core/auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
 const max_error_body_bytes = 1024 * 1024;
@@ -33,66 +32,47 @@ pub const Transport = struct {
 };
 
 pub const ProviderContext = struct {
-    build_fn: *const fn (Allocator, stream_provider.RequestData) anyerror![]u8,
-    endpoint: Endpoint,
+    build_fn: stream_provider.BuildFn,
     transport: Transport,
-};
-
-pub const Endpoint = union(enum) {
-    fixed: []const u8,
-    resolve: *const fn () []const u8,
-
-    fn url(self: Endpoint) []const u8 {
-        return switch (self) {
-            .fixed => |fixed| fixed,
-            .resolve => |resolve| resolve(),
-        };
-    }
 };
 
 pub fn provider(context: *ProviderContext) stream_provider.Provider {
     return .{
         .context = context,
+        .build_fn = build,
         .stream_fn = stream,
-        .build_request_fn = buildRequest,
     };
 }
 
-pub fn initContext(
-    build_fn: *const fn (Allocator, stream_provider.RequestData) anyerror![]u8,
-    endpoint: Endpoint,
-    transport: Transport,
-) ProviderContext {
-    return .{ .build_fn = build_fn, .endpoint = endpoint, .transport = transport };
+pub fn initContext(build_fn: stream_provider.BuildFn, transport: Transport) ProviderContext {
+    return .{ .build_fn = build_fn, .transport = transport };
 }
 
-fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
-    if (deadlineExpired(request.deadline)) return error.Timeout;
+fn build(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.BuildRequest) anyerror![]u8 {
+    const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
+    return context.build_fn(null, alloc, request);
+}
+
+fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) anyerror!stream_provider.Result {
     const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
     const transport = context.transport;
-    const payload = request.prepared_request_body orelse
-        try context.build_fn(alloc, request.data());
-    defer if (request.prepared_request_body == null) alloc.free(payload);
-    const auth = if (request.credential.secret()) |credential|
-        try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential})
-    else
-        null;
-    defer if (auth) |value| alloc.free(value);
+    const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
+    defer alloc.free(auth);
 
     const Header = struct { name: []const u8, value: []const u8 };
     var headers: std.ArrayList(Header) = .empty;
     defer headers.deinit(alloc);
     try headers.appendSlice(alloc, &.{
         .{ .name = "content-type", .value = "application/json" },
-        .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" },
-        .{ .name = "X-Title", .value = "fx" },
+        .{ .name = "authorization", .value = auth },
+        .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/ffx" },
+        .{ .name = "X-Title", .value = "ffx" },
         .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
         .{ .name = "ai-language-model-specification-version", .value = "4" },
         .{ .name = "ai-language-model-id", .value = request.model },
         .{ .name = "ai-language-model-streaming", .value = "true" },
     });
-    if (auth) |value| try headers.append(alloc, .{ .name = "authorization", .value = value });
-    if (request.credential.tenant()) |team| if (team.len > 0) try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
+    if (request.team) |team| if (team.len > 0) try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
     if (request.session_id) |session_id| if (session_id.len > 0) try headers.appendSlice(alloc, &.{
         .{ .name = "x-session-id", .value = session_id },
         .{ .name = "x-session-affinity", .value = session_id },
@@ -102,17 +82,14 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     defer headers_json.deinit();
     try std.json.Stringify.value(headers.items, .{}, &headers_json.writer);
 
-    const endpoint = context.endpoint.url();
-    try request.admission.admit();
     request.delivery.markPossiblySent();
-    const handle = try transport.open("POST", endpoint, headers_json.writer.buffered(), payload);
+    const handle = try transport.open("POST", request.chat_url, headers_json.writer.buffered(), request.payload);
     if (handle < 0) return error.HostStreamFailed;
     defer transport.close(handle);
 
     var status_code: u16 = 0;
     while (true) {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (deadlineExpired(request.deadline)) return error.Timeout;
         const status_result = transport.status(handle, &status_code);
         if (status_result == 1) break;
         if (status_result == -2) return error.Cancelled;
@@ -121,151 +98,40 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     }
 
     const status: std.http.Status = @enumFromInt(status_code);
-    if (status != .ok) return .{ .failed = .{
-        .kind = failureKind(status),
-        .detail = try readBody(
-            alloc,
-            transport,
-            handle,
-            request.cancel_flag,
-            request.deadline,
-            request.cooperative_pulse,
-        ),
+    if (status != .ok) return .{
+        .status = status,
+        .err_body = try readBody(alloc, transport, handle, request.cancel_flag, request.cooperative_pulse),
         .ownership = .owned,
-    } };
+    };
 
     var reader: HostStreamReader = undefined;
-    reader.init(
-        transport,
-        handle,
-        request.cancel_flag,
-        request.deadline,
-        request.cooperative_pulse,
-    );
-    var events = request.events;
+    reader.init(transport, handle, request.cancel_flag, request.cooperative_pulse);
     const completion = gateway_client.consumeGatewaySseStream(
         alloc,
         &reader.interface,
-        &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        EventBridge.reasoning,
+        request.callback_ctx,
+        request.on_content_chunk,
+        request.on_tool_start,
+        request.on_reasoning_chunk,
         request.cancel_flag,
         request.content_capture_limit,
     ) catch |err| switch (err) {
-        error.ReadFailed => return if (reader.timed_out)
-            error.Timeout
-        else if (request.cancel_flag.load(.seq_cst) or reader.aborted)
-            error.Cancelled
-        else
-            error.HostStreamFailed,
+        error.ReadFailed => return if (request.cancel_flag.load(.seq_cst) or reader.aborted) error.Cancelled else error.HostStreamFailed,
         else => return err,
     };
-    return .{ .completed = .{
-        .completion = completion,
-        .usage = gatewayUsageOutcome(request, completion),
-        .ownership = .owned,
-    } };
-}
-
-fn buildRequest(
-    raw: ?*anyopaque,
-    alloc: Allocator,
-    request: stream_provider.RequestData,
-) anyerror![]u8 {
-    const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
-    return context.build_fn(alloc, request);
-}
-
-fn gatewayUsageOutcome(
-    request: stream_provider.ModelRequest,
-    completion: @import("../core/shared/types.zig").ModelCompletion,
-) stream_provider.UsageOutcome {
-    const reference = gatewayUsageReference(request, completion) orelse
-        return .{ .unavailable = .possibly_billed };
-    return if (completion.billing != null)
-        .{ .exact = .gateway }
-    else
-        .{ .deferred = reference };
-}
-
-fn gatewayUsageReference(
-    request: stream_provider.ModelRequest,
-    completion: @import("../core/shared/types.zig").ModelCompletion,
-) ?stream_provider.DeferredUsageReference {
-    const generation_id = completion.generation_id orelse return null;
-    const source = request.credential.credentialSource() orelse return null;
-    return .{
-        .provider = .gateway,
-        .generation_id = generation_id,
-        .scope = gateway_client.generationBaseUrl(),
-        .tenant = request.credential.tenant(),
-        .account_id = request.credential.accountId(),
-        .credential_source = source,
-        .credential_identity = credential_authority.derive(
-            source,
-            request.credential.accountId(),
-        ),
-    };
-}
-
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *stream_provider.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
-    }
-};
-
-fn failureKind(status: std.http.Status) stream_provider.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
+    return .{ .status = .ok, .completion = completion, .ownership = .owned };
 }
 
 fn pulse(value: ?stream_provider.CooperativePulse) !void {
     if (value) |callback| try callback.pulse();
 }
 
-fn deadlineExpired(deadline: ?std.Io.Clock.Timestamp) bool {
-    const value = deadline orelse return false;
-    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-    return !std.Io.Clock.Timestamp.compare(now, .lt, value);
-}
-
-fn readBody(
-    alloc: Allocator,
-    transport: Transport,
-    handle: i32,
-    cancel_flag: *std.atomic.Value(bool),
-    deadline: ?std.Io.Clock.Timestamp,
-    cooperative_pulse: ?stream_provider.CooperativePulse,
-) ![]u8 {
+fn readBody(alloc: Allocator, transport: Transport, handle: i32, cancel_flag: *std.atomic.Value(bool), cooperative_pulse: ?stream_provider.CooperativePulse) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     var chunk: [4096]u8 = undefined;
     while (true) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (deadlineExpired(deadline)) return error.Timeout;
         const count = transport.next(handle, &chunk);
         if (count == -3) {
             try pulse(cooperative_pulse);
@@ -285,27 +151,17 @@ const HostStreamReader = struct {
     transport: Transport = undefined,
     handle: i32 = -1,
     cancel_flag: *std.atomic.Value(bool) = undefined,
-    deadline: ?std.Io.Clock.Timestamp = null,
     cooperative_pulse: ?stream_provider.CooperativePulse = null,
     last_cooperative_pulse: ?std.Io.Clock.Timestamp = null,
     aborted: bool = false,
-    timed_out: bool = false,
     buffer: [16 * 1024]u8 = undefined,
     interface: std.Io.Reader = undefined,
 
-    fn init(
-        self: *@This(),
-        transport: Transport,
-        handle: i32,
-        cancel_flag: *std.atomic.Value(bool),
-        deadline: ?std.Io.Clock.Timestamp,
-        cooperative_pulse: ?stream_provider.CooperativePulse,
-    ) void {
+    fn init(self: *@This(), transport: Transport, handle: i32, cancel_flag: *std.atomic.Value(bool), cooperative_pulse: ?stream_provider.CooperativePulse) void {
         self.* = .{
             .transport = transport,
             .handle = handle,
             .cancel_flag = cancel_flag,
-            .deadline = deadline,
             .cooperative_pulse = cooperative_pulse,
             .last_cooperative_pulse = if (cooperative_pulse != null)
                 std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)
@@ -331,11 +187,6 @@ const HostStreamReader = struct {
         return error.ReadFailed;
     }
 
-    fn abortDeadline(self: *@This()) std.Io.Reader.Error {
-        self.timed_out = true;
-        return error.ReadFailed;
-    }
-
     fn pulseAt(self: *@This(), now: std.Io.Clock.Timestamp) !void {
         if (self.cooperative_pulse == null) return;
         self.last_cooperative_pulse = now;
@@ -353,7 +204,6 @@ const HostStreamReader = struct {
     fn readHost(self: *@This(), dest: []u8) std.Io.Reader.Error!usize {
         while (true) {
             if (self.cancel_flag.load(.seq_cst)) return self.abortRead();
-            if (deadlineExpired(self.deadline)) return self.abortDeadline();
             if (self.cooperative_pulse != null) {
                 self.pulseIfDueAt(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)) catch return error.ReadFailed;
             }
@@ -422,7 +272,7 @@ test "error response bodies are bounded" {
 
     try std.testing.expectError(
         error.HostStreamFailed,
-        readBody(std.testing.allocator, transport, 1, &cancel_flag, null, null),
+        readBody(std.testing.allocator, transport, 1, &cancel_flag, null),
     );
 }
 
@@ -451,37 +301,9 @@ test "host stream reader omits pulse timing state without callback" {
         .status_fn = FakeTransport.status,
         .next_fn = FakeTransport.next,
         .close_fn = FakeTransport.close,
-    }, 1, &cancel_flag, null, null);
+    }, 1, &cancel_flag, null);
 
     try std.testing.expect(reader.last_cooperative_pulse == null);
-}
-
-test "host stream reader stops at its provider deadline" {
-    const FakeTransport = struct {
-        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) anyerror!i32 {
-            return 1;
-        }
-        fn status(_: ?*anyopaque, _: i32, _: *u16) i32 {
-            return 0;
-        }
-        fn next(_: ?*anyopaque, _: i32, _: []u8) i32 {
-            return -3;
-        }
-        fn close(_: ?*anyopaque, _: i32) void {}
-    };
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var reader: HostStreamReader = undefined;
-    reader.init(.{
-        .context = null,
-        .open_fn = FakeTransport.open,
-        .status_fn = FakeTransport.status,
-        .next_fn = FakeTransport.next,
-        .close_fn = FakeTransport.close,
-    }, 1, &cancel_flag, std.Io.Clock.Timestamp.now(std.testing.io, .awake), null);
-    var buffer: [1]u8 = undefined;
-    try std.testing.expectError(error.ReadFailed, reader.readHost(&buffer));
-    try std.testing.expect(reader.timed_out);
 }
 
 test "host stream reader throttles cooperative pulses" {

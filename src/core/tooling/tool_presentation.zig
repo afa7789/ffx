@@ -18,7 +18,6 @@ const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
 const max_run_command_activity_bytes = 120;
 const max_run_command_activity_source_bytes = max_run_command_activity_bytes * max_run_command_activity_bytes;
-pub const max_run_command_reflow_bytes = max_run_command_activity_source_bytes;
 pub const max_auto_permission_reason_presentation_bytes: usize = 160;
 
 pub const ToolActionInput = struct {
@@ -35,15 +34,14 @@ pub const RunCommandActivity = struct {
 };
 
 pub fn isProviderSearchAlias(name: []const u8) bool {
-    return std.mem.eql(u8, name, "exa_search") or
-        std.mem.eql(u8, name, "perplexity_search") or
+    return std.mem.eql(u8, name, "perplexity_search") or
         std.mem.eql(u8, name, "parallel_search");
 }
 
 fn projectRunCommandActivitySource(
     command: []const u8,
     workspace_root_input: []const u8,
-    storage: []u8,
+    storage: *[max_run_command_activity_bytes + 1]u8,
 ) []const u8 {
     const display_command = stripNoopCurrentDirectoryPrefix(command);
     var workspace_root_end = workspace_root_input.len;
@@ -115,20 +113,6 @@ fn workspaceRootMatchesAt(command: []const u8, workspace_root: []const u8, index
     return command[next_index] == '/' or !isPathTokenByte(command[next_index]);
 }
 
-fn containsUnresolvedAbsolutePath(command: []const u8) bool {
-    for (command, 0..) |byte, index| {
-        if (byte != '/' or (index > 0 and isPathTokenByte(command[index - 1]))) continue;
-        const suffix = command[index..];
-        if (std.mem.startsWith(u8, suffix, "/dev/null") and
-            (suffix.len == "/dev/null".len or !isPathTokenByte(suffix["/dev/null".len])))
-        {
-            continue;
-        }
-        return true;
-    }
-    return false;
-}
-
 fn isPathTokenByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or switch (byte) {
         '/', '-', '.', '_', '~' => true,
@@ -149,8 +133,8 @@ pub fn formatRunCommandPermissionLabel(
         command,
         max_run_command_activity_bytes,
     );
-    const suffix = try commandApprovalLabelSuffix(scratch, "shell", command);
-    return std.fmt.allocPrint(alloc, "shell.run {s}{s}", .{ encoded.bytes, suffix });
+    const suffix = try commandApprovalLabelSuffix(scratch, "terminal", command);
+    return std.fmt.allocPrint(alloc, "terminal.exec {s}{s}", .{ encoded.bytes, suffix });
 }
 
 pub fn isAdvertisedDynamicMcpName(registry: tool_dispatch.Registry, name: []const u8, advertised: []const []const u8) bool {
@@ -161,22 +145,7 @@ pub fn isAdvertisedDynamicMcpName(registry: tool_dispatch.Registry, name: []cons
     return false;
 }
 
-/// Returns a borrowed static label when the call is a captured command.
-pub fn runCommandCompletedActionLabel(
-    alloc: Allocator,
-    registry: tool_dispatch.Registry,
-    call: ToolCall,
-) !?[]const u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, call.arguments_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object or !isCapturedCommandCall(registry, call, parsed.value.object)) return null;
-    const command = tool_args.optionalStringArg(parsed.value.object, "command") orelse return null;
-    return if (try tool_dispatch.matchRunCommandCompatibility(registry, command)) |matched|
-        matched.tool.completed_action_label
-    else
-        "Ran";
-}
-
+/// The caller owns `detail` and must free it with `alloc`.
 pub fn formatRunCommandActivity(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
@@ -190,33 +159,13 @@ pub fn formatRunCommandActivity(
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch return null;
     if (!isCapturedCommandCall(registry, call, args)) return null;
     const command = tool_args.optionalStringArg(args, "command") orelse return null;
-    const detail = (try formatRunCommandDetailBounded(
-        alloc,
-        command,
-        workspace_root,
-        max_run_command_activity_bytes,
-    )) orelse return null;
+    var projected_storage: [max_run_command_activity_bytes + 1]u8 = undefined;
+    const projected = projectRunCommandActivitySource(command, workspace_root, &projected_storage);
+    const encoded = try text_utils.encodeTerminalSafe(scratch, projected, max_run_command_activity_bytes);
     return .{
-        .detail = detail,
+        .detail = try alloc.dupe(u8, encoded.bytes),
         .compatibility_tool = if (try tool_dispatch.matchRunCommandCompatibility(registry, command)) |matched| matched.tool else null,
     };
-}
-
-pub fn formatRunCommandDetailBounded(
-    alloc: Allocator,
-    command: []const u8,
-    workspace_root: []const u8,
-    max_encoded_bytes: usize,
-) !?[]u8 {
-    if (max_encoded_bytes == 0) return try alloc.dupe(u8, "");
-    if (workspace_root.len == 0 and containsUnresolvedAbsolutePath(command)) return null;
-
-    const effective_max = @min(max_encoded_bytes, max_run_command_activity_source_bytes - 1);
-    const projected_storage = try alloc.alloc(u8, effective_max + 1);
-    defer alloc.free(projected_storage);
-    const projected = projectRunCommandActivitySource(command, workspace_root, projected_storage);
-    const encoded = try text_utils.encodeTerminalSafe(alloc, projected, effective_max);
-    return encoded.bytes;
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
@@ -376,6 +325,9 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     if (spec.executor_kind == .web_search) {
         return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
     }
+    if (try copyRenameLabel(scratch, call.name, args)) |value| {
+        return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, value });
+    }
     const value = input.display_target orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
@@ -406,6 +358,9 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
             "{s} {s}",
             .{ call.name, spec.label_arg_default },
         );
+    }
+    if (try copyRenameLabel(scratch, call.name, args)) |value| {
+        return std.fmt.allocPrint(alloc, "{s} {s}", .{ call.name, value });
     }
     const value = tool_dispatch.toolLabelValue(spec.*, args) orelse return try alloc.dupe(u8, call.name);
 
@@ -477,8 +432,7 @@ fn appendWebSearchDomains(writer: *std.Io.Writer, label: []const u8, value: ?std
 
 fn commandApprovalLabelSuffix(alloc: Allocator, tool_name: []const u8, command: []const u8) ![]const u8 {
     if (!std.mem.eql(u8, tool_name, "run_command") and
-        !std.mem.eql(u8, tool_name, "terminal") and
-        !std.mem.eql(u8, tool_name, "shell")) return "";
+        !std.mem.eql(u8, tool_name, "terminal")) return "";
     const risk = command_policy.command_risk_note_for(command);
     const safer = command_policy.command_safer_alternative_for(command);
     if (risk == null and safer == null) return "";
@@ -534,6 +488,20 @@ fn isCapturedCommandCall(
     return std.mem.eql(u8, action, expected);
 }
 
+fn copyRenameLabel(alloc: Allocator, tool_name: []const u8, args: std.json.ObjectMap) !?[]const u8 {
+    if (std.mem.eql(u8, tool_name, "copy_file")) {
+        const source = tool_args.optionalStringArg(args, "source") orelse return null;
+        const destination = tool_args.optionalStringArg(args, "destination") orelse return null;
+        return try std.fmt.allocPrint(alloc, "{s} -> {s}", .{ source, destination });
+    }
+    if (std.mem.eql(u8, tool_name, "rename_file")) {
+        const old_path = tool_args.optionalStringArg(args, "old_path") orelse return null;
+        const new_path = tool_args.optionalStringArg(args, "new_path") orelse return null;
+        return try std.fmt.allocPrint(alloc, "{s} -> {s}", .{ old_path, new_path });
+    }
+    return null;
+}
+
 fn matchesTestSkillInstall(command: []const u8) bool {
     return std.mem.startsWith(u8, command, "npx skills add ");
 }
@@ -548,7 +516,7 @@ fn executeTestSkillInstall(
 const test_install_skill = blk: {
     var tool = test_builtin_tools.skill;
     tool.name = "install_skill";
-    tool.model_schema.name = "install_skill";
+    tool.gateway_schema.name = "install_skill";
     tool.executor_kind = .install_skill;
     tool.activity_kind = .write;
     tool.requires_approval = true;
@@ -566,7 +534,7 @@ const test_install_skill = blk: {
 const test_web_search = blk: {
     var tool = test_builtin_tools.read_file;
     tool.name = "web_search";
-    tool.model_schema.name = "web_search";
+    tool.gateway_schema.name = "web_search";
     tool.executor_kind = .web_search;
     tool.action_label = "Searching";
     tool.completed_action_label = "Searched";
@@ -579,15 +547,18 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
+    test_builtin_tools.rename_file,
+    test_builtin_tools.copy_file,
     test_web_search,
-    test_builtin_tools.shell,
+    test_builtin_tools.terminal,
+    test_builtin_tools.memory,
     test_builtin_tools.skill,
     test_install_skill,
     test_builtin_tools.ask_user_question,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_presentation_tool = blk: {
-    var tool = test_builtin_tools.read_file;
+    var tool = test_builtin_tools.memory;
     tool.name = "custom_presentation";
     tool.action_label = "Inspecting";
     tool.label_arg_kind = .name;
@@ -716,52 +687,6 @@ test "run command activity projects line boundaries without changing other bytes
     }
 }
 
-test "run command detail uses the caller bound without changing activity labels" {
-    const alloc = std.testing.allocator;
-    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
-    const arguments_json = try std.fmt.allocPrint(
-        alloc,
-        "{{\"command\":{f}}}",
-        .{std.json.fmt(command, .{})},
-    );
-    defer alloc.free(arguments_json);
-
-    const detail = (try formatRunCommandDetailBounded(
-        alloc,
-        command,
-        "",
-        max_run_command_reflow_bytes,
-    )) orelse return error.TestExpectedEqual;
-    defer alloc.free(detail);
-    try std.testing.expectEqualStrings(command, detail);
-
-    const bounded = (try formatRunCommandDetailBounded(alloc, command, "", 80)) orelse
-        return error.TestExpectedEqual;
-    defer alloc.free(bounded);
-    try std.testing.expect(bounded.len <= 80);
-    try std.testing.expect(std.mem.endsWith(u8, bounded, "..."));
-
-    const activity = (try formatRunCommandActivity(alloc, test_tool_registry, "", .{
-        .id = "bounded_activity",
-        .name = "run_command",
-        .arguments_json = arguments_json,
-    })) orelse return error.TestExpectedEqual;
-    defer alloc.free(activity.detail);
-    try std.testing.expect(activity.detail.len <= max_run_command_activity_bytes);
-    try std.testing.expect(std.mem.endsWith(u8, activity.detail, "..."));
-
-    const hidden_workspace_path = "printf " ++ ("prefix-" ** 20) ++ " /Users/example/workspace/file";
-    try std.testing.expectEqual(
-        @as(?[]u8, null),
-        try formatRunCommandDetailBounded(
-            alloc,
-            hidden_workspace_path,
-            "",
-            max_run_command_reflow_bytes,
-        ),
-    );
-}
-
 test "run command activity abbreviates only active workspace paths" {
     const alloc = std.testing.allocator;
     const workspace_root = "/Users/example/workspace";
@@ -822,7 +747,7 @@ test "run command activity abbreviates only active workspace paths" {
     });
     defer alloc.free(permission);
     try std.testing.expectEqualStrings(
-        "shell.run cd /Users/example/workspace/packages/cli && pwd",
+        "terminal.exec cd /Users/example/workspace/packages/cli && pwd",
         permission,
     );
 }
@@ -861,7 +786,7 @@ test "run command activity hides only a leading no-op current directory prefix" 
         .arguments_json = "{\"command\":\"cd . && zig build\"}",
     });
     defer alloc.free(permission);
-    try std.testing.expectEqualStrings("shell.run cd . && zig build", permission);
+    try std.testing.expectEqualStrings("terminal.exec cd . && zig build", permission);
 }
 
 test "tool presentation formats bounded web search action detail" {
@@ -905,10 +830,10 @@ test "tool presentation formats permission labels" {
     const cwd = try formatPermissionLabel(alloc, test_tool_registry, .{
         .id = "command",
         .name = "run_command",
-        .arguments_json = "{\"command\":\"npm test\",\"cwd\":\"/tmp/fx\"}",
+        .arguments_json = "{\"command\":\"npm test\",\"cwd\":\"/tmp/ffx\"}",
     });
     defer alloc.free(cwd);
-    try std.testing.expectEqualStrings("shell.run npm test", cwd);
+    try std.testing.expectEqualStrings("terminal.exec npm test", cwd);
 
     const risk = try formatPermissionLabel(alloc, test_tool_registry, .{
         .id = "risk",
@@ -929,9 +854,11 @@ test "tool presentation preserves plain action fallbacks" {
         .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/main.zig\"}" }, .expected = "Reading src/main.zig" },
         .{ .call = .{ .id = "command", .name = "run_command", .arguments_json = "{\"command\":\"zig build\"}" }, .expected = "Running zig build" },
         .{ .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" }, .expected = "Asking " },
+        .{ .call = .{ .id = "memory", .name = "memory", .arguments_json = "{\"action\":\"save\"}" }, .expected = "Remembering save" },
         .{ .call = .{ .id = "skill", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" }, .expected = "Loading skill workflow" },
-        .{ .call = .{ .id = "skill-resource", .name = "skill", .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}" }, .expected = "Reading skill resource references/contract-design.md" },
         .{ .call = .{ .id = "install", .name = "install_skill", .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}" }, .expected = "Installing skill vercel-labs/agent-skills" },
+        .{ .call = .{ .id = "copy", .name = "copy_file", .arguments_json = "{\"source\":\"src/a.zig\",\"destination\":\"src/b.zig\"}" }, .expected = "Copying src/a.zig -> src/b.zig" },
+        .{ .call = .{ .id = "rename", .name = "rename_file", .arguments_json = "{\"old_path\":\"src/a.zig\",\"new_path\":\"src/b.zig\"}" }, .expected = "Renaming src/a.zig -> src/b.zig" },
         .{ .call = .{ .id = "unknown", .name = "unknown_tool", .arguments_json = "{}" }, .expected = "Working: unknown_tool" },
     };
 
@@ -962,9 +889,9 @@ test "terminal display target is call-local across a cold inspect projection upd
     );
 
     const inspect_call = ToolCall{
-        .id = "interact",
-        .name = "shell",
-        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"terminal-cold-session\"}",
+        .id = "inspect",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"inspect\",\"session_id\":\"terminal-cold-session\"}",
     };
     var cold_snapshot = try projection.snapshot(alloc);
     const current_target = try resolveTerminalDisplayTargetFromRows(
@@ -997,9 +924,9 @@ test "terminal display target is call-local across a cold inspect projection upd
         test_tool_registry,
         "/tmp/workspace",
         .{
-            .id = "interact-next",
-            .name = "shell",
-            .arguments_json = "{\"action\":\"interact\",\"session_id\":\"terminal-cold-session\"}",
+            .id = "read",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"read\",\"session_id\":\"terminal-cold-session\"}",
         },
         learned_snapshot.rows,
     ) orelse return error.TestExpectedEqual;
@@ -1025,13 +952,24 @@ test "tool presentation frees all formatted output with a normal allocator" {
         .tool_registry = test_tool_registry,
         .call = .{
             .id = "provider_search",
-            .name = "exa_search",
+            .name = "perplexity_search",
             .arguments_json = "{}",
             .provenance = .provider_executed,
         },
     });
     defer alloc.free(provider_search);
     try std.testing.expectEqualStrings("Searching web", provider_search);
+
+    const copy = try formatPlainAction(alloc, .{
+        .tool_registry = test_tool_registry,
+        .call = .{
+            .id = "copy",
+            .name = "copy_file",
+            .arguments_json = "{\"source\":\"src/a.zig\",\"destination\":\"src/b.zig\"}",
+        },
+    });
+    defer alloc.free(copy);
+    try std.testing.expectEqualStrings("Copying src/a.zig -> src/b.zig", copy);
 
     const command = try formatPermissionLabel(alloc, test_tool_registry, .{
         .id = "command",
@@ -1040,6 +978,14 @@ test "tool presentation frees all formatted output with a normal allocator" {
     });
     defer alloc.free(command);
     try expectContains(command, "risk: command may discard version-control state");
+
+    const fallback = try formatPermissionLabel(alloc, test_tool_registry, .{
+        .id = "malformed",
+        .name = "memory",
+        .arguments_json = "{",
+    });
+    defer alloc.free(fallback);
+    try std.testing.expectEqualStrings("memory", fallback);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"query\":\"current Zig release\",\"blocked_domains\":[\"spam.example\"]}", .{});
     defer parsed.deinit();

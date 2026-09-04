@@ -56,7 +56,7 @@ const AssistantContinuation = union(enum) {
 /// Pre-existing hard newlines in `text` are honoured. The returned slice is
 /// owned by the caller and freed with `alloc`.
 pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
-    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, false, null, null);
+    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, false, null);
 }
 
 fn wrapAssistantTextWithBaseGutter(
@@ -67,17 +67,9 @@ fn wrapAssistantTextWithBaseGutter(
     replace_wide_runes_at_one_content_col: bool,
     literal_command: bool,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
-    finalized_prefix_bytes: ?*usize,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    if (finalized_prefix_bytes) |bytes| bytes.* = 0;
-    var finalized_source_end: usize = 0;
-    if (finalized_prefix_bytes != null) {
-        if (std.mem.findScalarLast(u8, text, '\n')) |newline| {
-            finalized_source_end = newline + 1;
-        }
-    }
 
     if (cols == 0) {
         return out.toOwnedSlice(alloc);
@@ -143,9 +135,6 @@ fn wrapAssistantTextWithBaseGutter(
             try out.append(alloc, ch);
             col = base_gutter + 1;
             i += 1;
-            if (finalized_prefix_bytes) |bytes| {
-                if (i == finalized_source_end) bytes.* = out.items.len;
-            }
             continuation = if (literal_command) null else assistantContinuation(text, i);
             word_breaks = .{};
             has_word_on_row = false;
@@ -402,38 +391,7 @@ pub fn wrapTranscriptAssistantTextInterruptible(
         true,
         false,
         checkpoint,
-        null,
     );
-}
-
-/// `bytes` is owned by the caller. `finalized_prefix_bytes` ends after the
-/// last source hard newline and excludes soft wraps from the unfinished line.
-pub const TranscriptAssistantWrap = struct {
-    bytes: []u8,
-    finalized_prefix_bytes: usize,
-};
-
-pub fn wrapTranscriptAssistantTextWithFinalityInterruptible(
-    alloc: Allocator,
-    text: []const u8,
-    cols: u16,
-    checkpoint: ?*build_checkpoint.BuildCheckpoint,
-) !TranscriptAssistantWrap {
-    var finalized_prefix_bytes: usize = 0;
-    const bytes = try wrapAssistantTextWithBaseGutter(
-        alloc,
-        text,
-        cols,
-        gutterWidth(cols),
-        true,
-        false,
-        checkpoint,
-        &finalized_prefix_bytes,
-    );
-    return .{
-        .bytes = bytes,
-        .finalized_prefix_bytes = finalized_prefix_bytes,
-    };
 }
 
 /// Reflow canonical command output as literal terminal text. Every physical
@@ -454,7 +412,6 @@ pub fn wrapLiteralCommandOutput(
         gutter,
         true,
         true,
-        null,
         null,
     );
 }
@@ -487,7 +444,6 @@ pub fn wrapLiteralToolOutputInterruptible(
         true,
         true,
         checkpoint,
-        null,
     );
 }
 
@@ -1119,12 +1075,12 @@ test "wrapAssistantText preserves heading underline across wrap boundary" {
 test "wrapAssistantText preserves an underlined OSC 8 link across a wrap" {
     const alloc = std.testing.allocator;
     const input =
-        "\x1b]8;id=fx-1;https://example.com\x1b\\\x1b[4mabcdef\x1b[24m\x1b]8;;\x1b\\ tail";
+        "\x1b]8;id=ffx-1;https://example.com\x1b\\\x1b[4mabcdef\x1b[24m\x1b]8;;\x1b\\ tail";
     const out = try wrapAssistantText(alloc, input, 3);
     defer alloc.free(out);
     try std.testing.expectEqualStrings(
-        "\x1b]8;id=fx-1;https://example.com\x1b\\\x1b[4mabc\x1b[0m\x1b]8;;\x1b\\\n" ++
-            "\x1b[4m\x1b]8;id=fx-1;https://example.com\x1b\\def\x1b[24m\x1b]8;;\x1b\\\ntai\nl",
+        "\x1b]8;id=ffx-1;https://example.com\x1b\\\x1b[4mabc\x1b[0m\x1b]8;;\x1b\\\n" ++
+            "\x1b[4m\x1b]8;id=ffx-1;https://example.com\x1b\\def\x1b[24m\x1b]8;;\x1b\\\ntai\nl",
         out,
     );
 }
@@ -1132,12 +1088,12 @@ test "wrapAssistantText preserves an underlined OSC 8 link across a wrap" {
 test "wrapAssistantText reopens an OSC 8 link after a word-balanced wrap" {
     const alloc = std.testing.allocator;
     const input =
-        "\x1b]8;id=fx-1;https://example.com\x1b\\\x1b[4malpha beta\x1b[24m\x1b]8;;\x1b\\";
+        "\x1b]8;id=ffx-1;https://example.com\x1b\\\x1b[4malpha beta\x1b[24m\x1b]8;;\x1b\\";
     const out = try wrapAssistantText(alloc, input, 6);
     defer alloc.free(out);
     try std.testing.expectEqualStrings(
-        "\x1b]8;id=fx-1;https://example.com\x1b\\\x1b[4malpha\x1b[0m\x1b]8;;\x1b\\\n" ++
-            "\x1b[4m\x1b]8;id=fx-1;https://example.com\x1b\\beta\x1b[24m\x1b]8;;\x1b\\",
+        "\x1b]8;id=ffx-1;https://example.com\x1b\\\x1b[4malpha\x1b[0m\x1b]8;;\x1b\\\n" ++
+            "\x1b[4m\x1b]8;id=ffx-1;https://example.com\x1b\\beta\x1b[24m\x1b]8;;\x1b\\",
         out,
     );
 }
@@ -1359,7 +1315,7 @@ test "wrapAssistantText elides infeasible dim footnote markers at narrow widths"
 
 test "wrapAssistantText reopens a definition link after a wrap" {
     const alloc = std.testing.allocator;
-    const link_open = "\x1b]8;id=fx-definition;https://example.com\x1b\\";
+    const link_open = "\x1b]8;id=ffx-definition;https://example.com\x1b\\";
     const link_close = "\x1b]8;;\x1b\\";
     const input =
         "\x1b[2m  \x1b[22m" ++

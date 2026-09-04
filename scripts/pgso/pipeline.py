@@ -41,10 +41,6 @@ BENCHMARK_USE_FLAGS = (
     "-passes=default<O2>,mergefunc,iroutliner",
 )
 
-FX_MACHINE_OUTLINER_FLAGS = (
-    "-machine-outliner-reruns=1",
-)
-
 CANDIDATE_SIGNING_PAGE_SIZE = 16 * 1024
 
 PROFILE_SECTION_ALIGNMENTS = (
@@ -60,7 +56,7 @@ PROFILE_SECTIONS = (
 )
 
 ARTIFACT_LAYOUTS = {
-    "fx": (None, "fx", "fx.bc"),
+    "ffx": (None, "ffx", "ffx.bc"),
     "file_index": ("bench-file-index", "file-index-bench", "file-index.bc"),
     "ui_activity": (
         "bench-ui-activity",
@@ -81,7 +77,7 @@ class ArtifactSpec:
     target: str = SUPPORTED_TARGET
     optimize: str = "ReleaseSafe"
     update_channel: str = "stable"
-    selector: str = "fx"
+    selector: str = "ffx"
 
     def __post_init__(self) -> None:
         if self.target != SUPPORTED_TARGET:
@@ -132,7 +128,7 @@ class PipelinePaths:
         cls,
         root: pathlib.Path,
         *,
-        selector: str = "fx",
+        selector: str = "ffx",
     ) -> "PipelinePaths":
         return cls._initialize(root, selector=selector, require_empty=True)
 
@@ -141,7 +137,7 @@ class PipelinePaths:
         cls,
         root: pathlib.Path,
         *,
-        selector: str = "fx",
+        selector: str = "ffx",
     ) -> "PipelinePaths":
         root = root.resolve()
         if not root.is_dir():
@@ -253,9 +249,9 @@ def _runtime_environment(paths: PipelinePaths) -> dict[str, str]:
     environment = hermetic_environment(paths.runtime_home)
     environment.update(
         {
-            "FX_AUTO_UPGRADE": "0",
-            "FX_SKIP_ONBOARDING": "1",
-            "FX_SOUND": "0",
+            "FFX_AUTO_UPGRADE": "0",
+            "FFX_SKIP_ONBOARDING": "1",
+            "FFX_SOUND": "0",
             "HOME": str(paths.runtime_home),
             "NO_COLOR": "1",
         }
@@ -316,7 +312,7 @@ def profile_use_argv(
     profile_path: pathlib.Path | None = None,
 ) -> tuple[str, ...]:
     profile = profile_path or paths.merged_profile
-    flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
+    flags = USE_FLAGS if paths.selector == "ffx" else BENCHMARK_USE_FLAGS
     return (
         str(toolchain.opt),
         *flags,
@@ -374,24 +370,6 @@ def candidate_link_argv(
         "-o",
         str(paths.candidate_binary),
         "-lc",
-    )
-
-
-def candidate_object_argv(
-    toolchain: Toolchain,
-    paths: PipelinePaths,
-) -> tuple[str, ...]:
-    # A second AArch64 outliner pass can fold sequences exposed by the first.
-    # Keep benchmark artifacts on their established code-generation contract.
-    outliner_flags = FX_MACHINE_OUTLINER_FLAGS if paths.selector == "fx" else ()
-    return (
-        str(toolchain.llc),
-        "-filetype=obj",
-        "-O=2",
-        *outliner_flags,
-        str(paths.profile_use_bitcode),
-        "-o",
-        str(paths.profile_use_object),
     )
 
 
@@ -799,7 +777,14 @@ def link_candidate(
         verify_release_safe_ir(paths.profile_use_ir)
 
     run_checked(
-        candidate_object_argv(toolchain, paths),
+        (
+            str(toolchain.llc),
+            "-filetype=obj",
+            "-O=2",
+            str(paths.profile_use_bitcode),
+            "-o",
+            str(paths.profile_use_object),
+        ),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,

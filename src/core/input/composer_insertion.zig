@@ -184,7 +184,7 @@ pub const State = struct {
 
     fn reconcilePickerAfterEdit(self: State) void {
         self.picker.reconcileInlinePickerAfterEdit(self.edit);
-        self.picker.resetActiveCompletionIndex();
+        self.picker.resetActiveModelPickerIndex();
     }
 };
 

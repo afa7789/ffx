@@ -44,7 +44,7 @@ pub const State = struct {
         self.picker.clearModelPickerFlow();
         self.entities.discardPendingAutoSeparator();
         self.picker.reconcileInlinePickerAfterEdit(self.edit);
-        self.picker.resetActiveCompletionIndex();
+        self.picker.resetActiveModelPickerIndex();
         self.picker.resetFilePickerIndex();
         self.history.commit(alloc, &prepared);
         return true;

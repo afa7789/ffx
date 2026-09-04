@@ -12,19 +12,8 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-export const FX_BIN = resolve(import.meta.dirname, "../../zig-out/bin/fx");
+export const FFX_BIN = resolve(import.meta.dirname, "../../zig-out/bin/ffx");
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
-
-export function providerVersionTestEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
-  const result = { ...env };
-  if (env.FX_E2E_OPENAI_CODEX_MODELS_URL && !env.FX_E2E_CODEX_VERSION_URL && !env.FX_E2E_CODEX_CLIENT_VERSION) {
-    result.FX_E2E_CODEX_CLIENT_VERSION = "0.153.0";
-  }
-  if ((env.FX_E2E_XAI_GROK_MODELS_URL || env.FX_E2E_XAI_GROK_RESPONSES_URL) && !env.FX_E2E_GROK_VERSION_URL && !env.FX_E2E_GROK_CLIENT_VERSION) {
-    result.FX_E2E_GROK_CLIENT_VERSION = "1.0.6";
-  }
-  return result;
-}
 
 export const EVAL_MODELS = [
   "anthropic/claude-sonnet-4.6",
@@ -61,7 +50,7 @@ function loadDotEnv(): Record<string, string> {
 export function shouldLoadDotEnv(
   environment: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  return environment.FX_E2E_DISABLE_DOTENV !== "1";
+  return environment.FFX_E2E_DISABLE_DOTENV !== "1";
 }
 
 const dotEnvVars = shouldLoadDotEnv() ? loadDotEnv() : {};
@@ -110,9 +99,9 @@ export interface EvalOptions {
   setup?: (dir: string) => Promise<void>;
 }
 
-const PREFIX = "fx-eval-";
-const HOME_PREFIX = "fx-eval-home-";
-const TEST_HOME_PREFIX = "fx-test-home-";
+const PREFIX = "ffx-eval-";
+const HOME_PREFIX = "ffx-eval-home-";
+const TEST_HOME_PREFIX = "ffx-test-home-";
 
 export function createWorkDir(): string {
   return mkdtempSync(join(tmpdir(), PREFIX));
@@ -134,15 +123,19 @@ export function cleanupIsolatedTestHome(home: string): void {
 
 function createEvalHome(): string {
   const home = mkdtempSync(join(tmpdir(), HOME_PREFIX));
-  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({
       permission_mode: "auto",
       permission: {
         bash: "allow",
+        copy_file: "allow",
+        create_folder: "allow",
+        delete_file: "allow",
         edit: "allow",
         read: "allow",
+        rename_file: "allow",
       },
     }) + "\n",
     { mode: 0o600 },
@@ -164,7 +157,7 @@ export function buildEvalProcessEnv(
     NO_COLOR: "1",
     HOME: home,
     PATH: process.env.PATH ?? "",
-    FX_MODEL: model,
+    FFX_MODEL: model,
   };
 }
 
@@ -182,9 +175,9 @@ export async function runEval(
       await setup(workDir);
     }
 
-    if (!existsSync(FX_BIN)) {
+    if (!existsSync(FFX_BIN)) {
       throw new Error(
-        `fx binary not found at ${FX_BIN}. Run 'zig build' first.`,
+        `ffx binary not found at ${FFX_BIN}. Run 'zig build' first.`,
       );
     }
 
@@ -204,7 +197,7 @@ export async function runEval(
       code: number | null;
     }>((resolvePromise) => {
       const env = buildEvalProcessEnv(home, model);
-      const child = nodeSpawn(FX_BIN, args, {
+      const child = nodeSpawn(FFX_BIN, args, {
         env,
         cwd: workDir,
         stdio: ["pipe", "pipe", "pipe"],
@@ -230,7 +223,7 @@ export async function runEval(
       json = JSON.parse(result.stdout.trim());
     } catch {
       throw new Error(
-        `Failed to parse fx JSON output.\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+        `Failed to parse ffx JSON output.\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
       );
     }
 
@@ -252,7 +245,7 @@ export async function runEval(
 
     if (json.error) {
       throw new Error(
-        `fx returned error: ${json.error}\nstderr: ${result.stderr.slice(-1000)}`,
+        `ffx returned error: ${json.error}\nstderr: ${result.stderr.slice(-1000)}`,
       );
     }
 
@@ -413,7 +406,7 @@ export function assertNoTerminalExecMatches(
 function recordedTerminalExecCommands(result: EvalResult): string[] {
   const commands = new Set<string>();
   for (const tc of result.json.tool_calls ?? []) {
-    if (tc.name !== "shell") continue;
+    if (tc.name !== "terminal") continue;
     const command = tc.command_result?.command;
     if (command) commands.add(command);
   }
@@ -429,11 +422,11 @@ export function assertFirstTerminalExecMatches(
   pattern: RegExp,
 ): void {
   const first = result.json.tool_calls?.[0];
-  expect(first?.name).toBe("shell");
+  expect(first?.name).toBe("terminal");
   expect(pattern.test(first?.command_result?.command ?? "")).toBe(true);
 }
 
-// Generic fx CLI runner for deterministic command coverage.
+// Generic ffx CLI runner for deterministic command coverage.
 
 export interface FxRunResult {
   stdout: string;
@@ -453,7 +446,7 @@ function captureFxProcessState(): string {
     return execFileSync("ps", ["-axo", "pid,ppid,stat,etime,command"], {
       encoding: "utf8",
     }).split("\n").filter((line) =>
-      line.includes("/zig-out/bin/fx") ||
+      line.includes("/zig-out/bin/ffx") ||
       line.includes("mcp-modern-") ||
       line.includes("mcp-legacy-") ||
       line.includes("bun test")
@@ -472,8 +465,8 @@ export async function runFx(
     timeoutMs?: number;
   } = {},
 ): Promise<FxRunResult> {
-  if (!existsSync(FX_BIN)) {
-    throw new Error(`fx binary not found at ${FX_BIN}. Run 'zig build' first.`);
+  if (!existsSync(FFX_BIN)) {
+    throw new Error(`ffx binary not found at ${FFX_BIN}. Run 'zig build' first.`);
   }
 
   const { cwd, timeoutMs = 15_000 } = opts;
@@ -493,8 +486,8 @@ export async function runFx(
         env[key] = value;
       }
     }
-    const child = nodeSpawn(FX_BIN, args, {
-      env: providerVersionTestEnv(env),
+    const child = nodeSpawn(FFX_BIN, args, {
+      env,
       cwd: cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],
     });

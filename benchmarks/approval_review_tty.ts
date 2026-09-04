@@ -23,9 +23,9 @@ const SEED = "0xf17ed1ff20260805";
 // inline transcript stream used to prepare the session.
 const HISTORY_LINES = 200;
 const DIFF_LINES = (() => {
-  const value = Number(process.env.FX_APPROVAL_PROFILE_DIFF_LINES ?? "50000");
+  const value = Number(process.env.FFX_APPROVAL_PROFILE_DIFF_LINES ?? "50000");
   if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`invalid FX_APPROVAL_PROFILE_DIFF_LINES: ${JSON.stringify(value)}`);
+    throw new Error(`invalid FFX_APPROVAL_PROFILE_DIFF_LINES: ${JSON.stringify(value)}`);
   }
   return value;
 })();
@@ -333,12 +333,12 @@ async function waitForPaneDeath(session: TmuxSession, timeoutMs: number): Promis
     if (status.dead) return status.status;
     await Bun.sleep(25);
   }
-  throw new Error("timed out waiting for fx process exit");
+  throw new Error("timed out waiting for ffx process exit");
 }
 
-const binary = realpathSync(requiredEnv("FX_APPROVAL_PROFILE_BIN"));
-const outRoot = requiredEnv("FX_APPROVAL_PROFILE_OUT");
-const cycles = positiveInteger(process.env.FX_APPROVAL_PROFILE_CYCLES, DEFAULT_CYCLES);
+const binary = realpathSync(requiredEnv("FFX_APPROVAL_PROFILE_BIN"));
+const outRoot = requiredEnv("FFX_APPROVAL_PROFILE_OUT");
+const cycles = positiveInteger(process.env.FFX_APPROVAL_PROFILE_CYCLES, DEFAULT_CYCLES);
 mkdirSync(outRoot, { recursive: true });
 
 const home = join(outRoot, "home");
@@ -349,18 +349,19 @@ const stderrPath = join(outRoot, "approval-review.stderr.log");
 const samplesPath = join(outRoot, "timings.jsonl");
 const resourcesPath = join(outRoot, "resources.jsonl");
 const fixturePath = join(outRoot, "fixture.json");
-mkdirSync(join(home, ".fx"), { recursive: true });
+mkdirSync(join(home, ".ffx"), { recursive: true });
 mkdirSync(workspace, { recursive: true });
 writeFileSync(samplesPath, "");
 writeFileSync(resourcesPath, "");
 writeFileSync(tracePath, "");
 writeFileSync(stderrPath, "");
 writeFileSync(
-  join(home, ".fx", "settings.json"),
+  join(home, ".ffx", "settings.json"),
   JSON.stringify({
     sandbox: "none",
     permission_mode: "ask",
     permission: {},
+    maxxing_mode: "legacy",
     max_agent_steps: cycles * 3 + 20,
     max_tool_result_bytes: 4 * 1024 * 1024,
   }),
@@ -423,16 +424,16 @@ try {
       HOME: home,
       AI_GATEWAY_API_KEY: "fake-approval-profile-key",
       VERCEL_OIDC_TOKEN: undefined,
-      FX_GATEWAY_BASE_URL: gateway.baseUrl,
-      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_MODEL: "openai/gpt-5",
-      FX_PERMISSION_MODE: "ask",
-      FX_AUTO_UPGRADE: "0",
-      FX_RECORD: tapePath,
-      FX_RECORD_INPUT: "1",
-      FX_SYNC_UPDATES: "1",
-      FX_TRACE_LOG: tracePath,
-      FX_TRACE_SCOPES: "permission,input,frame_render,terminal_diff",
+      FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FFX_MODEL: "openai/gpt-5",
+      FFX_PERMISSION_MODE: "ask",
+      FFX_AUTO_UPGRADE: "0",
+      FFX_RECORD: tapePath,
+      FFX_RECORD_INPUT: "1",
+      FFX_SYNC_UPDATES: "1",
+      FFX_TRACE_LOG: tracePath,
+      FFX_TRACE_SCOPES: "permission,input,frame_render,terminal_diff",
       NO_COLOR: "1",
     },
     stderrPath,
@@ -716,7 +717,7 @@ try {
     );
     assert(decisions.length === 1, `${callId} decision count was ${decisions.length}, expected 1`);
   }
-  assert(readFileSync(stderrPath, "utf8") === "", "fx wrote to stderr");
+  assert(readFileSync(stderrPath, "utf8") === "", "ffx wrote to stderr");
   // Escape cancels without a tool-result request. Ctrl-C reports the
   // interrupted tool result once before returning to the composer.
   assert(gateway.requests.length === 1 + cycles * 2 + 3, `unexpected gateway request count ${gateway.requests.length}`);
@@ -732,7 +733,7 @@ try {
     children: 0,
     exit_status: exitStatus,
   });
-  assert(exitStatus === 0, `fx exit status was ${exitStatus}`);
+  assert(exitStatus === 0, `ffx exit status was ${exitStatus}`);
   passed = true;
   console.log(JSON.stringify({
     status: "PASS",

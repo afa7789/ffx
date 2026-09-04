@@ -88,94 +88,22 @@ test "context notice body drops legacy markers from every line" {
 }
 
 pub const CredentialSource = enum {
-    vercel_oidc_token,
-    ai_gateway_api_key,
-    fx_login,
+    /// Credential loaded from an environment variable (FFX_PROVIDER_API_KEY or similar).
+    env_var,
+    /// Credential stored in keychain or settings file.
     stored_key,
-    chatgpt_subscription,
-    grok_subscription,
-    host_managed,
 };
-
-pub const DirectCredentialLease = struct {
-    secret_bytes: []const u8 = "",
-    source: ?CredentialSource = null,
-    account_id: ?[]const u8 = null,
-    tenant_context: ?[]const u8 = null,
-};
-
-/// Borrowed authorization for one provider request. Host-managed requests
-/// cannot carry credential or account bytes into the embedded runtime.
-pub const CredentialLease = union(enum) {
-    direct: DirectCredentialLease,
-    host_managed,
-
-    pub fn secret(self: CredentialLease) ?[]const u8 {
-        return switch (self) {
-            .direct => |direct| if (direct.secret_bytes.len > 0) direct.secret_bytes else null,
-            .host_managed => null,
-        };
-    }
-
-    pub fn credentialSource(self: CredentialLease) ?CredentialSource {
-        return switch (self) {
-            .direct => |direct| direct.source,
-            .host_managed => .host_managed,
-        };
-    }
-
-    pub fn accountId(self: CredentialLease) ?[]const u8 {
-        return switch (self) {
-            .direct => |direct| direct.account_id,
-            .host_managed => null,
-        };
-    }
-
-    pub fn tenant(self: CredentialLease) ?[]const u8 {
-        return switch (self) {
-            .direct => |direct| direct.tenant_context,
-            .host_managed => null,
-        };
-    }
-};
-
-test "host-managed credential lease carries no local authority bytes" {
-    const lease: CredentialLease = .host_managed;
-    try std.testing.expect(lease.secret() == null);
-    try std.testing.expect(lease.accountId() == null);
-    try std.testing.expect(lease.tenant() == null);
-    try std.testing.expectEqual(CredentialSource.host_managed, lease.credentialSource().?);
-}
-
-test "empty direct credential lease preserves absent authority" {
-    const lease = CredentialLease{ .direct = .{} };
-    try std.testing.expect(lease.secret() == null);
-    try std.testing.expect(lease.credentialSource() == null);
-}
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
-    const source = parseRuntimeCredentialSource(text) orelse return null;
-    return if (source == .host_managed) null else source;
-}
-
-pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
     return std.meta.stringToEnum(CredentialSource, text);
 }
 
 test "credential source round trips through its persisted name" {
     for (std.meta.tags(CredentialSource)) |source| {
-        if (source == .host_managed) continue;
         try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
     }
     try std.testing.expect(parseCredentialSource("keychain") == null);
-}
-
-test "host-managed authority is runtime-only and cannot be persisted" {
-    try std.testing.expect(parseCredentialSource("host_managed") == null);
-    try std.testing.expectEqual(
-        CredentialSource.host_managed,
-        parseRuntimeCredentialSource("host_managed").?,
-    );
+    try std.testing.expect(parseCredentialSource("fx_login") == null);
 }
 
 pub const TurnPresentationOutcome = enum {
@@ -243,22 +171,8 @@ pub const ToolLifecycleEvent = union(enum) {
     turn_finished: TurnFinished,
 };
 
-pub const TurnPhase = enum {
-    thinking,
-    generating,
-    running,
-};
-
-pub const TurnPhaseUpdate = struct {
-    turn_id: u64,
-    step_id: u64,
-    phase: TurnPhase,
-};
-
 pub const StreamState = struct {
     active: bool = false,
-    phase: TurnPhase = .thinking,
-    phase_step_id: u64 = 0,
     chunks: usize = 0,
     read_count: usize = 0,
     list_count: usize = 0,
@@ -269,13 +183,22 @@ pub const StreamState = struct {
     subagent_count: usize = 0,
     token_progress: TurnTokenProgress = .{},
     last_activity_kind: ?ToolActivityKind = null,
-    /// When the turn started; 0 hides the elapsed counter and activity blink.
-    /// Monotonic for the whole turn: phase and tool boundaries never reset it.
+    /// When the turn started; 0 hides the Thinking elapsed counter and its
+    /// wall-clock blink. Monotonic for the whole turn: tool boundaries never
+    /// reset it.
     turn_started_ms: i64 = 0,
-    /// When fx started waiting on user input (approval or question); 0 means
-    /// not waiting. While set, the turn clock freezes at this instant;
+    /// When ffx started waiting on user input (approval or question); 0 means
+    /// not waiting. While set, the Thinking clock freezes at this instant;
     /// on resume the wait is excluded by shifting turn_started_ms forward.
     waiting_since_ms: i64 = 0,
+    /// Assistant text reached the transcript in the current stretch: the
+    /// status row stays with the response instead of flipping back to Thinking
+    /// whenever the pacer catches up. A tool start opens the next stretch.
+    assistant_text_started: bool = false,
+    /// The model is streaming tool arguments that open no status row of their
+    /// own, so the turn is producing output the transcript cannot show yet.
+    /// Cleared as soon as assistant text resumes or the tool itself starts.
+    composing_tool_payload: bool = false,
 };
 
 pub const RouteRecoveryUnsafeReason = enum {
@@ -292,7 +215,6 @@ pub const RouteRecoveryStatusTone = enum {
 pub const ModelRecoveryCause = enum {
     network_interrupted,
     response_interrupted,
-    provider_stream_timeout,
     provider_unavailable,
     rate_limited,
     system_resumed,
@@ -327,7 +249,6 @@ pub const ModelFailureDiagnostic = struct {
         return switch (cause) {
             .network_interrupted => "NetworkInterrupted",
             .response_interrupted => "StreamInterrupted",
-            .provider_stream_timeout => "gateway_stream_timeout",
             .provider_unavailable => "provider_error",
             .rate_limited => "HTTP 429",
             .system_resumed => "SystemResumed",
@@ -383,7 +304,6 @@ pub const RouteRecoveryStatus = struct {
     action: ?ModelRecoveryAction = null,
     required_action: ModelRecoveryRequiredAction = .none,
     delay_seconds: u64 = 0,
-    retry_deadline: ?std.Io.Clock.Timestamp = null,
     diagnostic: ?ModelFailureDiagnostic = null,
 
     pub fn tone(self: RouteRecoveryStatus) RouteRecoveryStatusTone {
@@ -474,7 +394,6 @@ pub const RouteRecoveryStatus = struct {
         const cause = switch (self.cause orelse .provider_unavailable) {
             .network_interrupted => "Network interrupted",
             .response_interrupted => "Response ended early",
-            .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
@@ -483,7 +402,7 @@ pub const RouteRecoveryStatus = struct {
         };
         const action = switch (self.action orelse .retrying_request) {
             .retrying_request => "retrying request",
-            .continuing_response => "restarting response",
+            .continuing_response => "continuing response",
             .regenerating_tool => "regenerating unstarted tool",
             .continuing_after_tool => "continuing after confirmed tool",
             .reconciling_tool => "checking uncertain tool state",
@@ -548,20 +467,6 @@ pub const RouteRecoveryStatus = struct {
                 .{ self.failed_attempt, self.attempt_limit },
             ) catch "⚠ Connection unavailable · recovery paused";
         }
-        if (cause == .provider_stream_timeout) {
-            if (self.diagnostic) |diagnostic| {
-                return std.fmt.bufPrint(
-                    buf,
-                    "⚠ Gateway stream timed out · {s} · automatic retry paused · attempt {d}/{d}",
-                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
-                ) catch "⚠ Gateway stream timed out · automatic retry paused";
-            }
-            return std.fmt.bufPrint(
-                buf,
-                "⚠ Gateway stream timed out · automatic retry paused · attempt {d}/{d}",
-                .{ self.failed_attempt, self.attempt_limit },
-            ) catch "⚠ Gateway stream timed out · automatic retry paused";
-        }
         if (cause == .request_limit_reached) {
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
@@ -579,7 +484,6 @@ pub const RouteRecoveryStatus = struct {
         const name = switch (cause) {
             .network_interrupted => "Network interrupted",
             .response_interrupted => "Response ended early",
-            .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
@@ -828,7 +732,6 @@ pub const PersistedToolResult = struct {
     committed_file_presentation: ?CommittedFilePresentation = null,
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
-    terminal_action_presentation: ?TerminalActionPresentation = null,
 };
 
 pub const CommandOutputReplayDescriptor = struct {
@@ -849,86 +752,11 @@ pub const CancelledCommandPresentation = struct {
 pub const CommandProcessPresentation = union(enum) {
     exit_code: i64,
     signal: u32,
-    timed_out,
-    output_capture_failed,
-};
-
-pub const TerminalReturnPresentation = union(enum) {
-    started,
-    condition_met,
-    safety_ceiling,
-    cancelled,
-    exited: i32,
-    signal: u32,
-};
-
-pub const TerminalFailurePresentation = enum {
-    invalid_request,
-    path_outside_workspace,
-    unsupported_host,
-    shell_unavailable,
-    pty_unavailable,
-    startup_failed,
-    process_identity_unavailable,
-    session_lost,
-    session_not_found,
-    invalid_lifecycle,
-    authority_denied,
-    authority_retired,
-    lease_conflict,
-    cursor_gap,
-    screen_unavailable,
-    protocol_incompatible,
-    capacity_exceeded,
-    cancelled,
-
-    pub fn detail(self: TerminalFailurePresentation) []const u8 {
-        return switch (self) {
-            .invalid_request => "invalid request",
-            .path_outside_workspace => "path is outside the workspace",
-            .unsupported_host => "terminal host is unavailable",
-            .shell_unavailable => "terminal shell is unavailable",
-            .pty_unavailable => "terminal PTY is unavailable",
-            .startup_failed => "terminal startup failed",
-            .process_identity_unavailable => "terminal process identity is unavailable",
-            .session_lost => "terminal session was lost",
-            .session_not_found => "terminal session not found",
-            .invalid_lifecycle => "terminal session is in an invalid lifecycle state",
-            .authority_denied => "terminal authority denied",
-            .authority_retired => "saved terminal authority is from an older fx version; start a new terminal",
-            .lease_conflict => "terminal control lease conflict",
-            .cursor_gap => "terminal output cursor gap",
-            .screen_unavailable => "terminal screen is unavailable",
-            .protocol_incompatible => "terminal protocol is incompatible",
-            .capacity_exceeded => "terminal capacity exceeded",
-            .cancelled => "terminal action was cancelled",
-        };
-    }
-};
-
-pub const TerminalActionPresentation = union(enum) {
-    returned: TerminalReturnPresentation,
-    failed: TerminalFailurePresentation,
-
-    pub fn outcomeKind(self: TerminalActionPresentation) ToolOutcomeKind {
-        return switch (self) {
-            .returned => |returned| switch (returned) {
-                .started, .condition_met, .safety_ceiling => .completed,
-                .cancelled => .cancelled,
-                .exited => |code| if (code == 0) .completed else .failed,
-                .signal => .failed,
-            },
-            .failed => |failed| if (failed == .cancelled)
-                .cancelled
-            else
-                .failed,
-        };
-    }
 };
 
 pub const deferred_tool_result_output = "Not executed";
 pub const context_deferred_tool_result_output = "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.";
-pub const context_deferred_tool_status_label = "Not run — project instructions changed:";
+pub const context_deferred_tool_status_label = "Context updated";
 
 pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
@@ -983,19 +811,12 @@ pub const ToolResultMemory = struct {
     committed_file_presentation: ?CommittedFilePresentation = null,
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
-    terminal_action_presentation: ?TerminalActionPresentation = null,
 };
 
 pub const ToolExecutionStep = struct {
     assistant: ?[]u8 = null,
     tool_calls: []ToolCall = &.{},
     tool_results: []PersistedToolResult = &.{},
-};
-
-pub const PersistedSteering = struct {
-    text: []u8,
-    assistant_prefix: ?[]u8 = null,
-    after_tool_step_count: usize,
 };
 
 pub const FileEvidence = struct {
@@ -1012,12 +833,9 @@ pub const FileEvidence = struct {
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
-    /// User guidance consumed between model steps, with its chronological tool boundary.
-    steering: []PersistedSteering = &.{},
-    turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
-        return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0;
+        return self.tool_steps.len == 0 and self.files.len == 0;
     }
 };
 
@@ -1061,14 +879,11 @@ pub const ChatMessage = struct {
 pub const Usage = struct {
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,
-    cache_read_tokens: ?u64 = null,
-    cache_write_tokens: ?u64 = null,
-    reasoning_tokens: ?u64 = null,
 };
 
-/// Exact usage metadata returned by a completed provider stream. `model` is
+/// Exact usage metadata returned by a completed Gateway stream. `model` is
 /// owned by the completion carrying this value.
-pub const ProviderBilling = struct {
+pub const GatewayBilling = struct {
     created_at_ms: i64,
     model: []const u8,
     total_cost: f64,
@@ -1096,8 +911,6 @@ pub const ToolUsage = struct {
 };
 
 pub const TurnSummary = struct {
-    started_at_ms: i64 = 0,
-    completed_at_ms: i64 = 0,
     thinking_duration_ms: u64 = 0,
     turn_duration_ms: u64 = 0,
     token_progress: TurnTokenProgress = .{},
@@ -1139,21 +952,16 @@ pub const ProviderFinishReason = enum {
     }
 };
 
-pub const ProviderFailureCause = enum {
-    gateway_stream_timeout,
-};
-
-pub const ModelCompletion = struct {
+pub const GatewayCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     generation_id: ?[]const u8 = null,
-    billing: ?ProviderBilling = null,
+    billing: ?GatewayBilling = null,
     /// Gateway generation or resolved-model metadata was malformed or conflicting.
     generation_metadata_invalid: bool = false,
     /// An earlier delivery may have billed outside this generation identity.
     delivery_ambiguous: bool = false,
     provider_result_identity_failure: ?ProviderResultIdentityFailure = null,
-    provider_failure_cause: ?ProviderFailureCause = null,
     provider_failure_detail: ?[]const u8 = null,
     /// Provider-owned opaque response items for the next stateless request in this turn.
     provider_state_json: ?[]const u8 = null,
@@ -1318,14 +1126,6 @@ pub fn validGatewayTeam(team: []const u8) bool {
     return true;
 }
 
-pub fn validCredentialAccountId(account_id: []const u8) bool {
-    if (account_id.len == 0 or account_id.len > 1024) return false;
-    for (account_id) |byte| {
-        if (byte < 0x21 or byte > 0x7e) return false;
-    }
-    return true;
-}
-
 pub const ProviderCompletionDisposition = enum {
     completed,
     length_limited,
@@ -1342,7 +1142,7 @@ pub fn allToolCallsProviderExecuted(tool_calls: []const ToolCall) bool {
     return true;
 }
 
-pub fn classifyProviderCompletion(completion: ModelCompletion) ProviderCompletionDisposition {
+pub fn classifyProviderCompletion(completion: GatewayCompletion) ProviderCompletionDisposition {
     const finish_reason = completion.finish_reason orelse return .interrupted;
     return switch (finish_reason) {
         .provider_error, .content_filter => .provider_failure,
@@ -1467,7 +1267,7 @@ pub const AuthoritativeToolAdmission = union(enum) {
     reject_duplicate_identity,
 };
 
-pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeToolAdmission {
+pub fn authoritativeToolAdmission(completion: GatewayCompletion) AuthoritativeToolAdmission {
     if (completion.provider_result_identity_failure) |failure| {
         return .{ .reject_malformed_provider_result = failure };
     }
@@ -1624,6 +1424,18 @@ pub const AssistantHistoryTurn = struct {
     execution: ExecutionMemory = .{},
 };
 
+pub const StableBackgroundRecordId = [16]u8;
+
+pub const BackgroundCommandHistoryTurn = struct {
+    user: UserTurn,
+    assistant: ?[]u8 = null,
+    execution: ExecutionMemory = .{},
+    log_path: []u8,
+    expect_url: bool,
+    url: ?[]u8 = null,
+    background_record_id: ?StableBackgroundRecordId = null,
+};
+
 pub const InterruptedTerminalReason = enum {
     cancelled,
     failed,
@@ -1638,9 +1450,6 @@ pub const InterruptedHistoryTurn = struct {
     cancelled_command: ?CancelledCommandPresentation = null,
     terminal_reason: InterruptedTerminalReason = .cancelled,
 };
-
-pub const context_handoff_open = "<context_handoff>";
-pub const context_handoff_close = "</context_handoff>";
 
 pub const CompactedSummaryHistoryTurn = struct {
     summary: []u8,
@@ -1661,24 +1470,9 @@ pub const CompactedSummaryHistoryTurn = struct {
 pub const HistoryTurn = union(enum) {
     compacted_summary: CompactedSummaryHistoryTurn,
     assistant: AssistantHistoryTurn,
+    background_command: BackgroundCommandHistoryTurn,
     interrupted: InterruptedHistoryTurn,
 };
-
-pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
-    switch (turn.*) {
-        .assistant => |*entry| entry.execution.turn_summary = summary,
-        .interrupted => |*entry| entry.execution.turn_summary = summary,
-        .compacted_summary => {},
-    }
-}
-
-pub fn historyTurnSummary(turn: HistoryTurn) ?TurnSummary {
-    return switch (turn) {
-        .assistant => |entry| entry.execution.turn_summary,
-        .interrupted => |entry| entry.execution.turn_summary,
-        .compacted_summary => null,
-    };
-}
 
 pub const FinishedPromptProjection = enum {
     history_default,
@@ -1686,8 +1480,6 @@ pub const FinishedPromptProjection = enum {
 };
 
 pub const SnapshotFileOwnership = struct {
-    /// Shared lifetime for snapshot files after worker completion. Copies must
-    /// retain/release; accepted history transfers deletion responsibility.
     ctx: *anyopaque,
     retain_fn: *const fn (*anyopaque) void,
     release_fn: *const fn (*anyopaque) void,
@@ -1835,9 +1627,6 @@ pub const ReasoningEffort = union(enum) {
 pub const ToolPermissionDenialReason = enum {
     user_denied,
     auto_denied,
-    review_caution,
-    review_evidence_incomplete,
-    review_unavailable,
     policy_denied,
     permission_required,
 };
@@ -1937,6 +1726,13 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             alloc.free(entry.assistant);
             freeExecutionMemory(alloc, entry.execution);
         },
+        .background_command => |entry| {
+            freeUserTurn(alloc, entry.user);
+            if (entry.assistant) |assistant| alloc.free(assistant);
+            freeExecutionMemory(alloc, entry.execution);
+            alloc.free(entry.log_path);
+            if (entry.url) |url| alloc.free(url);
+        },
         .interrupted => |entry| {
             freeUserTurn(alloc, entry.user);
             if (entry.assistant) |assistant| alloc.free(assistant);
@@ -1998,6 +1794,32 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .user = user,
                 .assistant = assistant,
                 .execution = execution,
+            } };
+        },
+        .background_command => |entry| blk: {
+            const user = try dupeUserTurn(alloc, entry.user);
+            errdefer freeUserTurn(alloc, user);
+
+            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
+            errdefer if (assistant) |text| alloc.free(text);
+
+            const execution = try dupeExecutionMemory(alloc, entry.execution);
+            errdefer freeExecutionMemory(alloc, execution);
+
+            const log_path = try alloc.dupe(u8, entry.log_path);
+            errdefer alloc.free(log_path);
+
+            const url = if (entry.url) |src| try alloc.dupe(u8, src) else null;
+            errdefer if (url) |owned| alloc.free(owned);
+
+            break :blk .{ .background_command = .{
+                .user = user,
+                .assistant = assistant,
+                .execution = execution,
+                .log_path = log_path,
+                .expect_url = entry.expect_url,
+                .url = url,
+                .background_record_id = entry.background_record_id,
             } };
         },
         .interrupted => |entry| blk: {
@@ -2104,58 +1926,15 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const tool_steps = try dupeToolExecutionSteps(alloc, memory.tool_steps);
     errdefer freeToolExecutionSteps(alloc, tool_steps);
     const files = try dupeFileEvidenceSlice(alloc, memory.files);
-    errdefer freeFileEvidenceSlice(alloc, files);
-    const steering = try dupePersistedSteering(alloc, memory.steering);
     return .{
         .tool_steps = tool_steps,
         .files = files,
-        .steering = steering,
-        .turn_summary = memory.turn_summary,
     };
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
-    freePersistedSteering(alloc, memory.steering);
-}
-
-pub fn dupePersistedSteering(
-    alloc: std.mem.Allocator,
-    steering: []const PersistedSteering,
-) ![]PersistedSteering {
-    if (steering.len == 0) return &.{};
-    const copy = try alloc.alloc(PersistedSteering, steering.len);
-    errdefer alloc.free(copy);
-    var copied: usize = 0;
-    errdefer for (copy[0..copied]) |item| {
-        alloc.free(item.text);
-        if (item.assistant_prefix) |prefix| alloc.free(prefix);
-    };
-    for (steering, copy) |item, *dest| {
-        const text = try alloc.dupe(u8, item.text);
-        errdefer alloc.free(text);
-        const assistant_prefix = if (item.assistant_prefix) |prefix|
-            try alloc.dupe(u8, prefix)
-        else
-            null;
-        errdefer if (assistant_prefix) |prefix| alloc.free(prefix);
-        dest.* = .{
-            .text = text,
-            .assistant_prefix = assistant_prefix,
-            .after_tool_step_count = item.after_tool_step_count,
-        };
-        copied += 1;
-    }
-    return copy;
-}
-
-pub fn freePersistedSteering(alloc: std.mem.Allocator, steering: []PersistedSteering) void {
-    for (steering) |item| {
-        alloc.free(item.text);
-        if (item.assistant_prefix) |prefix| alloc.free(prefix);
-    }
-    if (steering.len > 0) alloc.free(steering);
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {
@@ -2351,7 +2130,6 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .committed_file_presentation = committed_file_presentation,
         .command_output_replay = command_output_replay,
         .command_process_presentation = result.command_process_presentation,
-        .terminal_action_presentation = result.terminal_action_presentation,
     };
 }
 
@@ -2797,6 +2575,37 @@ test "HistoryTurn helpers duplicate and free owned turns" {
     freeHistoryTurn(alloc, summary_copy);
     freeHistoryTurn(alloc, summary_original);
 
+    const background_original: HistoryTurn = .{ .background_command = .{
+        .user = .{ .text = try alloc.dupe(u8, "run dev") },
+        .assistant = try alloc.dupe(u8, "Starting the server."),
+        .execution = .{ .files = blk: {
+            const files = try alloc.alloc(FileEvidence, 1);
+            files[0] = .{
+                .path = try alloc.dupe(u8, "src/main.zig"),
+                .tool_call_id = try alloc.dupe(u8, "call_1"),
+                .tool_name = try alloc.dupe(u8, "read_file"),
+                .action = .read,
+                .status = .success,
+                .model_view_covers_full_file = true,
+            };
+            break :blk files;
+        } },
+        .log_path = try alloc.dupe(u8, "/tmp/ffx.log"),
+        .expect_url = true,
+        .url = try alloc.dupe(u8, "http://localhost:3000"),
+    } };
+    const background_copy = try dupeHistoryTurn(alloc, background_original);
+    try std.testing.expectEqualStrings("run dev", background_copy.background_command.user.text);
+    try std.testing.expectEqualStrings("/tmp/ffx.log", background_copy.background_command.log_path);
+    try std.testing.expectEqualStrings("http://localhost:3000", background_copy.background_command.url.?);
+    try std.testing.expectEqualStrings("Starting the server.", background_copy.background_command.assistant.?);
+    try std.testing.expectEqualStrings("src/main.zig", background_copy.background_command.execution.files[0].path);
+    try std.testing.expect(background_copy.background_command.log_path.ptr != background_original.background_command.log_path.ptr);
+    try std.testing.expect(background_copy.background_command.assistant.?.ptr != background_original.background_command.assistant.?.ptr);
+    try std.testing.expect(background_copy.background_command.execution.files[0].path.ptr != background_original.background_command.execution.files[0].path.ptr);
+    freeHistoryTurn(alloc, background_copy);
+    freeHistoryTurn(alloc, background_original);
+
     const interrupted_original: HistoryTurn = .{ .interrupted = .{
         .user = .{ .text = try alloc.dupe(u8, "stop") },
         .execution = .{ .files = blk: {
@@ -2812,10 +2621,10 @@ test "HistoryTurn helpers duplicate and free owned turns" {
         } },
         .cancelled_command = .{
             .output_replay = .{ .available = .{
-                .handle = try alloc.dupe(u8, "fx-command-replay.bin"),
+                .handle = try alloc.dupe(u8, "ffx-command-replay.bin"),
                 .framed_bytes = 42,
             } },
-            .command_artifact_handle = try alloc.dupe(u8, "fx-command.log"),
+            .command_artifact_handle = try alloc.dupe(u8, "ffx-command.log"),
         },
         .terminal_reason = .failed,
     } };
@@ -2825,7 +2634,7 @@ test "HistoryTurn helpers duplicate and free owned turns" {
     const copied_presentation = interrupted_copy.interrupted.cancelled_command.?;
     const original_presentation = interrupted_original.interrupted.cancelled_command.?;
     try std.testing.expectEqualStrings(
-        "fx-command-replay.bin",
+        "ffx-command-replay.bin",
         copied_presentation.output_replay.?.available.handle,
     );
     try std.testing.expect(
@@ -2974,7 +2783,7 @@ test "public types remain constructible" {
     try std.testing.expectEqual(ChatRole.assistant, chat.role);
     try std.testing.expectEqualStrings("ok", chat.tool_calls[0].provider_result.?);
 
-    const completion = ModelCompletion{
+    const completion = GatewayCompletion{
         .content = "done",
         .tool_calls = &.{tool_call},
         .finish_reason = .stop,

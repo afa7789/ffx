@@ -11,9 +11,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FFX_BIN } from "../evals/eval-helpers";
 import {
-  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   startFakeGateway,
@@ -54,14 +53,14 @@ async function startFx(
   duplicateReview = false,
   traceScopes?: string,
 ): Promise<TmuxSession> {
-  root = realpathSync(mkdtempSync(join(tmpdir(), "fx-edit-contracts-")));
+  root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-edit-contracts-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace);
   writeFileSync(
-    join(home, ".fx", "settings.json"),
-    JSON.stringify({}),
+    join(home, ".ffx", "settings.json"),
+    JSON.stringify({ maxxing_mode: "legacy" }),
   );
   stderrPath = join(root, "stderr.log");
   writeFileSync(stderrPath, "");
@@ -73,7 +72,7 @@ async function startFx(
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
   );
   writeFileSync(join(workspace, "target.txt"), "target\n");
-  const skillRoot = join(home, ".fx", "skills", "review");
+  const skillRoot = join(home, ".ffx", "skills", "review");
   mkdirSync(skillRoot, { recursive: true });
   writeFileSync(
     join(skillRoot, "SKILL.md"),
@@ -107,21 +106,21 @@ async function startFx(
   }
 
   session = await TmuxSession.create({
-    cmd: FX_BIN,
+    cmd: FFX_BIN,
     cwd: workspace,
     env: {
       HOME: home,
       AI_GATEWAY_API_KEY: withGateway ? "fake-edit-contract-key" : undefined,
       VERCEL_OIDC_TOKEN: undefined,
-      FX_GATEWAY_BASE_URL: gateway?.baseUrl,
-      FX_GATEWAY_CHAT_URL: gateway?.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: gateway
+      FFX_GATEWAY_BASE_URL: gateway?.baseUrl,
+      FFX_GATEWAY_CHAT_URL: gateway?.chatUrl,
+      FFX_E2E_GATEWAY_MODELS_URL: gateway
         ? `${gateway.baseUrl}/coding-agent/v1/models`
         : undefined,
-      FX_MODEL: withGateway ? FAKE_GATEWAY_MODEL : undefined,
-      FX_AUTO_UPGRADE: "0",
-      FX_TRACE_LOG: tracePath,
-      FX_TRACE_SCOPES: traceScopes,
+      FFX_MODEL: withGateway ? FAKE_GATEWAY_MODEL : undefined,
+      FFX_AUTO_UPGRADE: "0",
+      FFX_TRACE_LOG: tracePath,
+      FFX_TRACE_SCOPES: traceScopes,
     },
     width: 112,
     height: 32,
@@ -132,7 +131,7 @@ async function startFx(
 }
 
 function historyImageSnapshotPath(): string {
-  const sessionsRoot = join(root!, "home", ".fx", "sessions");
+  const sessionsRoot = join(root!, "home", ".ffx", "sessions");
   const sessionNames = readdirSync(sessionsRoot, { withFileTypes: true })
     .filter((entry) =>
       entry.isDirectory() &&
@@ -360,7 +359,7 @@ tmuxTest(
     const submitted = (await active.captureFullScrollback())
       .split("\n")
       .find((line) => line.includes("if True:"));
-    expect(submitted).toContain("┃     if True:");
+    expect(submitted).toContain("❯     if True:");
     expectCleanRuntime(active);
   },
   TIMEOUT,
@@ -713,7 +712,7 @@ tmuxTest(
     await active.waitForPane(
       (pane) =>
         pane.includes("edit contract complete") &&
-        pane.includes("┃") &&
+        pane.includes("❯") &&
         !pane.includes("Thinking"),
       TIMEOUT,
     );
@@ -744,7 +743,7 @@ tmuxTest(
     await active.waitForPane(
       (pane) =>
         pane.includes("edit contract complete") &&
-        pane.includes("┃") &&
+        pane.includes("❯") &&
         !pane.includes("Thinking"),
       TIMEOUT,
     );
@@ -794,7 +793,7 @@ for (
       await active.waitForPane(
         (pane) =>
           pane.includes("edit contract complete") &&
-          pane.includes("┃") &&
+          pane.includes("❯") &&
           !pane.includes("Thinking"),
         TIMEOUT,
       );
@@ -817,36 +816,26 @@ for (
 }
 
 tmuxTest(
-  "history recall preserves duplicate skill provenance without showing it",
+  "history recall preserves the selected duplicate skill source",
   async () => {
     const active = await startFx(true, 2, true);
 
     await selectReviewSkill(active, true);
-    await active.waitForPane(
-      (pane) =>
-        composerContains(pane, "review") &&
-        !composerContains(pane, "review · workspace skills/"),
-      TIMEOUT,
-    );
+    await active.waitForText("review · workspace skills/", TIMEOUT);
     await active.sendLiteralText("history skill");
     await active.sendKeys("Enter");
     await waitForGatewayRequest();
     await active.waitForPane(
       (pane) =>
         pane.includes("edit contract complete") &&
-        pane.includes("┃") &&
+        pane.includes("❯") &&
         !pane.includes("Thinking"),
       TIMEOUT,
     );
 
     await active.sendKeys("Up");
-    await active.waitForPane(
-      (pane) =>
-        composerContains(pane, "history skill") &&
-        composerContains(pane, "review") &&
-        !composerContains(pane, "review · workspace skills/"),
-      TIMEOUT,
-    );
+    await active.waitForText("history skill", TIMEOUT);
+    await active.waitForText("review · workspace skills/", TIMEOUT);
     await active.sendKeys("Enter");
     await waitForGatewayRequest(2);
 

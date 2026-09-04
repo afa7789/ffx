@@ -21,7 +21,6 @@ const StoreError = host.SecretStoreWriteError;
 pub const provider: host.SecretStore = .{
     .backend_label = backend_label,
     .is_disabled_fn = isDisabledCallback,
-    .presence_fn = presenceCallback,
     .load_fn = loadCallback,
     .store_fn = storeCallback,
     .store_interactive_fn = storeInteractiveCallback,
@@ -49,7 +48,7 @@ fn store(alloc: Allocator, value: []const u8) StoreError!void {
 }
 
 /// Let the platform credential store own terminal input when it supports a
-/// secure prompt, keeping plaintext out of the fx process.
+/// secure prompt, keeping plaintext out of the ffx process.
 fn storeInteractive() StoreError!bool {
     if (comptime builtin.os.tag == .macos) {
         keychain.storeInteractive() catch |err| return writeFailed("keychain_interactive", err);
@@ -60,30 +59,6 @@ fn storeInteractive() StoreError!bool {
 
 fn isDisabledCallback(_: ?*anyopaque) bool {
     return isDisabled();
-}
-
-fn presenceCallback(_: ?*anyopaque) host.SecretStorePresence {
-    if (isDisabled()) return .missing;
-    if (comptime builtin.os.tag == .macos) {
-        return keychain.contains() catch .unavailable;
-    }
-    return presenceInProfile();
-}
-
-fn presenceInProfile() host.SecretStorePresence {
-    const home = io_mod.getenv("HOME") orelse return .unavailable;
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch
-        return .unavailable;
-    defer home_dir.close(io_mod.getIo());
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
-        .follow_symlinks = false,
-    }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
-    defer fx_dir.close(io_mod.getIo());
-    const stat = fx_dir.statFile(io_mod.getIo(), profile_paths.api_key_file_name, .{
-        .follow_symlinks = false,
-    }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) return .unavailable;
-    return if (stat.size == 0) .missing else .present;
 }
 
 fn loadCallback(_: ?*anyopaque, alloc: Allocator) LoadError!?[]u8 {

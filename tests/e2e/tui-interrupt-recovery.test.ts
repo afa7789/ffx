@@ -12,12 +12,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findFooterBlocks, readTrace } from "./tui-render-assertions";
+import { readTrace } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayToolCall,
-  fakeShellRun,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -63,16 +62,16 @@ afterEach(async () => {
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
   test(
-    "submitted text interrupts a tool-free response and continues immediately",
+    "submitted status text queues behind an active response",
     async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-text-steering-")));
+      root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-text-queues-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
 
       const held: HoldState = {
         started: false,
@@ -80,10 +79,10 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         cancelCount: 0,
         released: false,
       };
-      const steeringText = "What are you doing right now?";
+      const queuedText = "What are you doing right now?";
       gateway = startFakeGateway([
         () => heldUntilReleasedResponse(held),
-        fakeGatewayFinalText("STEERING_STATUS_PROMPT_COMPLETE"),
+        fakeGatewayFinalText("QUEUED_STATUS_PROMPT_COMPLETE"),
       ]);
       session = await TmuxSession.create({
         cwd: realpathSync(workspace),
@@ -92,74 +91,65 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         height: 40,
         env: {
           HOME: home,
-          AI_GATEWAY_API_KEY: "fake-text-queues-key",
+          FFX_PROVIDER_API_KEY: "fake-text-queues-key",
           VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_MODEL: FAKE_GATEWAY_MODEL,
-          FX_TRACE_SCOPES: TRACE_SCOPES,
-          FX_TRACE_LOG: tracePath,
+          FFX_AUTO_UPGRADE: "0",
+          FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FFX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FFX_MODEL: FAKE_GATEWAY_MODEL,
+          FFX_TRACE_SCOPES: TRACE_SCOPES,
+          FFX_TRACE_LOG: tracePath,
         },
       });
       await session.waitForComposer(TIMEOUT);
 
       await session.sendText("Hold this response until the test releases it.");
       await waitForCondition(() => held.started, "held response start");
-      await session.sendText(steeringText);
-      await waitForCondition(() => held.cancelled, "tool-free steering cancellation");
-      await session.waitForText("STEERING_STATUS_PROMPT_COMPLETE", TIMEOUT);
+      await session.sendText(queuedText);
+      await Bun.sleep(250);
+
+      expect(gateway.requests).toHaveLength(1);
+      expect(held.cancelled).toBe(false);
+      expect(held.cancelCount).toBe(0);
+      expect(readTrace(tracePath)).not.toContain("event=interrupt_persisted");
+
+      held.release!();
+      await session.waitForText("QUEUED_STATUS_PROMPT_COMPLETE", TIMEOUT);
       await waitForCondition(
         () => countOccurrences(readTrace(tracePath), "finish processing queued=0") >= 1,
-        "steering continuation to finish",
+        "both queued turns to finish",
       );
 
-      expect(held.released).toBe(false);
-      expect(held.cancelCount).toBe(1);
+      expect(held.released).toBe(true);
+      expect(held.cancelCount).toBe(0);
       expect(gateway.requests).toHaveLength(2);
-      const steeringRequest = JSON.parse(gateway.requests[1]!.body) as {
+      const queuedRequest = JSON.parse(gateway.requests[1]!.body) as {
         prompt: unknown;
         tools: unknown[];
       };
-      const steeringPrompt = JSON.stringify(steeringRequest.prompt);
-      expect(steeringPrompt).toContain(steeringText);
-      expect(steeringRequest.tools.length).toBeGreaterThan(0);
+      const queuedPrompt = JSON.stringify(queuedRequest.prompt);
+      expect(queuedPrompt).toContain(queuedText);
+      expect(queuedRequest.tools.length).toBeGreaterThan(0);
       expect(gateway.requests[1]!.body).not.toContain(
         "Treat it as interrupting any previous tool plan.",
       );
       expect(gateway.requests[1]!.body).not.toContain(
         "Continue from the latest meaningful state",
       );
-      expect(gateway.requests[1]!.body).toContain("<user_steering>");
-      expect(gateway.requests[1]!.body).toContain(
-        "Apply this live user update to the current task.",
-      );
-      expect(gateway.requests[1]!.body).toContain("ACTIVE_RESPONSE_HELD");
-      expect(gateway.requests[1]!.body).not.toContain("<turn_aborted>");
-      expect(gateway.requests[1]!.body).not.toContain(
-        "The previous response ended before completion.",
-      );
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
 
-      const sessionRoot = join(home, ".fx", "sessions");
-      let eventsPath: string | undefined;
-      await waitForCondition(() => {
-        eventsPath = readdirSync(sessionRoot, { withFileTypes: true })
-          .filter((entry) => entry.isDirectory())
-          .map((entry) => join(sessionRoot, entry.name, "events.jsonl"))
-          .find((path) => existsSync(path) && readFileSync(path, "utf8").includes(steeringText));
-        return eventsPath !== undefined;
-      }, "steering history persistence");
+      const sessionRoot = join(home, ".ffx", "sessions");
+      const eventsPath = readdirSync(sessionRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => join(sessionRoot, entry.name, "events.jsonl"))
+        .find((path) => existsSync(path) && readFileSync(path, "utf8").includes(queuedText));
+      expect(eventsPath).toBeDefined();
       const events = readFileSync(eventsPath!, "utf8");
       expect(events).not.toContain('"kind":"interrupted"');
-      expect(events).toContain(steeringText);
-      const scrollback = await session.captureFullScrollback();
-      expect(countOccurrences(scrollback, steeringText)).toBe(1);
-      expect(countOccurrences(scrollback, "ACTIVE_RESPONSE_HELD")).toBe(1);
-      expect(scrollback).not.toContain("cancelled");
+      expect(events).toContain(queuedText);
     },
     TIMEOUT * 2,
   );
@@ -167,14 +157,14 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
   test(
     "partial output survives cancellation and the next prompt completes",
     async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-interrupt-recovery-")));
+      root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-interrupt-recovery-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      const settingsPath = join(home, ".fx", "settings.json");
+      const settingsPath = join(home, ".ffx", "settings.json");
       writeFileSync(
         settingsPath,
         JSON.stringify({ model: FAKE_GATEWAY_MODEL }) + "\n",
@@ -202,15 +192,15 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         height: 40,
         env: {
           HOME: home,
-          AI_GATEWAY_API_KEY: "fake-interrupt-recovery-key",
+          FFX_PROVIDER_API_KEY: "fake-interrupt-recovery-key",
           VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-          FX_TRACE_SCOPES: TRACE_SCOPES,
-          FX_TRACE_LOG: tracePath,
+          FFX_AUTO_UPGRADE: "0",
+          FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FFX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FFX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FFX_TRACE_SCOPES: TRACE_SCOPES,
+          FFX_TRACE_LOG: tracePath,
         },
       });
       await session.waitForComposer(TIMEOUT);
@@ -221,18 +211,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.sendKeys("Escape");
       await waitForCondition(() => held.cancelled, "gateway stream cancellation");
       await waitForTrace(tracePath, "event=interrupt_persisted", TIMEOUT);
-      await session.waitForText("What can fx do differently?", TIMEOUT);
-      const cancelledGrid = await session.capturePaneGrid();
-      const footer = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
-      expect(footer).toBeDefined();
-      expect(cancelledRow).toBeGreaterThanOrEqual(0);
-      expect(cancelledRow).toBeLessThan(footer!.topDivider);
-      const gapRows = cancelledGrid.slice(cancelledRow + 1, footer!.topDivider);
-      expect(gapRows.length).toBeGreaterThanOrEqual(1);
-      expect(gapRows.map((row) => row.trim())).toEqual(
-        Array.from({ length: gapRows.length }, () => ""),
-      );
+      await session.waitForText("cancelled", TIMEOUT);
       await session.sendText(`/model ${FOLLOW_UP_MODEL}`);
       await waitForCondition(
         () => JSON.parse(readFileSync(settingsPath, "utf8")).models?.gateway === FOLLOW_UP_MODEL,
@@ -243,11 +222,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       for (const chunk of VISIBLE_PARTIAL_CHUNKS) {
         expect(interruptedScrollback).toContain(chunk.trim());
       }
-      expect(
-        countOccurrences(interruptedScrollback, "What can fx do differently?"),
-      ).toBe(1);
-      expect(interruptedScrollback).not.toContain("System: cancelled");
-      expect(interruptedScrollback).not.toContain("Cancelling");
+      expect(countOccurrences(interruptedScrollback, "cancelled")).toBe(1);
 
       await session.waitForText(FOLLOW_UP_RESPONSE, TIMEOUT);
       await waitForCondition(
@@ -260,11 +235,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         expect(finalScrollback).toContain(chunk.trim());
       }
       expect(finalScrollback).toContain(FOLLOW_UP_RESPONSE);
-      expect(
-        countOccurrences(finalScrollback, "What can fx do differently?"),
-      ).toBe(1);
-      expect(finalScrollback).not.toContain("System: cancelled");
-      expect(finalScrollback).not.toContain("Cancelling");
+      expect(countOccurrences(finalScrollback, "cancelled")).toBe(1);
       expect(gateway.requests).toHaveLength(2);
       expect(held.cancelCount).toBe(1);
       expect(countOccurrences(readTrace(tracePath), "event=interrupt_persisted")).toBe(1);
@@ -304,7 +275,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(finalScrollback).not.toContain("HTTP 400");
 
-      const sessionRoot = join(home, ".fx", "sessions");
+      const sessionRoot = join(home, ".ffx", "sessions");
       const sessionIds = readdirSync(sessionRoot, { withFileTypes: true })
         .filter((entry) => entry.isDirectory())
         .map((entry) => entry.name)
@@ -331,14 +302,14 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
   test(
     "workspace mutation waits for cancelled worker unwind",
     async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-workspace-cancel-unwind-")));
+      root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-workspace-cancel-unwind-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const observed = join(root, "observed");
       const shared = join(root, "shared");
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       mkdirSync(observed, { recursive: true });
       mkdirSync(shared, { recursive: true });
@@ -346,7 +317,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const observedRoot = realpathSync(observed);
       const sharedRoot = realpathSync(shared);
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({
           sandbox: "none",
           permission_mode: "auto",
@@ -369,8 +340,10 @@ while :; do sleep 1; done
       chmodSync(scriptPath, 0o755);
 
       gateway = startFakeGateway([
-        fakeShellRun("workspace-cancel-hold", "./hold-workspace-cancel.sh", {
+        fakeGatewayToolCall("workspace-cancel-hold", "terminal", {
+          action: "exec",
           timeout_ms: 600_000,
+          command: "./hold-workspace-cancel.sh",
         }),
       ]);
       session = await TmuxSession.create({
@@ -380,15 +353,15 @@ while :; do sleep 1; done
         height: 40,
         env: {
           HOME: home,
-          AI_GATEWAY_API_KEY: "fake-workspace-cancel-unwind-key",
+          FFX_PROVIDER_API_KEY: "fake-workspace-cancel-unwind-key",
           VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_MODEL: FAKE_GATEWAY_MODEL,
-          FX_TRACE_SCOPES: `${TRACE_SCOPES},core`,
-          FX_TRACE_LOG: tracePath,
+          FFX_AUTO_UPGRADE: "0",
+          FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FFX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FFX_MODEL: FAKE_GATEWAY_MODEL,
+          FFX_TRACE_SCOPES: `${TRACE_SCOPES},core`,
+          FFX_TRACE_LOG: tracePath,
         },
       });
       await session.waitForComposer(TIMEOUT);
@@ -411,16 +384,7 @@ while :; do sleep 1; done
       );
 
       const command = `/workspace add ${sharedRoot}`;
-      const cancelStartedAt = Date.now();
       await session.sendKeys("Escape");
-      const immediateCancellation = await session.waitForText(
-        "What can fx do differently?",
-        TIMEOUT,
-      );
-      expect(Date.now() - cancelStartedAt).toBeLessThan(500);
-      expect(immediateCancellation).toContain("■ Cancelled");
-      expect(immediateCancellation).not.toContain("System: cancelled");
-      expect(immediateCancellation).not.toContain("Cancelling");
       await waitForTrace(
         tracePath,
         "event=cancel_requested source=input_active_stream",
@@ -434,7 +398,7 @@ while :; do sleep 1; done
         TIMEOUT,
       );
       const beforeRetry = JSON.parse(
-        readFileSync(join(home, ".fx", "settings.json"), "utf8"),
+        readFileSync(join(home, ".ffx", "settings.json"), "utf8"),
       );
       expect(beforeRetry.workspaces[workspaceRoot].additional_directories).toEqual([
         observedRoot,
@@ -442,7 +406,7 @@ while :; do sleep 1; done
 
       await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
       await session.waitForText(
-        "Cancelled ./hold-workspace-cancel.sh · What can fx do differently?",
+        "Cancelled ./hold-workspace-cancel.sh · What can ffx do differently?",
         TIMEOUT,
       );
       await session.sendText("/workspace list");
@@ -453,7 +417,7 @@ while :; do sleep 1; done
       await session.sendText(command);
       await session.waitForText("runtime_changed=true", TIMEOUT);
 
-      const stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+      const stored = JSON.parse(readFileSync(join(home, ".ffx", "settings.json"), "utf8"));
       expect(stored.workspaces[workspaceRoot].additional_directories).toEqual([
         observedRoot,
         sharedRoot,
@@ -461,88 +425,6 @@ while :; do sleep 1; done
       expect(gateway.requests).toHaveLength(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 2,
-  );
-
-  test(
-    "late successful tool settlement stays truthful after Escape",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-late-tool-success-")));
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      const corpus = join(workspace, "corpus");
-      const stderrPath = join(root, "stderr.log");
-      const tracePath = join(root, "trace.log");
-      const pattern = "LATE_SUCCESS_NEEDLE";
-      const callId = "late_success_grep";
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(corpus, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      for (let index = 0; index < 30_000; index += 1) {
-        writeFileSync(
-          join(corpus, `candidate-${String(index).padStart(5, "0")}.txt`),
-          "ordinary corpus text\n",
-        );
-      }
-
-      gateway = startFakeGateway([
-        fakeGatewayToolCall(callId, "grep_files", {
-          path: "corpus",
-          pattern,
-          head_limit: 5,
-        }),
-      ]);
-      session = await TmuxSession.create({
-        cwd: realpathSync(workspace),
-        stderrPath,
-        width: 120,
-        height: 40,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-late-tool-success-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_MODEL: FAKE_GATEWAY_MODEL,
-          FX_TRACE_SCOPES: `${TRACE_SCOPES},tool,ui_activity`,
-          FX_TRACE_LOG: tracePath,
-        },
-      });
-      await session.waitForComposer(TIMEOUT);
-
-      await session.sendText("Search the prepared corpus.");
-      await session.waitForText(`Searching ${pattern}`, TIMEOUT);
-      expect(readTrace(tracePath)).not.toContain(
-        `event=after_tool_execution call_id=${callId}`,
-      );
-
-      const cancelStartedAt = Date.now();
-      await session.sendKeys("Escape");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
-      expect(Date.now() - cancelStartedAt).toBeLessThan(500);
-      await waitForTrace(tracePath, `event=after_tool_execution`, TIMEOUT);
-      await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
-
-      const trace = readTrace(tracePath);
-      const completedTool = trace.split("\n").find((line) =>
-        line.includes("event=after_tool_execution") &&
-        line.includes(`call_id=${callId}`) &&
-        line.includes("name=grep_files") &&
-        line.includes("result_kind=model_output")
-      );
-      expect(completedTool).toBeDefined();
-      await session.waitForText(`Searched ${pattern}`, TIMEOUT);
-      const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain(`Searched ${pattern}`);
-      expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
-      expect(scrollback).not.toContain("System: cancelled");
-      expect(scrollback).not.toContain("Cancelling");
-      expect(gateway.requests).toHaveLength(1);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isPaneAlive()).toBe(true);
     },
     TIMEOUT * 2,

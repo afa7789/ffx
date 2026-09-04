@@ -1,5 +1,5 @@
-name: fx bug report
-description: Report a problem with fx
+name: ffx bug report
+description: Report a problem with ffx
 title: "Bug: "
 labels:
   - bug

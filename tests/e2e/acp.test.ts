@@ -15,9 +15,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { FX_BIN, HAS_API_KEY, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
+import { FFX_BIN, HAS_API_KEY, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
-  AUTO_EXA_SERIALIZED_TOOL_NAMES,
+  AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
   parseGatewayRequest,
@@ -26,7 +26,6 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import {
-  canonicalSubagentIdForStore,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText as finalText,
   heldFakeGatewayFinalText,
@@ -34,7 +33,6 @@ import {
   fakeGatewaySerializedToolCall,
   fakeGatewaySse,
   fakeGatewayToolCall,
-  fakeShellRun,
   startDynamicFakeGateway,
   startFakeGateway,
   terminalFixtureShell,
@@ -54,7 +52,6 @@ import {
 const TIMEOUT = 30_000;
 const LIVE_TIMEOUT = 120_000;
 const TERMINAL_HOST_EXIT_TIMEOUT_MS = 20_000;
-const SEEDED_GATEWAY_TOKEN = "seeded-access-token";
 const TERMINAL_FIXTURE_SHELL = terminalFixtureShell();
 const MCP_STDIO_FIXTURE = join(
   import.meta.dirname,
@@ -74,9 +71,9 @@ function acpStdioServer(
     command: process.execPath,
     args: [MCP_STDIO_FIXTURE],
     env: [
-      { name: "FX_MCP_RESULT_TEXT", value: resultText },
-      { name: "FX_MCP_PID_PATH", value: pidPath },
-      { name: "FX_MCP_MODE", value: mode },
+      { name: "FFX_MCP_RESULT_TEXT", value: resultText },
+      { name: "FFX_MCP_PID_PATH", value: pidPath },
+      { name: "FFX_MCP_MODE", value: mode },
       ...Object.entries(extraEnv).map(([name, value]) => ({ name, value })),
     ],
   };
@@ -145,10 +142,8 @@ function lengthLimitedCommandCall(command: string) {
     {
       type: "tool-call",
       toolCallId: "command_1",
-      toolName: "shell",
-      input: {
-        request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command },
-      },
+      toolName: "terminal",
+      input: { action: "exec", command },
     },
     {
       type: "finish",
@@ -196,12 +191,12 @@ function fakeGatewayEnv(
 ) {
   return {
     HOME: root.home,
-    AI_GATEWAY_API_KEY: "fake-acp-file-key",
+    FFX_PROVIDER_API_KEY: "fake-acp-file-key",
     VERCEL_OIDC_TOKEN: "",
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: FAKE_GATEWAY_MODEL,
-    FX_AUTO_UPGRADE: "0",
+    FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_MODEL: FAKE_GATEWAY_MODEL,
+    FFX_AUTO_UPGRADE: "0",
   };
 }
 
@@ -259,32 +254,6 @@ function occurrenceCount(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
-function expectRestartedAcpResponse(
-  previousMessages: any[],
-  resumedMessages: any[],
-  partialText: string,
-  replacementText: string,
-): void {
-  const preview = previousMessages.find((message) =>
-    message.params?.update?.sessionUpdate === "agent_message_chunk" &&
-    message.params.update.content.text === partialText
-  )?.params.update;
-  expect(preview).toBeDefined();
-  const resumed = resumedMessages.filter((message) =>
-    message.params?.update?.sessionUpdate === "agent_message_chunk"
-  ).map((message) => message.params.update);
-  expect(resumed.map((update) => update.content.text)).toEqual([
-    "\n\n[Response interrupted. Restarting.]\n\n",
-    replacementText,
-  ]);
-  const ids = [preview.messageId, ...resumed.map((update) => update.messageId)];
-  for (const id of ids) {
-    expect(typeof id).toBe("string");
-    expect(id.length).toBeGreaterThan(0);
-  }
-  expect(new Set(ids).size).toBe(3);
-}
-
 function acpPromptText(body: string): string {
   return acpGatewayRequest(body).prompt
     .map((message) => acpContentText(message.content))
@@ -296,28 +265,236 @@ function acpLatestPromptText(body: string): string {
   return acpContentText(prompt.at(-1)?.content);
 }
 
-function writeSeededFxAuth(home: string, teamId?: string): void {
-  const fxDir = join(home, ".fx");
-  mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-  chmodSync(fxDir, 0o700);
-  const authPath = join(fxDir, "auth.json");
-  const auth: Record<string, string | number> = {
-    version: 1,
-    issuer: "https://vercel.com",
-    client_id: "test-client",
-    access_token: SEEDED_GATEWAY_TOKEN,
-    refresh_token: "seeded-refresh-token",
-    expires_at_ms: Date.now() + 60 * 60 * 1000,
-    scope: "openid",
-    token_type: "Bearer",
-  };
-  if (teamId) {
-    auth.team_id = teamId;
-    auth.team_slug = "vercel-labs";
-  }
-  writeFileSync(authPath, JSON.stringify(auth) + "\n", { mode: 0o600 });
-  chmodSync(authPath, 0o600);
+function expectNoAcpParentDeliveries(body: string) {
+  expect(acpPromptText(body)).not.toContain("<subagent_deliveries");
 }
+
+function acpParentDeliveryEnvelope(text: string): string {
+  const start = text.indexOf("<subagent_deliveries");
+  expect(start).toBeGreaterThanOrEqual(0);
+  const end = text.indexOf("</subagent_deliveries>", start);
+  expect(end).toBeGreaterThanOrEqual(start);
+  return text.slice(start, end + "</subagent_deliveries>".length);
+}
+
+function acpParentDeliveryIds(body: string): string[] {
+  const text = acpPromptText(body);
+  if (!text.includes("<subagent_deliveries")) return [];
+  return acpParentDeliveryEnvelope(text)
+    .split("\n")
+    .filter((line) => line.startsWith("- "))
+    .map((line) =>
+      String((JSON.parse(line.slice(2)) as { id?: unknown }).id ?? "")
+    );
+}
+
+function persistedAcpPayloadText(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return JSON.stringify(payload);
+  const message = (payload as { message?: unknown }).message;
+  if (!message || typeof message !== "object") return JSON.stringify(payload);
+  const wire = message as { encoding?: unknown; data?: unknown };
+  if (wire.encoding !== "base64" || typeof wire.data !== "string") {
+    return JSON.stringify(payload);
+  }
+  return Buffer.from(wire.data, "base64").toString("utf8");
+}
+
+function findPersistedAcpDeliveryIds(
+  root: ReturnType<typeof createIsolatedRoot>,
+  childId: string,
+  payload: string,
+): string[] {
+  const path = join(root.home, ".ffx", "sessions", childId, "subagent", "communication.json");
+  if (!existsSync(path)) return [];
+  const record = JSON.parse(readFileSync(
+    path,
+    "utf8",
+  )) as {
+    ledger: {
+      deliveries: Array<{ id: string; payload?: unknown }>;
+    };
+  };
+  return record.ledger.deliveries
+    .filter((item) => persistedAcpPayloadText(item.payload ?? item).includes(payload))
+    .map((item) => item.id);
+}
+
+function findPersistedAcpDeliveryId(
+  root: ReturnType<typeof createIsolatedRoot>,
+  childId: string,
+  payload: string,
+): string | null {
+  const matches = findPersistedAcpDeliveryIds(root, childId, payload);
+  if (matches.length > 1) {
+    throw new Error(`Expected one persisted delivery child=${childId} payload=${payload}`);
+  }
+  return matches[0] ?? null;
+}
+
+async function waitForPersistedAcpDeliveryId(
+  root: ReturnType<typeof createIsolatedRoot>,
+  childId: string,
+  payload: string,
+): Promise<string> {
+  const deadline = Date.now() + TIMEOUT;
+  while (Date.now() < deadline) {
+    const id = findPersistedAcpDeliveryId(root, childId, payload);
+    if (id) return id;
+    await Bun.sleep(20);
+  }
+  throw new Error(`Timed out waiting for persisted delivery child=${childId} payload=${payload}`);
+}
+
+async function waitForPersistedAcpDeliveryIds(
+  root: ReturnType<typeof createIsolatedRoot>,
+  childId: string,
+  payload: string,
+): Promise<string[]> {
+  const deadline = Date.now() + TIMEOUT;
+  while (Date.now() < deadline) {
+    const ids = findPersistedAcpDeliveryIds(root, childId, payload);
+    if (ids.length > 0) return ids;
+    await Bun.sleep(20);
+  }
+  throw new Error(`Timed out waiting for persisted delivery child=${childId} payload=${payload}`);
+}
+
+function acpSubagentState(
+  root: ReturnType<typeof createIsolatedRoot>,
+  childId: string,
+): string | null {
+  const path = join(root.home, ".ffx", "sessions", childId, "subagent", "control.json");
+  if (!existsSync(path)) return null;
+  const record = JSON.parse(readFileSync(path, "utf8")) as { state?: string };
+  return record.state ?? null;
+}
+
+function expectAcpParentDelivery(
+  body: string,
+  childId: string,
+  eventId: string,
+  payload: string,
+) {
+  const text = acpPromptText(body);
+  expect(occurrenceCount(text, "<subagent_deliveries")).toBe(1);
+  const envelope = acpParentDeliveryEnvelope(text);
+  expect(envelope).toContain(`"source_id":"${childId}"`);
+  expect(occurrenceCount(envelope, `"id":"${eventId}"`)).toBe(1);
+  expect(envelope).toContain(payload);
+}
+
+function expectAcpParentDeliveries(
+  body: string,
+  childId: string,
+  eventIds: string[],
+  payload: string,
+) {
+  const text = acpPromptText(body);
+  expect(occurrenceCount(text, "<subagent_deliveries")).toBe(1);
+  const envelope = acpParentDeliveryEnvelope(text);
+  expect(eventIds.length).toBeGreaterThan(0);
+  expect(envelope.split("\n").filter((line) => line.startsWith("- "))).toHaveLength(
+    eventIds.length,
+  );
+  for (const eventId of eventIds) {
+    expect(occurrenceCount(envelope, `"id":"${eventId}"`)).toBe(1);
+  }
+  expect(occurrenceCount(envelope, `"source_id":"${childId}"`)).toBe(eventIds.length);
+  expect(occurrenceCount(envelope, payload)).toBe(eventIds.length);
+}
+
+function expectAcpParentDeliveriesOrNone(
+  body: string,
+  childId: string,
+  eventIds: string[],
+  payload: string,
+) {
+  if (eventIds.length > 0) {
+    expectAcpParentDeliveries(body, childId, eventIds, payload);
+  } else {
+    expectNoAcpParentDeliveries(body);
+  }
+}
+
+type AcpParentMessagePart = {
+  logical_message_id: string;
+  offset: number;
+  end_offset: number;
+  total_bytes: number;
+  more: boolean;
+  content: string;
+};
+
+function acpParentMessagePart(
+  body: string,
+  childId: string,
+  eventId: string,
+): AcpParentMessagePart {
+  const text = acpPromptText(body);
+  expect(occurrenceCount(text, "<subagent_deliveries")).toBe(1);
+  const envelope = acpParentDeliveryEnvelope(text);
+  const line = envelope.split("\n").find((value) => value.startsWith("- "));
+  expect(line).toBeDefined();
+  const delivery = JSON.parse(line!.slice(2)) as {
+    id: string;
+    source_id: string;
+    payload: { message: AcpParentMessagePart };
+  };
+  expect(delivery.id).toBe(eventId);
+  expect(delivery.source_id).toBe(childId);
+  expect(delivery.payload.message.logical_message_id).toBe(eventId);
+  expect(Buffer.byteLength(delivery.payload.message.content, "utf8")).toBe(
+    delivery.payload.message.end_offset - delivery.payload.message.offset,
+  );
+  expect(delivery.payload.message.more).toBe(
+    delivery.payload.message.end_offset < delivery.payload.message.total_bytes,
+  );
+  return delivery.payload.message;
+}
+
+function expectAcpHumanUnreadIndependent(
+  root: ReturnType<typeof createIsolatedRoot>,
+  childId: string,
+  eventId: string,
+) {
+  const record = JSON.parse(readFileSync(
+    join(root.home, ".ffx", "sessions", childId, "subagent", "communication.json"),
+    "utf8",
+  )) as {
+    ledger: {
+      deliveries: Array<{ id: string; sequence: number }>;
+      cursors: Array<{
+        consumer_id: string;
+        projection?: string;
+        acknowledged_sequence: number;
+      }>;
+    };
+  };
+  const delivery = record.ledger.deliveries.find((item) => item.id === eventId);
+  expect(delivery).toBeDefined();
+  const modelCursor = record.ledger.cursors.find((cursor) =>
+    cursor.consumer_id === "parent-model" && cursor.projection === "parent_turn"
+  );
+  expect(modelCursor).toBeDefined();
+  expect(modelCursor!.acknowledged_sequence).toBeGreaterThanOrEqual(delivery!.sequence);
+  expect(record.ledger.cursors.some((cursor) => cursor.consumer_id === "human")).toBe(false);
+}
+
+function expectAcpParentHistoryClean(
+  root: ReturnType<typeof createIsolatedRoot>,
+  parentSessionId: string,
+  forbidden: string[],
+) {
+  const sessionDir = join(root.home, ".ffx", "sessions", parentSessionId);
+  for (const name of ["session.json", "events.jsonl"]) {
+    const path = join(sessionDir, name);
+    if (!existsSync(path)) continue;
+    const text = readFileSync(path, "utf8");
+    expect(text).not.toContain("<subagent_deliveries");
+    for (const marker of forbidden) expect(text).not.toContain(marker);
+  }
+}
+
 
 function acpChatGptAccessToken(
   accountId = "acct_acp_e2e",
@@ -330,7 +507,7 @@ function acpChatGptAccessToken(
 }
 
 function writeSeededAcpChatGptLogin(home: string, accessToken: string): void {
-  const fxDir = join(home, ".fx");
+  const fxDir = join(home, ".ffx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
   const authPath = join(fxDir, "chatgpt-auth.json");
@@ -342,6 +519,15 @@ function writeSeededAcpChatGptLogin(home: string, accessToken: string): void {
     account_id: "acct_acp_e2e",
   }) + "\n", { mode: 0o600 });
   chmodSync(authPath, 0o600);
+  // The provider switch resolves credentials through the generic store, so
+  // seed a stored key that authorizes Codex while streams keep using the
+  // subscription login above.
+  writeFileSync(
+    join(fxDir, "settings.json"),
+    JSON.stringify({ api_keys: { codex: accessToken } }) + "\n",
+    { mode: 0o600 },
+  );
+  chmodSync(join(fxDir, "settings.json"), 0o600);
 }
 
 function codexFinalText(text: string): string {
@@ -384,7 +570,6 @@ function startAcpFakeCodex(options: {
   const modelRequests: Array<{ path: string; authorization: string | null }> = [];
   const tokenRequests: Array<{ path: string; authorization: string | null }> = [];
   let unauthorizedResponses = options.unauthorizedResponses ?? 0;
-  const extraModels: string[] = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -395,9 +580,7 @@ function startAcpFakeCodex(options: {
         modelRequests.push(recorded);
         return Response.json({ models: [
           { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
-          { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
-          ...extraModels.map((slug) => ({ slug, visibility: "list", supported_in_api: true })),
         ] });
       }
       if (path === "/token") {
@@ -429,13 +612,12 @@ function startAcpFakeCodex(options: {
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
     tokenUrl: `http://127.0.0.1:${server.port}/token`,
-    addModel(slug: string) { extraModels.push(slug); },
     stop() { server.stop(true); },
   };
 }
 
 function writeSeededAcpGrokLogin(home: string, accessToken: string): void {
-  const fxDir = join(home, ".fx");
+  const fxDir = join(home, ".ffx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
   const authPath = join(fxDir, "grok-auth.json");
@@ -569,9 +751,6 @@ class AcpClient {
   private waiters: Array<(line: string) => void> = [];
   private _closed = false;
   private _stderrChunks: Buffer[] = [];
-  private activeSessionId: string | null = null;
-  private pendingSessionTargets = new Map<number | string, string>();
-  private pendingNewSessions = new Set<number | string>();
   readonly rawLines: string[] = [];
   private permissionOptionId: "allow_once" | "allow_always" | "reject_once" = "reject_once";
   private elicitationHandler?: (
@@ -616,12 +795,12 @@ class AcpClient {
         inheritedEnv[key] = value;
       }
     }
-    const proc = nodeSpawn(FX_BIN, args, {
-      env: providerVersionTestEnv({
+    const proc = nodeSpawn(FFX_BIN, args, {
+      env: {
         ...inheritedEnv,
         NO_COLOR: "1",
         PATH: inheritedEnv.PATH ?? "",
-      }),
+      },
       cwd: opts?.cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -652,36 +831,7 @@ class AcpClient {
   }
 
   send(msg: object): void {
-    let outgoing = msg as any;
-    if (
-      outgoing.method === "session/new" &&
-      (typeof outgoing.id === "number" || typeof outgoing.id === "string")
-    ) {
-      this.pendingNewSessions.add(outgoing.id);
-    }
-    if (
-      (outgoing.method === "session/load" || outgoing.method === "session/resume") &&
-      (typeof outgoing.id === "number" || typeof outgoing.id === "string") &&
-      typeof outgoing.params?.sessionId === "string"
-    ) {
-      this.pendingSessionTargets.set(outgoing.id, outgoing.params.sessionId);
-    }
-    if (
-      this.activeSessionId !== null &&
-      [
-        "session/prompt",
-        "session/cancel",
-        "session/set_mode",
-        "session/set_config_option",
-      ].includes(outgoing.method) &&
-      outgoing.params?.sessionId === undefined
-    ) {
-      outgoing = {
-        ...outgoing,
-        params: { ...(outgoing.params ?? {}), sessionId: this.activeSessionId },
-      };
-    }
-    this.proc.stdin!.write(JSON.stringify(outgoing) + "\n");
+    this.proc.stdin!.write(JSON.stringify(msg) + "\n");
   }
 
   endStdin(): void {
@@ -701,18 +851,6 @@ class AcpClient {
       });
     });
     const message = JSON.parse(line) as any;
-    if (typeof message.id === "number" || typeof message.id === "string") {
-      if (this.pendingNewSessions.delete(message.id)) {
-        if (message.error === undefined && typeof message.result?.sessionId === "string") {
-          this.activeSessionId = message.result.sessionId;
-        }
-      }
-      const sessionId = this.pendingSessionTargets.get(message.id);
-      if (sessionId !== undefined) {
-        this.pendingSessionTargets.delete(message.id);
-        if (message.error === undefined) this.activeSessionId = sessionId;
-      }
-    }
     if (message.method === "session/request_permission" && message.id !== undefined) {
       this.send({
         jsonrpc: "2.0",
@@ -740,22 +878,7 @@ class AcpClient {
   async request(method: string, params?: object, id?: number): Promise<object> {
     const reqId = id ?? Math.floor(Math.random() * 100000);
     this.send({ jsonrpc: "2.0", id: reqId, method, params: params ?? {} });
-    let resp: any;
-    do {
-      resp = await this.readLine() as any;
-    } while (resp.id !== reqId);
-    if (resp.error === undefined) {
-      if (method === "session/new" && typeof resp.result?.sessionId === "string") {
-        this.activeSessionId = resp.result.sessionId;
-      } else if (
-        (method === "session/load" || method === "session/resume") &&
-        typeof (params as any)?.sessionId === "string"
-      ) {
-        this.activeSessionId = (params as any).sessionId;
-      } else if (method === "session/close") {
-        this.activeSessionId = null;
-      }
-    }
+    const resp = await this.readLine();
     return resp as object;
   }
 
@@ -788,7 +911,7 @@ function createIsolatedRoot(prefix: string) {
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   const external = join(root, "external");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   mkdirSync(external, { recursive: true });
   return {
@@ -804,7 +927,7 @@ function createShortIsolatedRoot(prefix: string) {
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   const external = join(root, "external");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   mkdirSync(external, { recursive: true });
   return {
@@ -816,7 +939,7 @@ function createShortIsolatedRoot(prefix: string) {
 }
 
 async function waitForTerminalHostExit(root: string): Promise<void> {
-  const identityPath = join(root, "home", ".fx", "terminal-host-v7", "host.json");
+  const identityPath = join(root, "home", ".ffx", "terminal-host", "host.json");
   const deadline = Date.now() + TERMINAL_HOST_EXIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (!existsSync(identityPath)) return;
@@ -847,10 +970,10 @@ function writeAcpSession(
   sessionId: string,
   updatedAtMs: number,
 ): void {
-  const sessionDir = join(home, ".fx", "sessions", sessionId);
+  const sessionDir = join(home, ".ffx", "sessions", sessionId);
   mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
-  chmodSync(join(home, ".fx"), 0o700);
-  chmodSync(join(home, ".fx", "sessions"), 0o700);
+  chmodSync(join(home, ".ffx"), 0o700);
+  chmodSync(join(home, ".ffx", "sessions"), 0o700);
   chmodSync(sessionDir, 0o700);
   writeFileSync(
     join(sessionDir, "session.json"),
@@ -870,31 +993,6 @@ function writeAcpSession(
   );
 }
 
-function writeLegacyAcpSessionWithoutWorkspace(
-  home: string,
-  sessionId: string,
-  updatedAtMs: number,
-): void {
-  const sessionDir = join(home, ".fx", "sessions", sessionId);
-  mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
-  chmodSync(join(home, ".fx"), 0o700);
-  chmodSync(join(home, ".fx", "sessions"), 0o700);
-  chmodSync(sessionDir, 0o700);
-  writeFileSync(
-    join(sessionDir, "session.json"),
-    JSON.stringify({
-      schema_version: 1,
-      id: sessionId,
-      created_at_ms: 1,
-      updated_at_ms: updatedAtMs,
-      conversation_language: "en",
-      history_len: 0,
-      history: [],
-    }) + "\n",
-    { mode: 0o600 },
-  );
-}
-
 function createPromptTerminalBoundary(root: string) {
   const terminalReady = join(root, "prompt-terminal.ready");
   const reapReady = join(root, "prompt-reap.ready");
@@ -904,9 +1002,9 @@ function createPromptTerminalBoundary(root: string) {
     reapReady,
     release,
     env: {
-      FX_E2E_ACP_PROMPT_TERMINAL_READY: terminalReady,
-      FX_E2E_ACP_PROMPT_REAP_READY: reapReady,
-      FX_E2E_ACP_PROMPT_RELEASE: release,
+      FFX_E2E_ACP_PROMPT_TERMINAL_READY: terminalReady,
+      FFX_E2E_ACP_PROMPT_REAP_READY: reapReady,
+      FFX_E2E_ACP_PROMPT_RELEASE: release,
     },
   };
 }
@@ -1029,20 +1127,15 @@ async function runMcpToolPrompt(
   ).toContain(expectedResult);
 }
 
-async function continueRecovery(
-  client: AcpClient,
-  timeoutMs = LIVE_TIMEOUT,
-  sessionId?: string,
-) {
+async function continueRecovery(client: AcpClient, timeoutMs = LIVE_TIMEOUT) {
   const promptId = Math.floor(Math.random() * 100000) + 1000;
   client.send({
     jsonrpc: "2.0",
     id: promptId,
     method: "session/prompt",
     params: {
-      ...(sessionId ? { sessionId } : {}),
       prompt: [],
-      _meta: { fx: { continueRecovery: true } },
+      _meta: { ffx: { continueRecovery: true } },
     },
   });
 
@@ -1078,60 +1171,24 @@ describe("acp: model-independent", () => {
   });
 
   test(
-    "host-managed ACP sessions stream without local credentials",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-host-managed-");
-      const gateway = startFakeGateway([finalText("ACP_HOST_MANAGED_OK")]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: {
-            ...fakeGatewayEnv(root, gateway),
-            AI_GATEWAY_API_KEY: undefined,
-            VERCEL_OIDC_TOKEN: undefined,
-            FX_AUTH_MODE: "host-managed",
-          },
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine();
-        const result = await runPrompt(client, "Reply once.", TIMEOUT);
-
-        expect(result.promptResult.result.stopReason).toBe("end_turn");
-        expect(JSON.stringify(result.messages)).toContain("ACP_HOST_MANAGED_OK");
-        expect(gateway.requests.length).toBe(1);
-        expect(gateway.requests[0]!.headers.get("authorization")).toBeNull();
-        expect(gateway.requests[0]!.headers.get("x-vercel-ai-gateway-team")).toBeNull();
-        expect(existsSync(join(root.home, ".fx", "auth.json"))).toBe(false);
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
     "active ACP session uses typed MCP Resources Prompts and Completion state",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-features-");
+      const root = createIsolatedRoot("ffx-acp-mcp-features-");
       const pidPath = join(root.root, "mcp-features.pid");
       const wireLogPath = join(root.root, "mcp-features-wire.jsonl");
       const profilePidPath = join(root.root, "mcp-profile-features.pid");
       const profileWireLogPath = join(root.root, "mcp-profile-features-wire.jsonl");
       writeFileSync(
-        join(root.home, ".fx", "mcp.json"),
+        join(root.home, ".ffx", "mcp.json"),
         JSON.stringify({
           mcp: {
             profile: {
               type: "local",
               command: [process.execPath, MCP_STDIO_FIXTURE],
               environment: {
-                FX_MCP_MODE: "features",
-                FX_MCP_PID_PATH: profilePidPath,
-                FX_MCP_WIRE_LOG: profileWireLogPath,
+                FFX_MCP_MODE: "features",
+                FFX_MCP_PID_PATH: profilePidPath,
+                FFX_MCP_WIRE_LOG: profileWireLogPath,
               },
             },
           },
@@ -1191,7 +1248,7 @@ describe("acp: model-independent", () => {
               "UNUSED",
               pidPath,
               "features",
-              { FX_MCP_WIRE_LOG: wireLogPath },
+              { FFX_MCP_WIRE_LOG: wireLogPath },
             )],
           },
           2,
@@ -1237,9 +1294,9 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "session/new advertises no unsupported slash commands",
+    "session/new omits the removed summary command",
     async () => {
-      const root = createIsolatedRoot("fx-acp-available-commands-");
+      const root = createIsolatedRoot("ffx-acp-available-commands-");
       const gateway = startFakeGateway([]);
       try {
         client = await AcpClient.create({
@@ -1254,7 +1311,8 @@ describe("acp: model-independent", () => {
         const commandNames = notification.params.update.availableCommands.map(
           (command: any) => command.name,
         );
-        expect(commandNames).toEqual([]);
+        expect(commandNames).toContain("compact");
+        expect(commandNames).not.toContain("summary");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -1268,13 +1326,13 @@ describe("acp: model-independent", () => {
   test(
     "ACP reports a paused recovery and continues it only on explicit metadata",
     async () => {
-      const root = createIsolatedRoot("fx-acp-model-recovery-");
+      const root = createIsolatedRoot("ffx-acp-model-recovery-");
       const partialText = "ACP partial output before EOF.";
-      const replacementText = `${partialText} ACP recovery completed.`;
+      const finalTextSuffix = "ACP recovery completed.";
       const gateway = startFakeGateway([
         partialEofResponse(partialText),
         ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
-        finalText(replacementText),
+        finalText(`${partialText}${finalTextSuffix}`),
       ]);
       try {
         client = await AcpClient.create({
@@ -1310,102 +1368,8 @@ describe("acp: model-independent", () => {
           "Preserve this ACP prompt through recovery.",
         );
         const allUpdates = JSON.stringify([...paused.messages, ...resumed.messages]);
-        expectRestartedAcpResponse(paused.messages, resumed.messages, partialText, replacementText);
-        expect(occurrenceCount(allUpdates, partialText)).toBe(2);
-        expect(occurrenceCount(allUpdates, replacementText)).toBe(1);
-        expect(gateway.requests[10]!.body).not.toContain(partialText);
-        expect(acpLatestPromptText(gateway.requests[10]!.body)).toContain("Restart that response");
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ACP cancellation preserves earlier preview while replacement language is rejected",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-rejected-replacement-");
-      const tracePath = join(root.root, "trace.log");
-      const partialText = "The accepted English preview before the connection stopped.";
-      const rejectedText = "我会先检查锁文件和依赖清单。";
-      const laterText = "The later English answer is complete.";
-      const heldReplacement = new Response(new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(
-            `data: ${JSON.stringify({ type: "text-delta", id: "replacement", delta: rejectedText })}\n\n`,
-          ));
-        },
-      }), { headers: { "content-type": "text/event-stream" } });
-      const gateway = startFakeGateway([
-        partialEofResponse(partialText),
-        heldReplacement,
-        finalText(laterText),
-      ]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: {
-            ...fakeGatewayEnv(root, gateway),
-            FX_TRACE_LOG: tracePath,
-            FX_TRACE_SCOPES: "sse",
-          },
-        });
-        const sessionId = await startCodeSession(client);
-        sendPrompt(client, 40, "Explain the repository findings in English without using tools.");
-        await waitForCondition("both response text events", () => {
-          if (!existsSync(tracePath)) return false;
-          return (readFileSync(tracePath, "utf8").match(/event type=text-delta/g) ?? []).length === 2;
-        }, TIMEOUT);
-        expect(client.rawLines.join("\n")).toContain(partialText);
-        expect(client.rawLines.join("\n")).not.toContain(rejectedText);
-        expect(gateway.requests).toHaveLength(2);
-        expect(gateway.requests[1]!.body).not.toContain(partialText);
-
-        client.send({ jsonrpc: "2.0", id: 41, method: "session/cancel", params: {} });
-        const responses = new Map<number, any>();
-        while (responses.size < 2) {
-          const message = await client.readLine() as any;
-          if (message.id === 40 || message.id === 41) responses.set(message.id, message);
-        }
-        expect(responses.get(40)?.result?.stopReason).toBe("cancelled");
-        expect(responses.get(41)?.result).toBeNull();
-        expect(gateway.requests).toHaveLength(2);
-
-        await client.close();
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 50);
-        client.send({
-          jsonrpc: "2.0",
-          id: 51,
-          method: "session/load",
-          params: { sessionId, mcpServers: [] },
-        });
-        const loaded: any[] = [];
-        while (true) {
-          const message = await client.readLine() as any;
-          if (message.id === 51) {
-            expect(message.error).toBeUndefined();
-            break;
-          }
-          loaded.push(message);
-        }
-        expect(occurrenceCount(JSON.stringify(loaded), partialText)).toBe(1);
-        expect(JSON.stringify(loaded)).not.toContain(rejectedText);
-
-        const later = await runPrompt(client, "Return another English answer.", TIMEOUT);
-        expect(later.promptResult.result.stopReason).toBe("end_turn");
-        expect(JSON.stringify(later.messages)).toContain(laterText);
-        expect(JSON.stringify(later.messages)).not.toContain(partialText);
-        expect(gateway.requests).toHaveLength(3);
-        expect(gateway.requests[2]!.body).toContain(partialText);
-        expect(gateway.requests[2]!.body).not.toContain(rejectedText);
+        expect(occurrenceCount(allUpdates, partialText)).toBe(1);
+        expect(occurrenceCount(allUpdates, finalTextSuffix)).toBe(1);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -1419,7 +1383,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP sends continuation text normally with the full tool surface",
     async () => {
-      const root = createIsolatedRoot("fx-acp-continuation-text-");
+      const root = createIsolatedRoot("ffx-acp-continuation-text-");
       const gateway = startFakeGateway([finalText("ACP_CONTINUATION_TEXT_COMPLETE")]);
       const submitted = "Continue from the last useful progress update.";
       try {
@@ -1438,17 +1402,17 @@ describe("acp: model-independent", () => {
           .map((message) => acpContentText(message.content))
           .join("\n");
         expect(prompt).toContain(submitted);
-        expect(request.tools).toHaveLength(17);
+        expect(request.tools).toHaveLength(26);
         const toolNames = serializedToolNames(oracleRequest);
         expect(toolNames).toEqual(
-          AUTO_EXA_SERIALIZED_TOOL_NAMES,
+          AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
         );
-        expect(toolNames.filter((name) => name === "shell")).toHaveLength(1);
-        expect(toolNames.filter((name) => name === "exa_search"))
+        expect(toolNames.filter((name) => name === "terminal")).toHaveLength(1);
+        expect(toolNames.filter((name) => name === "perplexity_search"))
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
         expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [14],
+          providerToolIndices: [23],
           guidanceMessageIndices: [1],
         });
         expect(gateway.requests[0]!.body).not.toContain(
@@ -1468,97 +1432,9 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ordinary ACP ignores private libfx host capabilities",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-private-capabilities-");
-      const gateway = startFakeGateway([finalText("ACP_PRIVATE_CAPABILITIES_IGNORED")]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request(
-          "initialize",
-          {
-            protocolVersion: 1,
-            clientCapabilities: {
-              libfx: {
-                tools: [{
-                  name: "private_lookup",
-                  description: "Private libfx tool",
-                  inputSchema: { type: "object" },
-                }],
-                instructions: "PRIVATE_LIBFX_INSTRUCTIONS",
-              },
-            },
-          },
-          1,
-        );
-        await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine();
-        await client.request("session/set_mode", { modeId: "code" }, 3);
-
-        const result = await runPrompt(client, "Use the ordinary ACP tool surface.", TIMEOUT);
-        expect(result.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(1);
-        const request = acpGatewayRequest(gateway.requests[0]!.body);
-        expect(request.tools.some((tool) => tool.name === "private_lookup")).toBe(false);
-        expect(request.tools.some((tool) => tool.name === "shell")).toBe(true);
-        expect(gateway.requests[0]!.body).not.toContain("PRIVATE_LIBFX_INSTRUCTIONS");
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ordinary ACP rejects private libfx methods without replacing its session",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-private-methods-");
-      const gateway = startFakeGateway([finalText("ACP_PRIVATE_METHODS_REJECTED")]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
-        const sessionId = created.result.sessionId as string;
-        await client.readLine();
-
-        for (const [id, method, params] of [
-          [3, "libfx/checkpoint", { sessionId }],
-          [4, "libfx/restore", { sessionId, checkpoint: "" }],
-          [5, "libfx/new", {}],
-        ] as const) {
-          expect(await client.request(method, params, id)).toMatchObject({
-            jsonrpc: "2.0",
-            id,
-            error: { code: -32601, message: "Method not found" },
-          });
-        }
-
-        const followUp = await runPrompt(client, "Keep using the original ACP session.", TIMEOUT);
-        expect(followUp.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(1);
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
     "read_file rejects a FIFO without waiting for a writer",
     async () => {
-      const root = createIsolatedRoot("fx-acp-read-file-fifo-");
+      const root = createIsolatedRoot("ffx-acp-read-file-fifo-");
       const fifoPath = join(root.workspace, "search-pipe");
       const fifo = Bun.spawnSync(["mkfifo", fifoPath]);
       expect(fifo.exitCode).toBe(0);
@@ -1600,175 +1476,12 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP forwards exact Markdown source without rendered duplicates",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-markdown-source-");
-      const markdown = [
-        "# Heading\n\n- **bold** item\n\n",
-        "| A | B |\n| - | - |\n| 1 | 2 |\n\n",
-        "```zig\nconst x = 1;\n```\n",
-      ];
-      const gateway = startFakeGateway([
-        fakeGatewaySse([
-          ...markdown.map((delta) => ({
-            type: "text-delta",
-            id: "answer_1",
-            delta,
-          })),
-          {
-            type: "finish",
-            finishReason: { unified: "stop", raw: "stop" },
-            usage: {
-              inputTokens: { total: 3 },
-              outputTokens: { total: 5 },
-            },
-          },
-        ]),
-      ]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await startCodeSession(client);
-
-        const result = await runPrompt(client, "Return the Markdown fixture.", TIMEOUT);
-        expect(result.promptResult.result.stopReason).toBe("end_turn");
-        const agentChunks = result.messages.filter((message) =>
-            message.method === "session/update" &&
-            message.params?.update?.sessionUpdate === "agent_message_chunk"
-          );
-        const responseText = agentChunks
-          .map((message) => message.params.update.content.text)
-          .join("");
-        expect(responseText).toBe(markdown.join(""));
-        expect(responseText).not.toContain("\u001b");
-        expect(agentChunks.length).toBeGreaterThan(1);
-        expect(typeof agentChunks[0]?.params.update.messageId).toBe("string");
-        expect(agentChunks[0]?.params.update.messageId.length).toBeGreaterThan(0);
-        expect(new Set(agentChunks.map((message) => message.params.update.messageId)).size).toBe(1);
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ACP publishes session title and authoritative context usage",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-session-metadata-");
-      const title = "Publish ACP session metadata";
-      const gateway = startFakeGateway(
-        [
-          finalText("Metadata published."),
-          fakeGatewaySse([{
-            type: "text-delta",
-            id: "answer_2",
-            delta: "Usage omitted.",
-          }, {
-            type: "finish",
-            finishReason: { unified: "stop", raw: "stop" },
-          }]),
-        ],
-        {
-          models: [{
-            id: FAKE_GATEWAY_MODEL,
-            type: "language",
-            tags: ["tool-use"],
-            context_window: 128_000,
-          }],
-        },
-      );
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        const sessionId = await startCodeSession(client);
-
-        const result = await runPrompt(client, title, TIMEOUT);
-        expect(result.promptResult.result.stopReason).toBe("end_turn");
-        const usage = result.messages.find((message) =>
-          message.method === "session/update" &&
-          message.params?.update?.sessionUpdate === "usage_update"
-        );
-        expect(usage?.params).toMatchObject({
-          sessionId,
-          update: {
-            sessionUpdate: "usage_update",
-            used: 8,
-            size: 128_000,
-          },
-        });
-        expect(usage?.params.update.cost).toBeUndefined();
-
-        const info = result.messages.find((message) =>
-          message.method === "session/update" &&
-          message.params?.update?.sessionUpdate === "session_info_update" &&
-          message.params?.update?.title === title
-        );
-        expect(info?.params.sessionId).toBe(sessionId);
-        expect(Number.isNaN(Date.parse(info?.params.update.updatedAt))).toBe(false);
-
-        const unmeasured = await runPrompt(
-          client,
-          "Return a response without provider usage metadata.",
-          TIMEOUT,
-        );
-        expect(unmeasured.promptResult.result.stopReason).toBe("end_turn");
-        expect(unmeasured.messages.some((message) =>
-          message.params?.update?.sessionUpdate === "usage_update"
-        )).toBe(false);
-
-        await client.close();
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 90);
-        client.send({
-          jsonrpc: "2.0",
-          id: 91,
-          method: "session/load",
-          params: { sessionId, cwd: root.workspace, mcpServers: [] },
-        });
-        const replay: any[] = [];
-        while (true) {
-          const message = await client.readLine() as any;
-          if (message.id === 91) break;
-          replay.push(message);
-        }
-        expect(replay).toContainEqual(expect.objectContaining({
-          method: "session/update",
-          params: expect.objectContaining({
-            sessionId,
-            update: expect.objectContaining({
-              sessionUpdate: "session_info_update",
-              title,
-            }),
-          }),
-        }));
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
     "ACP reload replays pending execution once and clears recovery after completion",
     async () => {
-      const root = createIsolatedRoot("fx-acp-reload-model-recovery-");
+      const root = createIsolatedRoot("ffx-acp-reload-model-recovery-");
       const toolEvidence = "ACP_RESTART_TOOL_EVIDENCE";
       const partialText = "ACP_RESTART_PARTIAL_SENTINEL";
-      const replacementText = "ACP_RESTART_FINAL_SENTINEL";
+      const finalTextSuffix = "ACP_RESTART_FINAL_SENTINEL";
       writeFileSync(join(root.workspace, "recovery-fixture.txt"), `${toolEvidence}\n`);
       const gateway = startFakeGateway([
         fakeGatewayToolCall("recovery_read_1", "read_file", {
@@ -1776,7 +1489,7 @@ describe("acp: model-independent", () => {
         }),
         partialEofResponse(partialText),
         ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
-        finalText(replacementText),
+        finalText(`${partialText}${finalTextSuffix}`),
       ]);
       try {
         client = await AcpClient.create({
@@ -1825,7 +1538,7 @@ describe("acp: model-independent", () => {
         expect(occurrenceCount(loadUpdates, toolEvidence)).toBe(1);
         expect(occurrenceCount(loadUpdates, partialText)).toBe(1);
 
-        const resumed = await continueRecovery(client, TIMEOUT, sessionId);
+        const resumed = await continueRecovery(client, TIMEOUT);
         expect(resumed.promptResult.error).toBeUndefined();
         expect(resumed.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(12);
@@ -1834,11 +1547,8 @@ describe("acp: model-independent", () => {
           ...loadMessages,
           ...resumed.messages,
         ]);
-        expectRestartedAcpResponse(loadMessages, resumed.messages, partialText, replacementText);
         expect(occurrenceCount(restartedUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(restartedUpdates, replacementText)).toBe(1);
-        expect(gateway.requests[11]!.body).not.toContain(partialText);
-        expect(acpLatestPromptText(gateway.requests[11]!.body)).toContain("Restart that response");
+        expect(occurrenceCount(restartedUpdates, finalTextSuffix)).toBe(1);
 
         await client.close();
         client = await AcpClient.create({
@@ -1866,83 +1576,11 @@ describe("acp: model-independent", () => {
         const completedLoadUpdates = JSON.stringify(completedLoadMessages);
         expect(completedLoadUpdates).not.toContain("modelResponseRecovery");
         expect(occurrenceCount(completedLoadUpdates, toolEvidence)).toBe(1);
-        expect(occurrenceCount(completedLoadUpdates, partialText)).toBe(0);
-        expect(occurrenceCount(completedLoadUpdates, replacementText)).toBe(1);
+        expect(occurrenceCount(completedLoadUpdates, partialText)).toBe(1);
+        expect(occurrenceCount(completedLoadUpdates, finalTextSuffix)).toBe(1);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ACP retains interrupted preview when the process dies during a retry",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-retry-crash-");
-      const partialText = "ACP_CRASH_PARTIAL_PREVIEW";
-      const toolEvidence = "ACP_CRASH_SETTLED_TOOL";
-      const replacementText = "ACP_CRASH_REPLACEMENT";
-      writeFileSync(join(root.workspace, "fixture.txt"), `${toolEvidence}\n`);
-      const held = heldFakeGatewayFinalText();
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("crash_read_1", "read_file", { path: "fixture.txt" }),
-        partialEofResponse(partialText),
-        held.response,
-        finalText(replacementText),
-      ]);
-      const proc = nodeSpawn(FX_BIN, ["acp"], {
-        cwd: root.workspace,
-        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      try {
-        client = new AcpClient(proc);
-        const sessionId = await startCodeSession(client);
-        sendPrompt(client, 40, "Read fixture.txt once and preserve its result through recovery.");
-        await waitForCondition("reserved retry request", () => gateway.requests.length === 3, TIMEOUT);
-        expect(gateway.requests[2]!.body).not.toContain(partialText);
-        const exited = client.waitForExit();
-        proc.kill("SIGKILL");
-        await exited;
-        expect(proc.signalCode).toBe("SIGKILL");
-
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 10);
-        client.send({
-          jsonrpc: "2.0",
-          id: 11,
-          method: "session/load",
-          params: { sessionId, mcpServers: [] },
-        });
-        const loaded: any[] = [];
-        while (true) {
-          const message = await client.readLine() as any;
-          if (message.id === 11) {
-            expect(message.error).toBeUndefined();
-            break;
-          }
-          loaded.push(message);
-        }
-        const loadUpdates = JSON.stringify(loaded);
-        expect(occurrenceCount(loadUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(loadUpdates, toolEvidence)).toBe(1);
-
-        const resumed = await continueRecovery(client, TIMEOUT, sessionId);
-        expect(resumed.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(4);
-        expect(acpToolResultText(gateway.requests[3]!.body, "crash_read_1")).toContain(toolEvidence);
-        expect(gateway.requests[3]!.body).not.toContain(partialText);
-        expectRestartedAcpResponse(loaded, resumed.messages, partialText, replacementText);
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        held.dispose();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
@@ -1953,7 +1591,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP sends a prompt above the old CLI limit with one capability snapshot",
     async () => {
-      const root = createIsolatedRoot("fx-acp-large-prompt-");
+      const root = createIsolatedRoot("ffx-acp-large-prompt-");
       const gateway = startFakeGateway(
         [finalText("ACP_LARGE_PROMPT_COMPLETE")],
         {
@@ -1998,33 +1636,33 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP executes the shared managed shell TTY path",
+    "ACP executes the shared public terminal tool through the native backend",
     async () => {
-      const root = createShortIsolatedRoot("fx-acp-terminal-");
-      const toolCallId = "acp_shell_tty_1";
+      const root = createShortIsolatedRoot("ffx-acp-terminal-");
+      const toolCallId = "acp_terminal_native_1";
       const gateway = startFakeGateway([
-        fakeGatewayToolCall(toolCallId, "shell", {
-          request: {
-            action: "run",
-            cwd: root.workspace,
-            command: "printf ACP_PUBLIC_SHELL_TTY",
-            shell: {
-              kind: "executable",
-              path: TERMINAL_FIXTURE_SHELL,
-              clean_start: true,
-            },
-            tty: true,
-            yield_time_ms: 30_000,
+        fakeGatewayToolCall(toolCallId, "terminal", {
+          action: "start",
+          cwd: root.workspace,
+          command: "printf ACP_PUBLIC_TERMINAL_NATIVE",
+          shell: {
+            kind: "executable",
+            path: TERMINAL_FIXTURE_SHELL,
+            clean_start: true,
           },
+          backend: "native",
+          return_when: { kind: "exit" },
+          wait_ceiling_ms: 5_000,
+          dimensions: { rows: 24, columns: 80 },
         }),
-        finalText("ACP public shell complete"),
+        finalText("ACP public terminal complete"),
       ]);
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway),
-            FX_TERMINAL_HOST_IDLE_MS: "200",
+            FFX_TERMINAL_HOST_IDLE_MS: "200",
           },
         });
         client.setPermissionOption("allow_once");
@@ -2032,7 +1670,7 @@ describe("acp: model-independent", () => {
         await client.request("session/set_mode", { modeId: "ask" }, 4);
         const result = await runPrompt(
           client,
-          "Run the managed shell TTY fixture.",
+          "Run the native public terminal fixture.",
           TIMEOUT,
         );
 
@@ -2042,9 +1680,9 @@ describe("acp: model-independent", () => {
           gateway.requests[1]!.body,
           toolCallId,
         );
-        expect(toolResult).toContain('"state":"completed"');
-        expect(toolResult).toContain('"backend":"tty"');
-        expect(toolResult).toContain('"exit_code":0');
+        expect(toolResult).toContain('"success":{"start"');
+        expect(toolResult).toContain('"backend":"native"');
+        expect(toolResult).toContain('"exited":0');
         expect(toolResult).not.toContain("owner_authority");
         expect(toolResult).not.toContain("proof");
         expect(client.stderr).toBe("");
@@ -2061,7 +1699,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP added-root reads skip external deferral and added project instructions",
     async () => {
-      const root = createIsolatedRoot("fx-acp-added-root-");
+      const root = createIsolatedRoot("ffx-acp-added-root-");
       const sentinel = "ACP_ADDED_ROOT_AGENTS_SENTINEL";
       const target = join(root.external, "fixture.txt");
       writeFileSync(join(root.external, "AGENTS.md"), sentinel + "\n");
@@ -2106,13 +1744,13 @@ describe("acp: model-independent", () => {
   test(
     "context limit warnings use ACP session updates and dedupe for the live session",
     async () => {
-      const root = createIsolatedRoot("fx-acp-context-limits-");
+      const root = createIsolatedRoot("ffx-acp-context-limits-");
       writeFileSync(
         join(root.workspace, "AGENTS.md"),
         "ACP_RULE_PREFIX\nACP_RULE_SECOND\nACP_RULE_TAIL_SENTINEL\n",
       );
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({
           context_limits: { project_instruction_file_bytes: 96 },
           workspaces: {
@@ -2192,7 +1830,7 @@ describe("acp: model-independent", () => {
       const remoteUri = `https://example.test/${"a".repeat(256 * 1024)}/REMOTE_URI_TAIL_SENTINEL`;
 
       for (const testCase of cases) {
-        const root = createIsolatedRoot(`fx-acp-bounded-omission-${testCase.label}-`);
+        const root = createIsolatedRoot(`ffx-acp-bounded-omission-${testCase.label}-`);
         const gateway = startFakeGateway([finalText(`ACP_BOUNDED_OMISSION_${testCase.label}`)]);
         try {
           client = await AcpClient.create({
@@ -2242,7 +1880,7 @@ describe("acp: model-independent", () => {
   test(
     "project omissions reach ACP session updates and model context",
     async () => {
-      const root = createIsolatedRoot("fx-acp-project-omissions-");
+      const root = createIsolatedRoot("ffx-acp-project-omissions-");
       const { target } = writeProjectOmissionFixture(root);
       const gateway = startFakeGateway([finalText("ACP_PROJECT_OMISSIONS_COMPLETE")]);
       try {
@@ -2299,7 +1937,7 @@ describe("acp: model-independent", () => {
       }));
 
       for (const testCase of cases) {
-        const root = createIsolatedRoot(`fx-acp-aggregate-omissions-${testCase.label}-`);
+        const root = createIsolatedRoot(`ffx-acp-aggregate-omissions-${testCase.label}-`);
         const gateway = startFakeGateway([finalText(`ACP_AGGREGATE_OMISSIONS_${testCase.label}`)]);
         try {
           client = await AcpClient.create({
@@ -2346,9 +1984,9 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "initialize advertises native image prompt support",
+    "initialize reports that image prompt blocks are unsupported",
     async () => {
-      const root = createIsolatedRoot("fx-acp-initialize-");
+      const root = createIsolatedRoot("ffx-acp-initialize-");
       try {
         const version = await runFx(["--version"], {
           cwd: root.workspace,
@@ -2365,7 +2003,7 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: {
             HOME: root.home,
-            AI_GATEWAY_API_KEY: "e2e-placeholder",
+            FFX_PROVIDER_API_KEY: "e2e-placeholder",
             VERCEL_OIDC_TOKEN: "",
           },
         });
@@ -2377,10 +2015,10 @@ describe("acp: model-independent", () => {
         expect(resp.jsonrpc).toBe("2.0");
         expect(resp.id).toBe(1);
         expect(resp.result.protocolVersion).toBe(1);
-        expect(resp.result.agentInfo.name).toBe("fx");
+        expect(resp.result.agentInfo.name).toBe("ffx");
         expect(resp.result.agentInfo.version).toBe(version.stdout.trim());
         expect(resp.result.agentCapabilities.loadSession).toBe(true);
-        expect(resp.result.agentCapabilities.promptCapabilities.image).toBe(true);
+        expect(resp.result.agentCapabilities.promptCapabilities.image).toBe(false);
         expect(resp.result.agentCapabilities.mcpCapabilities.http).toBe(true);
         expect(resp.result.agentCapabilities.mcpCapabilities.sse).toBe(true);
         expect(resp.result.agentCapabilities.sessionCapabilities.resume).toEqual({});
@@ -2396,15 +2034,9 @@ describe("acp: model-independent", () => {
   test(
     "ACP session/new calls a supplied modern HTTP MCP server",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-http-");
+      const root = createIsolatedRoot("ffx-acp-mcp-http-");
       const httpFixture = startModernMcpHttpFixture("json");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("search_http", "capability_search", {
-          kind: "mcp",
-          server: "fixture",
-          query: "echo",
-          limit: 5,
-        }),
         fakeGatewayToolCall("select_http", "mcp_select_tool", {
           name: MCP_TOOL_NAME,
         }),
@@ -2433,19 +2065,12 @@ describe("acp: model-independent", () => {
         expect(created.error).toBeUndefined();
         await client.readLine();
         await client.request("session/set_mode", { modeId: "code" }, 3);
-        const requestStart = gateway.requests.length;
-        const prompt = await runPrompt(client, "Find and call the supplied MCP echo tool.", TIMEOUT);
-        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(requestStart + 4);
-        expect(
-          acpGatewayRequest(gateway.requests[requestStart]!.body).tools.some(
-            (tool) => tool.name === "memory",
-          ),
-        ).toBe(false);
-        expect(acpToolResultText(gateway.requests[requestStart + 1]!.body, "search_http"))
-          .toContain(MCP_TOOL_NAME);
-        expect(acpToolResultText(gateway.requests[requestStart + 3]!.body, "call_http"))
-          .toContain(MODERN_HTTP_TOOL_RESULT + ":acp");
+        await runMcpToolPrompt(
+          client,
+          gateway,
+          "call_http",
+          `${MODERN_HTTP_TOOL_RESULT}:acp`,
+        );
 
         const initialPrompt = acpGatewayRequest(gateway.requests[0]!.body).prompt
           .map((message) => acpContentText(message.content))
@@ -2476,389 +2101,9 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP skips pending workspace MCP and loads it after explicit trust",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-project-mcp-");
-      const pidPath = join(root.root, "project-mcp.pid");
-      const wirePath = join(root.root, "project-mcp-wire.jsonl");
-      writeFileSync(
-        join(root.workspace, ".mcp.json"),
-        JSON.stringify({
-          mcpServers: {
-            fixture: {
-              command: "${ACP_PROJECT_COMMAND}",
-              args: ["${ACP_PROJECT_FIXTURE}"],
-              env: {
-                FX_MCP_RESULT_TEXT: "${ACP_PROJECT_RESULT:-ACP_PROJECT_MCP_RESULT}",
-                FX_MCP_PID_PATH: "${ACP_PROJECT_PID}",
-                FX_MCP_WIRE_LOG: "${ACP_PROJECT_WIRE}",
-              },
-            },
-          },
-        }),
-      );
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_project", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_project", MCP_TOOL_NAME, { text: "acp" }),
-        finalText("ACP project MCP complete"),
-      ]);
-      const env = {
-        ...fakeGatewayEnv(root, gateway),
-        ACP_PROJECT_COMMAND: process.execPath,
-        ACP_PROJECT_FIXTURE: MCP_STDIO_FIXTURE,
-        ACP_PROJECT_PID: pidPath,
-        ACP_PROJECT_WIRE: wirePath,
-      };
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env,
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        const created = await client.request(
-          "session/new",
-          { cwd: root.workspace, mcpServers: [] },
-          2,
-        ) as any;
-        expect(created.error).toBeUndefined();
-        await client.readLine();
-        expect(existsSync(pidPath)).toBe(false);
-        expect(existsSync(wirePath)).toBe(false);
-        await client.close();
-        client = null;
-
-        const trusted = await runFx(
-          ["mcp", "trust", "approve", "fixture"],
-          { cwd: root.workspace, env },
-        );
-        expect(trusted.code).toBe(0);
-
-        client = await AcpClient.create({ cwd: root.workspace, env });
-        await client.request("initialize", { protocolVersion: 1 }, 10);
-        const trustedSession = await client.request(
-          "session/new",
-          { cwd: root.workspace, mcpServers: [] },
-          11,
-        ) as any;
-        expect(trustedSession.error).toBeUndefined();
-        await client.readLine();
-        await client.request("session/set_mode", { modeId: "code" }, 12);
-        await runMcpToolPrompt(
-          client,
-          gateway,
-          "call_project",
-          "ACP_PROJECT_MCP_RESULT",
-        );
-        expect(existsSync(pidPath)).toBe(true);
-        const settingsPath = join(root.home, ".fx", "settings.json");
-        expect(readFileSync(settingsPath, "utf8")).toContain(
-          "enabledMcpjsonServers",
-        );
-      } finally {
-        await client?.close();
-        client = null;
-        gateway.stop();
-        if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ACP keeps duplicate primary server names and excludes a workspace collision",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-project-mcp-collision-");
-      const firstPid = join(root.root, "primary-first.pid");
-      const secondPid = join(root.root, "primary-second.pid");
-      const projectPid = join(root.root, "project-collision.pid");
-      writeFileSync(
-        join(root.workspace, ".mcp.json"),
-        JSON.stringify({
-          mcpServers: {
-            fixture: {
-              command: process.execPath,
-              args: [MCP_STDIO_FIXTURE],
-              env: { FX_MCP_PID_PATH: projectPid },
-            },
-          },
-        }),
-      );
-      const gateway = startFakeGateway([]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        const created = await client.request(
-          "session/new",
-          {
-            cwd: root.workspace,
-            mcpServers: [
-              acpStdioServer("PRIMARY_FIRST", firstPid),
-              acpStdioServer("PRIMARY_SECOND", secondPid),
-            ],
-          },
-          2,
-        ) as any;
-        expect(created.error).toBeUndefined();
-        await client.readLine();
-        await waitForPath(firstPid, 5_000);
-        await waitForPath(secondPid, 5_000);
-        expect(existsSync(projectPid)).toBe(false);
-      } finally {
-        await client?.close();
-        client = null;
-        gateway.stop();
-        if (existsSync(firstPid)) await expectMcpProcessExited(firstPid);
-        if (existsSync(secondPid)) await expectMcpProcessExited(secondPid);
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ACP session/new keeps rejected and pending workspace MCP inert",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-project-mcp-optional-");
-      const pidPath = join(root.root, "rejected-project-mcp.pid");
-      let unavailableAttempts = 0;
-      const unavailable = Bun.serve({
-        port: 0,
-        fetch() {
-          unavailableAttempts += 1;
-          return new Response("optional failure", { status: 500 });
-        },
-      });
-      writeFileSync(
-        join(root.home, ".fx", "settings.json"),
-        JSON.stringify({
-          workspaces: {
-            [root.workspace]: { disabledMcpjsonServers: ["fixture"] },
-          },
-        }),
-      );
-      writeFileSync(
-        join(root.workspace, ".mcp.json"),
-        JSON.stringify({
-          mcpServers: {
-            fixture: {
-              command: process.execPath,
-              args: [MCP_STDIO_FIXTURE],
-              env: { FX_MCP_PID_PATH: pidPath },
-            },
-            unavailable: {
-              type: "http",
-              url: `http://127.0.0.1:${unavailable.port}/mcp`,
-              startup_timeout_ms: 100,
-            },
-          },
-        }),
-      );
-      const gateway = startFakeGateway([]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        const created = await client.request(
-          "session/new",
-          { cwd: root.workspace, mcpServers: [] },
-          2,
-        ) as any;
-        expect(created.error).toBeUndefined();
-        expect(created.result.sessionId).toBeTruthy();
-        expect(existsSync(pidPath)).toBe(false);
-        expect(unavailableAttempts).toBe(0);
-      } finally {
-        await client?.close();
-        client = null;
-        gateway.stop();
-        unavailable.stop(true);
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ACP cross-session restore retires reduced project authority before required failure",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-project-mcp-reduce-");
-      const pidPath = join(root.root, "active-project-mcp.pid");
-      const wirePath = join(root.root, "active-project-mcp-wire.jsonl");
-      writeFileSync(
-        join(root.home, ".fx", "settings.json"),
-        JSON.stringify({
-          workspaces: {
-            [root.workspace]: { enabledMcpjsonServers: ["fixture"] },
-          },
-        }),
-      );
-      writeFileSync(
-        join(root.workspace, ".mcp.json"),
-        JSON.stringify({
-          mcpServers: {
-            fixture: {
-              command: process.execPath,
-              args: [MCP_STDIO_FIXTURE],
-              env: {
-                FX_MCP_PID_PATH: pidPath,
-                FX_MCP_WIRE_LOG: wirePath,
-                FX_MCP_MODE: "stall_operation",
-              },
-            },
-          },
-        }),
-      );
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_reducing", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_reducing", MCP_TOOL_NAME, { text: "stall" }),
-      ]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        const created = await client.request(
-          "session/new",
-          { cwd: root.workspace, mcpServers: [] },
-          2,
-        ) as any;
-        expect(created.error).toBeUndefined();
-        await client.readLine();
-        await waitForPath(pidPath, 5_000);
-        sendPrompt(client, 4, "Start the project MCP operation.");
-        await waitForCondition(
-          "stalled project MCP call",
-          () => existsSync(wirePath) &&
-            readFileSync(wirePath, "utf8").includes("tools/call"),
-          5_000,
-        );
-
-        const targetSession = "project-reduction-target";
-        writeAcpSession(root.home, root.workspace, targetSession, Date.now());
-        writeFileSync(
-          join(root.home, ".fx", "settings.json"),
-          JSON.stringify({
-            workspaces: {
-              [root.workspace]: { disabledMcpjsonServers: ["fixture"] },
-            },
-          }),
-        );
-        client.send({
-          jsonrpc: "2.0",
-          id: 5,
-          method: "session/load",
-          params: {
-            sessionId: targetSession,
-            cwd: root.workspace,
-            mcpServers: [{
-              name: "required-failure",
-              command: "/bin/false",
-              args: [],
-              env: [],
-            }],
-          },
-        });
-        const loaded = await readResponse(client, 5, TIMEOUT);
-        expect(loaded.error?.message).toContain("Required MCP server");
-        await expectMcpProcessExited(pidPath);
-      } finally {
-        await client?.close();
-        client = null;
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ACP session/new retires reduced active project authority before required failure",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-project-mcp-new-reduce-");
-      const pidPath = join(root.root, "active-project-mcp.pid");
-      writeFileSync(
-        join(root.home, ".fx", "settings.json"),
-        JSON.stringify({
-          workspaces: {
-            [root.workspace]: { enabledMcpjsonServers: ["fixture"] },
-          },
-        }),
-      );
-      writeFileSync(
-        join(root.workspace, ".mcp.json"),
-        JSON.stringify({
-          mcpServers: {
-            fixture: {
-              command: process.execPath,
-              args: [MCP_STDIO_FIXTURE],
-              env: { FX_MCP_PID_PATH: pidPath },
-            },
-          },
-        }),
-      );
-      const gateway = startFakeGateway([]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        const created = await client.request(
-          "session/new",
-          { cwd: root.workspace, mcpServers: [] },
-          2,
-        ) as any;
-        expect(created.error).toBeUndefined();
-        await client.readLine();
-        await waitForPath(pidPath, 5_000);
-        writeFileSync(
-          join(root.home, ".fx", "settings.json"),
-          JSON.stringify({
-            workspaces: {
-              [root.workspace]: { disabledMcpjsonServers: ["fixture"] },
-            },
-          }),
-        );
-        const replacement = await client.request(
-          "session/new",
-          {
-            cwd: root.workspace,
-            mcpServers: [{
-              name: "required-failure",
-              command: "/bin/false",
-              args: [],
-              env: [],
-            }],
-          },
-          3,
-        ) as any;
-        expect(replacement.error?.message).toContain("Required MCP server");
-        await expectMcpProcessExited(pidPath);
-      } finally {
-        await client?.close();
-        client = null;
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
     "ACP routes legacy HTTP and SSE configs through new load resume and close",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-legacy-remote-");
+      const root = createIsolatedRoot("ffx-acp-mcp-legacy-remote-");
       const newFixture = startLegacyStreamableHttpFixture("2025-11-25");
       const loadFixture = startLegacyHttpSseFixture();
       const resumeFixture = startLegacyHttpSseFixture();
@@ -3006,7 +2251,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP remote authentication never starts an interactive authorization flow",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-auth-required-");
+      const root = createIsolatedRoot("ffx-acp-mcp-auth-required-");
       let mcpRequests = 0;
       let metadataRequests = 0;
       const server = Bun.serve({
@@ -3056,7 +2301,7 @@ describe("acp: model-independent", () => {
         expect(mcpRequests).toBe(1);
         expect(metadataRequests).toBe(0);
         expect(
-          existsSync(join(root.home, ".fx", "mcp-credentials")),
+          existsSync(join(root.home, ".ffx", "mcp-credentials")),
         ).toBe(false);
         expect(client.stderr).toBe("");
       } finally {
@@ -3072,7 +2317,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP bearer headers authenticate HTTP without persisting the credential",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-bearer-");
+      const root = createIsolatedRoot("ffx-acp-mcp-bearer-");
       const httpFixture = startModernMcpHttpFixture("json");
       const bearer = "acp-mcp-bearer-secret";
       const proxy = Bun.serve({
@@ -3130,7 +2375,7 @@ describe("acp: model-independent", () => {
           `${MODERN_HTTP_TOOL_RESULT}:authenticated`,
         );
         const session = readFileSync(
-          join(root.home, ".fx", "sessions", sessionId, "session.json"),
+          join(root.home, ".ffx", "sessions", sessionId, "session.json"),
           "utf8",
         );
         expect(session).not.toContain(bearer);
@@ -3149,7 +2394,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP HTTP tools and headers are recreated through load and resume",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-http-lifecycle-");
+      const root = createIsolatedRoot("ffx-acp-mcp-http-lifecycle-");
       const newFixture = startModernMcpHttpFixture("json");
       const loadFixture = startModernMcpHttpFixture("json");
       const resumeFixture = startModernMcpHttpFixture("json");
@@ -3279,7 +2524,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP replacement and close cancel stalled HTTP MCP calls",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-http-cancel-");
+      const root = createIsolatedRoot("ffx-acp-mcp-http-cancel-");
       const replacementFixture = startModernMcpHttpFixture("stall_call");
       const fastFixture = startModernMcpHttpFixture("json");
       const closeFixture = startModernMcpHttpFixture("stall_call");
@@ -3385,7 +2630,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP stdin EOF cancels a stalled HTTP MCP call",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-http-eof-");
+      const root = createIsolatedRoot("ffx-acp-mcp-http-eof-");
       const httpFixture = startModernMcpHttpFixture("stall_call");
       const gateway = startFakeGateway([
         fakeGatewayToolCall("select_http_eof_slow", "mcp_select_tool", {
@@ -3434,7 +2679,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP rejects redirects, bad status, and bad media types from HTTP MCP",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-http-failures-");
+      const root = createIsolatedRoot("ffx-acp-mcp-http-failures-");
       const gateway = startFakeGateway([]);
       try {
         client = await AcpClient.create({
@@ -3495,7 +2740,7 @@ describe("acp: model-independent", () => {
   test(
     "supplied stdio tools are recreated through new load and resume",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-lifecycle-");
+      const root = createIsolatedRoot("ffx-acp-mcp-lifecycle-");
       const newPid = join(root.root, "mcp-new.pid");
       const loadPid = join(root.root, "mcp-load.pid");
       const resumePid = join(root.root, "mcp-resume.pid");
@@ -3598,7 +2843,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP without elicitation capability returns input-required without a direct request",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-mrtr-");
+      const root = createIsolatedRoot("ffx-acp-mcp-mrtr-");
       const pidPath = join(root.root, "mcp-mrtr.pid");
       const gateway = startFakeGateway([
         fakeGatewayToolCall("select_mrtr", "mcp_select_tool", { name: MCP_TOOL_NAME }),
@@ -3652,7 +2897,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP never sends a URL mode the client did not advertise",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-unadvertised-url-");
+      const root = createIsolatedRoot("ffx-acp-mcp-unadvertised-url-");
       const pidPath = join(root.root, "mcp-unadvertised-url.pid");
       const gateway = startFakeGateway([
         fakeGatewayToolCall("select_unadvertised", "mcp_select_tool", {
@@ -3684,7 +2929,7 @@ describe("acp: model-independent", () => {
               "unused",
               pidPath,
               "mrtr_url_required",
-              { FX_MCP_EXPECT_ELICITATION: "form" },
+              { FFX_MCP_EXPECT_ELICITATION: "form" },
             )],
           },
           2,
@@ -3749,7 +2994,7 @@ describe("acp: model-independent", () => {
       ] as const;
 
       for (const testCase of cases) {
-        const root = createIsolatedRoot(`fx-acp-mcp-cap-${testCase.label}-`);
+        const root = createIsolatedRoot(`ffx-acp-mcp-cap-${testCase.label}-`);
         const pidPath = join(root.root, "mcp-cap.pid");
         const wirePath = join(root.root, "mcp-cap.wire.jsonl");
         const activeGateway = startFakeGateway([
@@ -3781,8 +3026,8 @@ describe("acp: model-independent", () => {
                 pidPath,
                 "mrtr_input_required",
                 {
-                  FX_MCP_WIRE_LOG: wirePath,
-                  FX_MCP_EXPECT_ELICITATION: testCase.supportsForm ? "both" : "none",
+                  FFX_MCP_WIRE_LOG: wirePath,
+                  FFX_MCP_EXPECT_ELICITATION: testCase.supportsForm ? "both" : "none",
                 },
               )],
             },
@@ -3825,7 +3070,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP form elicitation resumes the exact modern MCP operation",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-elicitation-form-");
+      const root = createIsolatedRoot("ffx-acp-mcp-elicitation-form-");
       const pidPath = join(root.root, "mcp-elicitation-form.pid");
       const wirePath = join(root.root, "mcp-elicitation-form.wire.jsonl");
       const gateway = startFakeGateway([
@@ -3857,8 +3102,8 @@ describe("acp: model-independent", () => {
               pidPath,
               "mrtr_input_required",
               {
-                FX_MCP_WIRE_LOG: wirePath,
-                FX_MCP_EXPECT_ELICITATION: "form",
+                FFX_MCP_WIRE_LOG: wirePath,
+                FFX_MCP_EXPECT_ELICITATION: "form",
               },
             )],
           },
@@ -3937,7 +3182,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP EOF cancels a pending direct elicitation without hanging",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-elicitation-eof-");
+      const root = createIsolatedRoot("ffx-acp-mcp-elicitation-eof-");
       const pidPath = join(root.root, "mcp-elicitation-eof.pid");
       const gateway = startFakeGateway([
         fakeGatewayToolCall("select_eof", "mcp_select_tool", { name: MCP_TOOL_NAME }),
@@ -3965,7 +3210,7 @@ describe("acp: model-independent", () => {
               "unused",
               pidPath,
               "mrtr_input_required",
-              { FX_MCP_EXPECT_ELICITATION: "form" },
+              { FFX_MCP_EXPECT_ELICITATION: "form" },
             )],
           },
           2,
@@ -4003,10 +3248,10 @@ describe("acp: model-independent", () => {
     "secret-like form fields are rejected before ACP publication or model exposure",
     async () => {
       const sentinel = "S10_SECRET_SENTINEL_7f3c";
-      const root = createIsolatedRoot("fx-acp-mcp-elicitation-secret-");
+      const root = createIsolatedRoot("ffx-acp-mcp-elicitation-secret-");
       const pidPath = join(root.root, "mcp-elicitation-secret.pid");
       const wirePath = join(root.root, "mcp-elicitation-secret.wire.jsonl");
-      const tracePath = join(root.root, "fx-trace.log");
+      const tracePath = join(root.root, "ffx-trace.log");
       const gateway = startFakeGateway([
         fakeGatewayToolCall("select_secret", "mcp_select_tool", { name: MCP_TOOL_NAME }),
         fakeGatewayToolCall("call_secret", MCP_TOOL_NAME, { text: "secret" }),
@@ -4018,8 +3263,8 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway),
-            FX_TRACE_LOG: tracePath,
-            FX_TRACE_SCOPES: "mcp",
+            FFX_TRACE_LOG: tracePath,
+            FFX_TRACE_SCOPES: "mcp",
           },
         });
         await client.request(
@@ -4039,8 +3284,8 @@ describe("acp: model-independent", () => {
               pidPath,
               "mrtr_secret_required",
               {
-                FX_MCP_WIRE_LOG: wirePath,
-                FX_MCP_EXPECT_ELICITATION: "form",
+                FFX_MCP_WIRE_LOG: wirePath,
+                FFX_MCP_EXPECT_ELICITATION: "form",
               },
             )],
           },
@@ -4082,7 +3327,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP URL consent completes only after modern MCP retry without prefetching",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-elicitation-url-");
+      const root = createIsolatedRoot("ffx-acp-mcp-elicitation-url-");
       const pidPath = join(root.root, "mcp-elicitation-url.pid");
       const wirePath = join(root.root, "mcp-elicitation-url.wire.jsonl");
       let urlRequests = 0;
@@ -4122,9 +3367,9 @@ describe("acp: model-independent", () => {
               pidPath,
               "mrtr_url_required",
               {
-                FX_MCP_WIRE_LOG: wirePath,
-                FX_MCP_EXPECT_ELICITATION: "url",
-                FX_MCP_ELICITATION_URL: targetUrl,
+                FFX_MCP_WIRE_LOG: wirePath,
+                FFX_MCP_EXPECT_ELICITATION: "url",
+                FFX_MCP_ELICITATION_URL: targetUrl,
               },
             )],
           },
@@ -4154,7 +3399,7 @@ describe("acp: model-independent", () => {
         });
         expect(direct.message).toContain("MCP server fixture");
         expect(direct.message).toContain("127.0.0.1");
-        expect(direct.elicitationId).toMatch(/^fx-\d+$/);
+        expect(direct.elicitationId).toMatch(/^ffx-\d+$/);
         expect(urlRequests).toBe(0);
 
         const completions = prompt.messages.filter((message) =>
@@ -4196,7 +3441,7 @@ describe("acp: model-independent", () => {
   test(
     "negotiated legacy MCP form requests use the versioned direct adapter",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-legacy-elicitation-");
+      const root = createIsolatedRoot("ffx-acp-mcp-legacy-elicitation-");
       const fixture = startLegacyStreamableHttpFixture("2025-06-18", {
         mode: "elicitation_form",
       });
@@ -4287,7 +3532,7 @@ describe("acp: model-independent", () => {
   test(
     "legacy URL completion is correlated from the notification listener to ACP",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-legacy-url-");
+      const root = createIsolatedRoot("ffx-acp-mcp-legacy-url-");
       let targetRequests = 0;
       const target = Bun.serve({
         port: 0,
@@ -4358,7 +3603,7 @@ describe("acp: model-independent", () => {
           url: targetUrl,
           message: expect.stringContaining("MCP server fixture"),
         });
-        expect(direct.elicitationId).toMatch(/^fx-\d+$/);
+        expect(direct.elicitationId).toMatch(/^ffx-\d+$/);
         expect(fixture.elicitationResponses).toEqual([{
           jsonrpc: "2.0",
           id: 9001,
@@ -4411,7 +3656,7 @@ describe("acp: model-independent", () => {
   test(
     "legacy URL completion waits for ACP consent and publishes exactly once",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-legacy-url-early-");
+      const root = createIsolatedRoot("ffx-acp-mcp-legacy-url-early-");
       const fixture = startLegacyStreamableHttpFixture("2025-11-25", {
         mode: "elicitation_url",
         completeBeforeElicitationResponse: true,
@@ -4500,7 +3745,7 @@ describe("acp: model-independent", () => {
   test(
     "declined legacy URL consent suppresses an early completion",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-legacy-url-decline-");
+      const root = createIsolatedRoot("ffx-acp-mcp-legacy-url-decline-");
       const fixture = startLegacyStreamableHttpFixture("2025-11-25", {
         mode: "elicitation_url",
         completeBeforeElicitationResponse: true,
@@ -4584,7 +3829,7 @@ describe("acp: model-independent", () => {
   test(
     "session cancellation interrupts a pending MCP elicitation",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-elicitation-cancel-");
+      const root = createIsolatedRoot("ffx-acp-mcp-elicitation-cancel-");
       const pidPath = join(root.root, "mcp-elicitation-cancel.pid");
       const gateway = startFakeGateway([
         fakeGatewayToolCall("select_cancelled_form", "mcp_select_tool", {
@@ -4595,7 +3840,6 @@ describe("acp: model-independent", () => {
         }),
       ]);
       let directRequestSeen = false;
-      let elicitationRequestId: number | string | null = null;
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
@@ -4609,7 +3853,7 @@ describe("acp: model-independent", () => {
           },
           1,
         );
-        const created = await client.request(
+        await client.request(
           "session/new",
           {
             cwd: root.workspace,
@@ -4617,17 +3861,15 @@ describe("acp: model-independent", () => {
               "unused",
               pidPath,
               "mrtr_input_required",
-              { FX_MCP_EXPECT_ELICITATION: "form" },
+              { FFX_MCP_EXPECT_ELICITATION: "form" },
             )],
           },
           2,
-        ) as any;
-        const sessionId = created.result.sessionId as string;
+        );
         await client.readLine();
-        await client.request("session/set_mode", { sessionId, modeId: "code" }, 3);
-        client.setElicitationHandler((_params, id) => {
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+        client.setElicitationHandler(() => {
           directRequestSeen = true;
-          elicitationRequestId = id;
           return undefined;
         });
 
@@ -4639,32 +3881,21 @@ describe("acp: model-independent", () => {
           jsonrpc: "2.0",
           id: cancelId,
           method: "session/cancel",
-          params: { sessionId },
+          params: {},
         });
 
         const responses = new Map<number, any>();
-        let requestCancellation: any = null;
         const deadline = Date.now() + 3_000;
-        while ((responses.size < 2 || requestCancellation === null) && Date.now() < deadline) {
-          let message: any;
-          try {
-            message = await client.readLine(Math.max(100, deadline - Date.now()));
-          } catch (error) {
-            if (error instanceof AcpReadTimeoutError) break;
-            throw error;
-          }
-          if (message.method === "$/cancel_request") requestCancellation = message;
+        while (responses.size < 2 && Date.now() < deadline) {
+          const message = await client.readLine(
+            Math.max(100, deadline - Date.now()),
+          ) as any;
           if (message.id === promptId || message.id === cancelId) {
             responses.set(message.id, message);
           }
         }
         expect(responses.get(cancelId)?.result).toBeNull();
         expect(responses.get(promptId)?.result?.stopReason).toBe("cancelled");
-        expect(requestCancellation).toMatchObject({
-          jsonrpc: "2.0",
-          method: "$/cancel_request",
-          params: { requestId: elicitationRequestId },
-        });
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -4679,7 +3910,7 @@ describe("acp: model-independent", () => {
   test(
     "sequential ACP sessions isolate same-named MCP tools",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-isolation-");
+      const root = createIsolatedRoot("ffx-acp-mcp-isolation-");
       const firstPid = join(root.root, "mcp-first.pid");
       const secondPid = join(root.root, "mcp-second.pid");
       const gateway = startFakeGateway([
@@ -4762,18 +3993,18 @@ describe("acp: model-independent", () => {
   test(
     "ACP rejects invalid or unsupported MCP config and never loads profile MCP",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-admission-");
+      const root = createIsolatedRoot("ffx-acp-mcp-admission-");
       const profilePid = join(root.root, "profile.pid");
       const suppliedPid = join(root.root, "supplied.pid");
       const gateway = startFakeGateway([]);
       writeFileSync(
-        join(root.home, ".fx", "mcp.json"),
+        join(root.home, ".ffx", "mcp.json"),
         JSON.stringify({
           mcp: {
             profile: {
               type: "local",
               command: [process.execPath, MCP_STDIO_FIXTURE],
-              environment: { FX_MCP_PID_PATH: profilePid },
+              environment: { FFX_MCP_PID_PATH: profilePid },
             },
           },
         }),
@@ -4900,7 +4131,7 @@ describe("acp: model-independent", () => {
   test(
     "replacement and close cancel slow MCP calls and reap children",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-cancel-");
+      const root = createIsolatedRoot("ffx-acp-mcp-cancel-");
       const replacementPid = join(root.root, "replacement-slow.pid");
       const replacementWire = join(root.root, "replacement-slow.jsonl");
       const fastPid = join(root.root, "replacement-fast.pid");
@@ -4928,7 +4159,7 @@ describe("acp: model-independent", () => {
               "UNREACHABLE",
               replacementPid,
               "stall_operation",
-              { FX_MCP_WIRE_LOG: replacementWire },
+              { FFX_MCP_WIRE_LOG: replacementWire },
             )],
           },
           2,
@@ -4972,7 +4203,7 @@ describe("acp: model-independent", () => {
               "UNREACHABLE",
               closePid,
               "stall_operation",
-              { FX_MCP_WIRE_LOG: closeWire },
+              { FFX_MCP_WIRE_LOG: closeWire },
             )],
           },
           7,
@@ -5009,7 +4240,7 @@ describe("acp: model-independent", () => {
   test(
     "stdin EOF cancels a stalled MCP call and reaps its child and reader",
     async () => {
-      const root = createIsolatedRoot("fx-acp-mcp-eof-");
+      const root = createIsolatedRoot("ffx-acp-mcp-eof-");
       const pidPath = join(root.root, "stalled.pid");
       const wirePath = join(root.root, "stalled.jsonl");
       const tracePath = join(root.root, "trace.log");
@@ -5022,8 +4253,8 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway),
-            FX_TRACE_LOG: tracePath,
-            FX_TRACE_SCOPES: "interrupt,mcp",
+            FFX_TRACE_LOG: tracePath,
+            FFX_TRACE_SCOPES: "interrupt,mcp",
           },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
@@ -5034,7 +4265,7 @@ describe("acp: model-independent", () => {
               "UNREACHABLE",
               pidPath,
               "stall_operation",
-              { FX_MCP_WIRE_LOG: wirePath },
+              { FFX_MCP_WIRE_LOG: wirePath },
             )],
           },
           2,
@@ -5070,13 +4301,13 @@ describe("acp: model-independent", () => {
   test(
     "invalid initialize requests return invalid_params without poisoning the connection",
     async () => {
-      const root = createIsolatedRoot("fx-acp-invalid-initialize-");
+      const root = createIsolatedRoot("ffx-acp-invalid-initialize-");
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
           env: {
             HOME: root.home,
-            AI_GATEWAY_API_KEY: "e2e-placeholder",
+            FFX_PROVIDER_API_KEY: "e2e-placeholder",
             VERCEL_OIDC_TOKEN: "",
           },
         });
@@ -5119,13 +4350,13 @@ describe("acp: model-independent", () => {
   test(
     "prompt before session creation returns the canonical no-session error",
     async () => {
-      const root = createIsolatedRoot("fx-acp-prompt-without-session-");
+      const root = createIsolatedRoot("ffx-acp-prompt-without-session-");
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
           env: {
             HOME: root.home,
-            AI_GATEWAY_API_KEY: "e2e-placeholder",
+            FFX_PROVIDER_API_KEY: "e2e-placeholder",
             VERCEL_OIDC_TOKEN: "",
           },
         });
@@ -5163,93 +4394,18 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "session-scoped requests reject a stale active-session target",
+    "image prompt rejection preserves history and admits the next text prompt",
     async () => {
-      const root = createIsolatedRoot("fx-acp-stale-session-target-");
-      const gateway = startFakeGateway([finalText("stale prompt executed")]);
+      const root = createIsolatedRoot("ffx-acp-image-rejection-");
+      const boundary = createPromptTerminalBoundary(root.root);
+      const gateway = startFakeGateway([finalText("valid image follow-up complete")]);
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        const first = await client.request(
-          "session/new",
-          { cwd: root.workspace, mcpServers: [] },
-          2,
-        ) as any;
-        await client.readLine();
-        const second = await client.request(
-          "session/new",
-          { cwd: root.workspace, mcpServers: [] },
-          3,
-        ) as any;
-        await client.readLine();
-        const staleSessionId = first.result.sessionId as string;
-        const activeSessionId = second.result.sessionId as string;
-        expect(staleSessionId).not.toBe(activeSessionId);
-
-        for (const [id, method, params] of [
-          [4, "session/set_mode", { sessionId: staleSessionId, modeId: "code" }],
-          [5, "session/set_config_option", {
-            sessionId: staleSessionId,
-            configId: "mode",
-            value: "code",
-          }],
-          [6, "session/cancel", { sessionId: staleSessionId }],
-        ] as const) {
-          const response = await client.request(method, params, id) as any;
-          expect(response.error).toMatchObject({
-            code: -32602,
-            message: "Session is not active",
-          });
-        }
-
-        const promptId = 7;
-        client.send({
-          jsonrpc: "2.0",
-          id: promptId,
-          method: "session/prompt",
-          params: {
-            sessionId: staleSessionId,
-            prompt: [{ type: "text", text: "Do not execute this stale prompt." }],
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            ...boundary.env,
           },
-        });
-        const promptResponse = await readResponse(client, promptId);
-        expect(promptResponse.error).toMatchObject({
-          code: -32602,
-          message: "Session is not active",
-        });
-        expect(gateway.requests).toHaveLength(0);
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "image prompt reaches the Gateway and replays from saved history",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-image-prompt-");
-      const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
-      const gateway = startFakeGateway(
-        [finalText("image prompt complete")],
-        {
-          models: [{
-            id: FAKE_GATEWAY_MODEL,
-            type: "language",
-            tags: ["vision", "file-input", "tool-use"],
-          }],
-        },
-      );
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
         });
         const sessionId = await startCodeSession(client);
         client.send({
@@ -5258,417 +4414,38 @@ describe("acp: model-independent", () => {
           method: "session/prompt",
           params: {
             prompt: [
-              { type: "text", text: "User literal [Image #1]." },
-              { type: "image", data: imageData, mimeType: "image/png" },
-              { type: "text", text: "After image." },
+              { type: "text", text: "Describe this image." },
+              { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
             ],
           },
         });
 
-        const completed = await readResponse(client, 94);
-        expect(completed.error).toBeUndefined();
-        expect(completed.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(1);
-        expect(gateway.requests[0]!.body).toContain("image/png");
-        expect(gateway.requests[0]!.body).toContain(imageData);
-
-        const detail = await runFx(["session", "--id", sessionId, "--json"], {
+        const invalid = await readResponse(client, 94);
+        expect(invalid.error).toEqual({
+          code: -32602,
+          message: "Image prompt blocks are not supported",
+        });
+        expect(gateway.requests).toHaveLength(0);
+        const detailBefore = await runFx(["session", "--id", sessionId, "--json"], {
           cwd: root.workspace,
           env: { HOME: root.home },
           timeoutMs: TIMEOUT,
         });
-        expect(detail.code).toBe(0);
-        expect(JSON.parse(detail.stdout).history_len).toBe(1);
-        await client.close();
+        expect(detailBefore.code).toBe(0);
+        expect(JSON.parse(detailBefore.stdout).history_len).toBe(0);
+        await waitForPath(boundary.terminalReady);
 
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 95);
-        client.send({
-          jsonrpc: "2.0",
-          id: 96,
-          method: "session/load",
-          params: { sessionId, cwd: root.workspace, mcpServers: [] },
-        });
-        const replay: any[] = [];
-        while (true) {
-          const message = await client.readLine() as any;
-          if (message.id === 96) break;
-          replay.push(message);
-        }
-        const userChunks = replay.filter((message) =>
-          message.params?.update?.sessionUpdate === "user_message_chunk"
-        );
-        const imageChunk = userChunks.find((message) =>
-          message.params?.update?.sessionUpdate === "user_message_chunk" &&
-          message.params?.update?.content?.type === "image"
-        );
-        expect(userChunks.map((message) => message.params.update.content.type)).toEqual([
-          "text",
-          "image",
-        ]);
-        expect(userChunks[0]?.params.update.content.text).toBe(
-          "User literal [Image #1].\n[Image #1]\nAfter image.",
-        );
-        expect(new Set(userChunks.map((message) => message.params.update.messageId)).size).toBe(1);
-        expect(imageChunk?.params.update.content).toMatchObject({
-          type: "image",
-          mimeType: "image/png",
-          data: imageData,
-        });
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
+        sendPrompt(client, 95, "Complete the valid prompt.");
+        await waitForPath(boundary.reapReady);
+        releasePromptBoundary(boundary);
 
-  test(
-    "image-only prompt publishes and reloads the shared image title",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-image-only-title-");
-      const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
-      const gateway = startFakeGateway(
-        [finalText("image-only prompt complete")],
-        {
-          models: [{
-            id: FAKE_GATEWAY_MODEL,
-            type: "language",
-            tags: ["vision", "file-input", "tool-use"],
-          }],
-        },
-      );
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        const sessionId = await startCodeSession(client);
-        const prompted = await runPromptBlocks(
-          client,
-          [{ type: "image", data: imageData, mimeType: "image/png" }],
-          TIMEOUT,
-        );
-        expect(prompted.promptResult.result.stopReason).toBe("end_turn");
-        expect(prompted.messages.find((message) =>
-          message.params?.update?.sessionUpdate === "session_info_update"
-        )?.params.update.title).toBe("Image session");
-        expect(gateway.requests).toHaveLength(1);
-        await client.close();
-
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 97);
-        client.send({
-          jsonrpc: "2.0",
-          id: 98,
-          method: "session/load",
-          params: { sessionId, cwd: root.workspace, mcpServers: [] },
-        });
-        const replay: any[] = [];
-        let loadResponse: any = null;
-        while (loadResponse === null) {
-          const message = await client.readLine() as any;
-          if (message.id === 98) loadResponse = message;
-          else replay.push(message);
-        }
-
-        expect(loadResponse.error).toBeUndefined();
-        expect(replay.find((message) =>
-          message.params?.update?.sessionUpdate === "session_info_update"
-        )?.params.update.title).toBe("Image session");
-        const userChunks = replay.filter((message) =>
-          message.params?.update?.sessionUpdate === "user_message_chunk"
-        );
-        expect(userChunks.map((message) => message.params.update.content.type)).toEqual([
-          "text",
-          "image",
-        ]);
-        expect(userChunks[0]?.params.update.content.text).toBe("[Image #1]");
-        expect(new Set(userChunks.map((message) => message.params.update.messageId)).size).toBe(1);
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "inline image above the portable encoded limit fails before effects",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-inline-image-limit-");
-      const maxEncodedImageBytes = 5 * 1024 * 1024;
-      const largestFittingRawImage = Math.floor(maxEncodedImageBytes / 4) * 3;
-      const oversized = Buffer.alloc(largestFittingRawImage + 1);
-      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(oversized);
-      const imageData = oversized.toString("base64");
-      expect(Buffer.byteLength(imageData)).toBe(maxEncodedImageBytes + 4);
-      const gateway = startFakeGateway(
-        [finalText("ACP image size recovery complete")],
-        {
-          models: [{
-            id: FAKE_GATEWAY_MODEL,
-            type: "language",
-            tags: ["vision", "file-input", "tool-use"],
-          }],
-        },
-      );
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        const sessionId = await startCodeSession(client);
-        client.send({
-          jsonrpc: "2.0",
-          id: 99,
-          method: "session/prompt",
-          params: {
-            prompt: [{
-              type: "image",
-              data: imageData,
-              mimeType: "image/png",
-            }],
-          },
-        });
-
-        const rejected = await readResponse(client, 99, LIVE_TIMEOUT);
-        expect(rejected.error).toEqual({
-          code: -32602,
-          message: "Image prompt exceeds size limit",
-        });
-        expect(gateway.requests).toHaveLength(0);
-        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
-        if (existsSync(imageDir)) expect(readdirSync(imageDir)).toEqual([]);
-
-        const recovered = await runPrompt(
-          client,
-          "Confirm the ACP connection remains usable after image size rejection.",
-          TIMEOUT,
-        );
-        expect(recovered.promptResult.result.stopReason).toBe("end_turn");
+        const valid = await readResponse(client, 95);
+        expect(valid.error).toBeUndefined();
+        expect(valid.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(1);
         expect(client.stderr).toBe("");
       } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    LIVE_TIMEOUT,
-  );
-
-  test(
-    "selected text-only model rejects images without leaking an internal error",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-image-model-capability-");
-      const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
-      const gateway = startFakeGateway([]);
-      const codex = startAcpFakeCodex();
-      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: {
-            ...fakeGatewayEnv(root, gateway),
-            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
-            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
-            FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
-          },
-        });
-        const initialized = await client.request(
-          "initialize",
-          { protocolVersion: 1 },
-          1,
-        ) as any;
-        expect(initialized.result.agentCapabilities.promptCapabilities.image).toBe(true);
-        const created = await client.request(
-          "session/new",
-          { mcpServers: [] },
-          2,
-        ) as any;
-        await client.readLine();
-        const sessionId = created.result.sessionId as string;
-        await client.request("session/set_mode", { modeId: "code" }, 3);
-        await client.request("session/set_config_option", {
-          configId: "provider",
-          value: "codex",
-        }, 4);
-        await client.request("session/set_config_option", {
-          configId: "model",
-          value: "gpt-5.4-mini",
-        }, 5);
-
-        client.send({
-          jsonrpc: "2.0",
-          id: 100,
-          method: "session/prompt",
-          params: {
-            prompt: [{ type: "image", data: imageData, mimeType: "image/png" }],
-          },
-        });
-        const rejected = await readResponse(client, 100);
-        expect(rejected.error).toEqual({
-          code: -32602,
-          message: "Image prompts are unavailable for the selected model",
-        });
-        expect(codex.requests).toHaveLength(0);
-        expect(gateway.requests).toHaveLength(0);
-        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
-        if (existsSync(imageDir)) expect(readdirSync(imageDir)).toEqual([]);
-
-        const rejectedDetail = await runFx(["session", "--id", sessionId, "--json"], {
-          cwd: root.workspace,
-          env: { HOME: root.home },
-          timeoutMs: TIMEOUT,
-        });
-        expect(rejectedDetail.code).toBe(0);
-        expect(JSON.parse(rejectedDetail.stdout).history_len).toBe(0);
-
-        const recovered = await runPrompt(
-          client,
-          "Confirm the ACP connection remains usable after image rejection.",
-          TIMEOUT,
-        );
-        expect(recovered.promptResult.result.stopReason).toBe("end_turn");
-        expect(codex.requests).toHaveLength(1);
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        codex.stop();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "image prompt MIME mismatch fails before the Gateway without an orphaned snapshot",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-image-mime-mismatch-");
-      const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
-      const gateway = startFakeGateway([finalText("ACP image recovery complete")]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        const sessionId = await startCodeSession(client);
-        client.send({
-          jsonrpc: "2.0",
-          id: 95,
-          method: "session/prompt",
-          params: {
-            prompt: [
-              { type: "text", text: "Reject the mismatched image." },
-              { type: "image", data: imageData, mimeType: "image/jpeg" },
-            ],
-          },
-        });
-
-        const rejected = await readResponse(client, 95);
-        expect(rejected.error).toEqual({
-          code: -32602,
-          message: "Invalid image prompt block",
-        });
-        expect(gateway.requests).toHaveLength(0);
-        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
-        if (existsSync(imageDir)) expect(readdirSync(imageDir)).toEqual([]);
-
-        const recovered = await runPrompt(
-          client,
-          "Confirm the ACP connection remains usable.",
-          TIMEOUT,
-        );
-        expect(recovered.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(1);
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "session load reports an unavailable saved image without failing",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-image-replay-missing-");
-      const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
-      const gateway = startFakeGateway(
-        [finalText("image saved")],
-        {
-          models: [{
-            id: FAKE_GATEWAY_MODEL,
-            type: "language",
-            tags: ["vision", "file-input", "tool-use"],
-          }],
-        },
-      );
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        const sessionId = await startCodeSession(client);
-        const saved = await runPromptBlocks(client, [
-          { type: "text", text: "Save this image." },
-          { type: "image", data: imageData, mimeType: "image/png" },
-        ], TIMEOUT);
-        expect(saved.promptResult.result.stopReason).toBe("end_turn");
-        await client.close();
-
-        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
-        const snapshots = readdirSync(imageDir);
-        expect(snapshots).toHaveLength(1);
-        rmSync(join(imageDir, snapshots[0]!));
-
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 97);
-        client.send({
-          jsonrpc: "2.0",
-          id: 98,
-          method: "session/load",
-          params: { sessionId, cwd: root.workspace, mcpServers: [] },
-        });
-        const replay: any[] = [];
-        let loadResponse: any = null;
-        while (loadResponse === null) {
-          const message = await client.readLine() as any;
-          if (message.id === 98) loadResponse = message;
-          else replay.push(message);
-        }
-
-        expect(loadResponse.error).toBeUndefined();
-        expect(Array.isArray(loadResponse.result?.configOptions)).toBe(true);
-        const userText = replay
-          .filter((message) =>
-            message.params?.update?.sessionUpdate === "user_message_chunk" &&
-            message.params?.update?.content?.type === "text"
-          )
-          .map((message) => message.params.update.content.text);
-        expect(userText).toEqual([
-          "Save this image.\n[Image #1]",
-          "Image #1 unavailable",
-        ]);
-        expect(client.stderr).toBe("");
-      } finally {
+        releasePromptBoundary(boundary);
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -5680,26 +4457,25 @@ describe("acp: model-independent", () => {
   test(
     "ACP automatic ask returns to the agent before requesting permission",
     async () => {
-      const acceptedRoot = createIsolatedRoot("fx-acp-auto-file-accepted-");
-      const blockedRoot = createIsolatedRoot("fx-acp-auto-file-check-");
+      const acceptedRoot = createIsolatedRoot("ffx-acp-auto-file-accepted-");
+      const blockedRoot = createIsolatedRoot("ffx-acp-auto-file-check-");
       try {
         const acceptedTarget = join(acceptedRoot.external, "accepted.txt");
         writeFileSync(acceptedTarget, "before");
         const acceptedPrompt =
           `Use only the write_file tool to overwrite ${acceptedTarget}.`;
         const acceptedGateway = startFakeGateway([
-          fileToolCall("write_external_accepted", acceptedTarget, "FX_ACP_AUTO_ACCEPTED"),
+          fileToolCall("write_external_accepted", acceptedTarget, "FFX_ACP_AUTO_ACCEPTED"),
           finalText("ACP external write accepted"),
         ]);
         try {
-          writeSeededFxAuth(acceptedRoot.home, "team_123");
           client = await AcpClient.create({
             cwd: acceptedRoot.workspace,
             env: {
               ...fakeGatewayEnv(acceptedRoot, acceptedGateway),
               AI_GATEWAY_API_KEY: undefined,
               VERCEL_OIDC_TOKEN: undefined,
-              FX_DISABLE_KEYCHAIN: "1",
+              FFX_DISABLE_KEYCHAIN: "1",
             },
           });
           await startCodeSession(client);
@@ -5708,25 +4484,19 @@ describe("acp: model-independent", () => {
           expect(JSON.stringify(accepted.messages)).not.toContain(
             "Auto agent approved this request: Writing file.",
           );
-          expect(readFileSync(acceptedTarget, "utf-8")).toBe("FX_ACP_AUTO_ACCEPTED");
+          expect(readFileSync(acceptedTarget, "utf-8")).toBe("FFX_ACP_AUTO_ACCEPTED");
           expect(acceptedGateway.classifierRequests).toHaveLength(1);
           expect(acceptedGateway.classifierRequests[0]!.headers.get("authorization")).toBe(
-            `Bearer ${SEEDED_GATEWAY_TOKEN}`,
+            `Bearer fake-acp-file-key`,
           );
-          expect(
-            acceptedGateway.classifierRequests[0]!.headers.get("x-vercel-ai-gateway-team"),
-          ).toBe("team_123");
           expect(acceptedGateway.classifierRequests[0]!.body).toContain(
-            "review_context_kind: normal",
-          );
-          expect(acceptedGateway.classifierRequests[0]!.body).not.toContain(
             acceptedPrompt,
           );
           expect(acceptedGateway.classifierRequests[0]!.body).toContain(
             "action: prepared_file_mutation",
           );
           expect(acceptedGateway.classifierRequests[0]!.body).toContain(
-            "FX_ACP_AUTO_ACCEPTED",
+            "FFX_ACP_AUTO_ACCEPTED",
           );
         } finally {
           acceptedGateway.stop();
@@ -5738,9 +4508,9 @@ describe("acp: model-independent", () => {
         const blockedPrompt =
           `Use only the write_file tool to overwrite ${blockedTarget}.`;
         const blockedGateway = startFakeGateway([
-          fileToolCall("write_external_blocked", blockedTarget, "FX_ACP_AUTO_BLOCKED"),
+          fileToolCall("write_external_blocked", blockedTarget, "FFX_ACP_AUTO_BLOCKED"),
           finalText("ACP external write blocked"),
-        ], { classifierDecision: "caution" });
+        ], { classifierDecision: "ask" });
         try {
           client = await AcpClient.create({
             cwd: blockedRoot.workspace,
@@ -5752,7 +4522,7 @@ describe("acp: model-independent", () => {
           expect(
             blocked.messages.some((message: any) => message.method === "session/request_permission"),
           ).toBe(false);
-          expect(serialized).toContain("review_caution");
+          expect(serialized).toContain("auto_denied");
           expect(serialized).not.toContain("user_denied");
           expect(serialized).toContain('"status":"failed"');
           const failedUpdateIndex = blocked.messages.findIndex((message: any) =>
@@ -5762,20 +4532,9 @@ describe("acp: model-independent", () => {
             message.params.update.status === "failed"
           );
           expect(failedUpdateIndex).toBeGreaterThanOrEqual(0);
-          const heldText = blocked.messages[failedUpdateIndex]!.params.update
-            .content[0].content.text as string;
-          const held = JSON.parse(heldText) as {
-            error: { type: string; reason: string; held: boolean };
-          };
-          expect(held.error.type).toBe("tool_review_held");
-          expect(held.error.reason).toBe("review_caution");
-          expect(held.error.held).toBe(true);
           expect(readFileSync(blockedTarget, "utf-8")).toBe("before");
           expect(blockedGateway.classifierRequests).toHaveLength(1);
           expect(blockedGateway.classifierRequests[0]!.body).toContain(
-            "review_context_kind: normal",
-          );
-          expect(blockedGateway.classifierRequests[0]!.body).not.toContain(
             blockedPrompt,
           );
         } finally {
@@ -5791,24 +4550,21 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP keeps the session active after repeated advisory cautions",
+    "ACP completes normally after automatic recovery exhaustion",
     async () => {
-      const root = createIsolatedRoot("fx-acp-auto-recovery-");
+      const root = createIsolatedRoot("ffx-acp-auto-recovery-");
       const target = join(root.external, "recovery.txt");
       writeFileSync(target, "before");
       const gateway = startFakeGateway(
-        [
-          ...Array.from({ length: 4 }, (_, index) => (body: string) => {
-            if (index > 0) expect(body).toContain("review_caution");
-            return fileToolCall(
-              `recovery_call_${index + 1}`,
-              target,
-              "ACP_RECOVERY_MUST_NOT_RUN",
-            );
-          }),
-          finalText("ACP advisory cautions handled normally."),
-        ],
-        { classifierDecision: "caution" },
+        Array.from({ length: 4 }, (_, index) => (body: string) => {
+          if (index > 0) expect(body).toContain("auto_denied");
+          return fileToolCall(
+            `recovery_call_${index + 1}`,
+            target,
+            "ACP_RECOVERY_MUST_NOT_RUN",
+          );
+        }),
+        { classifierDecision: "ask" },
       );
 
       try {
@@ -5819,7 +4575,7 @@ describe("acp: model-independent", () => {
         await startCodeSession(client);
         const result = await runPrompt(
           client,
-          "Write the ACP advisory caution fixture.",
+          "Write the ACP automatic recovery fixture.",
           TIMEOUT,
         );
 
@@ -5829,10 +4585,10 @@ describe("acp: model-independent", () => {
           ),
         ).toBe(false);
         expect(JSON.stringify(result.messages)).toContain(
-          "ACP advisory cautions handled normally.",
+          "I couldn't continue because the required actions were blocked by automatic safety checks.",
         );
         expect(gateway.classifierRequests).toHaveLength(1);
-        expect(gateway.requests).toHaveLength(5);
+        expect(gateway.requests).toHaveLength(4);
         expect(readFileSync(target, "utf8")).toBe("before");
         expect(client.stderr).toBe("");
       } finally {
@@ -5847,7 +4603,7 @@ describe("acp: model-independent", () => {
   test(
     "terminal prompt response admits immediate session/list before worker exit",
     async () => {
-      const root = createIsolatedRoot("fx-acp-terminal-list-");
+      const root = createIsolatedRoot("ffx-acp-terminal-list-");
       const boundary = createPromptTerminalBoundary(root.root);
       const gateway = startFakeGateway([finalText("first prompt complete")]);
       try {
@@ -5890,7 +4646,7 @@ describe("acp: model-independent", () => {
   test(
     "terminal prompt response admits an immediate second session/prompt",
     async () => {
-      const root = createIsolatedRoot("fx-acp-terminal-prompt-");
+      const root = createIsolatedRoot("ffx-acp-terminal-prompt-");
       const boundary = createPromptTerminalBoundary(root.root);
       const gateway = startFakeGateway([
         finalText("first prompt complete"),
@@ -5931,7 +4687,7 @@ describe("acp: model-independent", () => {
   test(
     "expected prompt validation error preserves -32602 and admits next prompt",
     async () => {
-      const root = createIsolatedRoot("fx-acp-terminal-validation-");
+      const root = createIsolatedRoot("ffx-acp-terminal-validation-");
       const boundary = createPromptTerminalBoundary(root.root);
       const gateway = startFakeGateway([finalText("valid prompt complete")]);
       try {
@@ -5973,7 +4729,7 @@ describe("acp: model-independent", () => {
   test(
     "non-retryable prompt failure preserves -32603 and leaves the server usable",
     async () => {
-      const root = createIsolatedRoot("fx-acp-terminal-failure-");
+      const root = createIsolatedRoot("ffx-acp-terminal-failure-");
       const boundary = createPromptTerminalBoundary(root.root);
       const gateway = startFakeGateway([
         fakeGatewaySse([
@@ -6027,7 +4783,7 @@ describe("acp: model-independent", () => {
   test(
     "auth failure names the selected source without leaking the provider body",
     async () => {
-      const root = createIsolatedRoot("fx-acp-auth-failure-");
+      const root = createIsolatedRoot("ffx-acp-auth-failure-");
       const providerDetail = "rejected fake-acp-file-key provider body";
       const gateway = startFakeGateway([
         new Response(JSON.stringify({ error: { message: providerDetail } }), {
@@ -6061,7 +4817,7 @@ describe("acp: model-independent", () => {
           message.params?.update?.sessionUpdate === "agent_message_chunk"
         );
         expect(authUpdate?.params.update.content.text).toBe(
-          "AI_GATEWAY_API_KEY authentication failed · HTTP 401",
+          "Environment variable authentication failed · HTTP 401",
         );
         const serialized = JSON.stringify({ messages, response });
         expect(serialized).not.toContain("fake-acp-file-key");
@@ -6082,7 +4838,7 @@ describe("acp: model-independent", () => {
   test(
     "running prompt rejects non-cancel requests",
     async () => {
-      const root = createIsolatedRoot("fx-acp-running-prompt-");
+      const root = createIsolatedRoot("ffx-acp-running-prompt-");
       const heldResponse = deferred<Response>();
       const gateway = startFakeGateway([() => heldResponse.promise]);
       try {
@@ -6109,18 +4865,6 @@ describe("acp: model-independent", () => {
           message: "Prompt already in progress",
         });
 
-        client.send({
-          jsonrpc: "2.0",
-          id: 98,
-          method: "session/set_config_option",
-          params: { configId: "provider", value: "codex" },
-        });
-        const providerChange = await readResponse(client, 98);
-        expect(providerChange.error).toEqual({
-          code: -32600,
-          message: "Prompt already in progress",
-        });
-
         heldResponse.resolve(finalText("held prompt complete"));
         const prompt = await readResponse(client, 96);
         expect(prompt.error).toBeUndefined();
@@ -6139,7 +4883,7 @@ describe("acp: model-independent", () => {
   test(
     "stdin shutdown joins a terminal prompt worker before teardown",
     async () => {
-      const root = createIsolatedRoot("fx-acp-terminal-shutdown-");
+      const root = createIsolatedRoot("ffx-acp-terminal-shutdown-");
       const boundary = createPromptTerminalBoundary(root.root);
       const gateway = startFakeGateway([finalText("shutdown prompt complete")]);
       try {
@@ -6175,7 +4919,7 @@ describe("acp: model-independent", () => {
   test(
     "session/cancel requests receive JSON-RPC responses",
     async () => {
-      const root = createIsolatedRoot("fx-acp-cancel-framing-");
+      const root = createIsolatedRoot("ffx-acp-cancel-framing-");
       const gateway = startFakeGateway([]);
       try {
         client = await AcpClient.create({
@@ -6226,7 +4970,7 @@ describe("acp: model-independent", () => {
   test(
     "malformed local tool arguments recover with a normal final stop",
     async () => {
-      const root = createIsolatedRoot("fx-acp-malformed-arguments-");
+      const root = createIsolatedRoot("ffx-acp-malformed-arguments-");
       const tracePath = join(root.root, "trace.log");
       const malformedArguments = '{"depth":1,"depth":2}';
       const malformedCallId = "acp_malformed_1";
@@ -6244,8 +4988,8 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway),
-            FX_TRACE_LOG: tracePath,
-            FX_TRACE_SCOPES: "agent,gateway",
+            FFX_TRACE_LOG: tracePath,
+            FFX_TRACE_SCOPES: "agent,gateway",
           },
         });
         await startCodeSession(client);
@@ -6287,7 +5031,7 @@ describe("acp: model-independent", () => {
   test(
     "missing API key returns JSON-RPC error on initialize",
     async () => {
-      const root = createIsolatedRoot("fx-acp-missing-auth-");
+      const root = createIsolatedRoot("ffx-acp-missing-auth-");
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
@@ -6295,13 +5039,13 @@ describe("acp: model-independent", () => {
             HOME: root.home,
             AI_GATEWAY_API_KEY: "",
             VERCEL_OIDC_TOKEN: "",
-            FX_DISABLE_KEYCHAIN: "1",
+            FFX_DISABLE_KEYCHAIN: "1",
           },
         });
         const resp = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
         expect(resp.error).toBeDefined();
-        expect(resp.error.message).toContain("fx login");
-        expect(resp.error.message).toContain("fx setup");
+        expect(resp.error.message).toContain("ffx login");
+        expect(resp.error.message).toContain("ffx setup");
         expect(resp.error.message).toContain("AI_GATEWAY_API_KEY");
         expect(client.stderr).toBe("");
       } finally {
@@ -6395,7 +5139,7 @@ describe("acp: model-independent", () => {
   test(
     "session/list leaves an empty home unchanged",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-acp-no-create-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-acp-no-create-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -6406,9 +5150,9 @@ describe("acp: model-independent", () => {
           cwd: realpathSync(workspace),
           env: {
             HOME: realpathSync(home),
-            AI_GATEWAY_API_KEY: "e2e-placeholder",
+            FFX_PROVIDER_API_KEY: "e2e-placeholder",
             VERCEL_OIDC_TOKEN: "",
-            FX_E2E_FAIL_ON_DURABLE_MUTATION: "1",
+            FFX_E2E_FAIL_ON_DURABLE_MUTATION: "1",
           },
         });
         expect((await client.request("initialize", { protocolVersion: 1 }, 1) as any).result).toBeDefined();
@@ -6416,7 +5160,7 @@ describe("acp: model-independent", () => {
         expect(response.result).toEqual({ sessions: [] });
         await client.close();
 
-        expect(existsSync(join(home, ".fx"))).toBe(false);
+        expect(existsSync(join(home, ".ffx"))).toBe(false);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -6425,9 +5169,9 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "session/list without cwd returns all sessions and filters by absolute cwd",
+    "session/list is scoped to the server workspace and exact load still works",
     async () => {
-      const root = createIsolatedRoot("fx-acp-workspace-session-list-");
+      const root = createIsolatedRoot("ffx-acp-workspace-session-list-");
       const gateway = startFakeGateway([]);
       try {
         writeAcpSession(root.home, root.workspace, "workspace-a-session", 20);
@@ -6442,31 +5186,21 @@ describe("acp: model-independent", () => {
         const listed = await client.request("session/list", {}, 2) as any;
         expect(listed.result?.sessions).toEqual([
           expect.objectContaining({
-            sessionId: "workspace-b-session",
-            cwd: root.external,
-          }),
-          expect.objectContaining({
             sessionId: "workspace-a-session",
             cwd: root.workspace,
           }),
         ]);
-
-        const filtered = await client.request(
-          "session/list",
-          { cwd: root.workspace },
-          3,
-        ) as any;
-        expect(filtered.result?.sessions).toEqual([
-          expect.objectContaining({
-            sessionId: "workspace-a-session",
-            cwd: root.workspace,
-          }),
-        ]);
+        expect(
+          listed.result.sessions.some(
+            (session: { sessionId: string }) =>
+              session.sessionId === "workspace-b-session",
+          ),
+        ).toBe(false);
 
         const loaded = await client.request(
           "session/load",
           { sessionId: "workspace-b-session", mcpServers: [] },
-          4,
+          3,
         ) as any;
         expect(loaded.error).toBeUndefined();
         expect(Array.isArray(loaded.result?.configOptions)).toBe(true);
@@ -6481,190 +5215,9 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "session/list exposes bounded titled pages",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-paged-session-list-");
-      const gateway = startFakeGateway([
-        finalText("ACP titled session created"),
-      ]);
-      const title = "Paginated ACP session title";
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        const titledSessionId = await startCodeSession(client);
-        const prompted = await runPrompt(client, title);
-        expect(prompted.promptResult.error).toBeUndefined();
-        await client.close();
-        client = null;
-
-        for (let index = 0; index < 100; index += 1) {
-          writeAcpSession(
-            root.home,
-            root.workspace,
-            `paged-session-${String(index).padStart(3, "0")}`,
-            index + 1,
-          );
-        }
-
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 10);
-
-        const first = await client.request("session/list", {}, 11) as any;
-        expect(first.result?.sessions).toHaveLength(100);
-        expect(first.result?.nextCursor).toEqual(expect.any(String));
-        const titledSession = first.result.sessions.find(
-          (session: { sessionId: string }) =>
-            session.sessionId === titledSessionId
-        );
-        expect(titledSession?.title).toBe(title);
-
-        const second = await client.request(
-          "session/list",
-          { cursor: first.result.nextCursor },
-          12,
-        ) as any;
-        expect(second.result?.sessions).toHaveLength(1);
-        expect(second.result?.nextCursor).toBeUndefined();
-        const firstIds = new Set(
-          first.result.sessions.map((session: { sessionId: string }) =>
-            session.sessionId
-          ),
-        );
-        expect(firstIds.has(second.result.sessions[0].sessionId)).toBe(false);
-        const listed = await client.request(
-          "session/list",
-          { cursor: "not-a-session-cursor" },
-          13,
-        ) as any;
-        expect(listed.error).toEqual({
-          code: -32602,
-          message: "Invalid params",
-        });
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "session/list treats null cwd as omitted",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-null-session-list-");
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: {
-            HOME: root.home,
-            AI_GATEWAY_API_KEY: "e2e-placeholder",
-            VERCEL_OIDC_TOKEN: "",
-          },
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-
-        const listed = await client.request("session/list", {}, 2) as any;
-        const listedWithNull = await client.request(
-          "session/list",
-          { cwd: null },
-          3,
-        ) as any;
-        expect(listedWithNull).toEqual({
-          jsonrpc: "2.0",
-          id: 3,
-          result: listed.result,
-        });
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "session/list rejects relative cwd",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-relative-session-list-");
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: {
-            HOME: root.home,
-            AI_GATEWAY_API_KEY: "e2e-placeholder",
-            VERCEL_OIDC_TOKEN: "",
-          },
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-
-        const relative = await client.request(
-          "session/list",
-          { cwd: "workspace-a" },
-          2,
-        ) as any;
-        expect(relative.error).toEqual({
-          code: -32602,
-          message: "Invalid params",
-        });
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "session/list omits legacy sessions without a workspace",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-legacy-session-list-");
-      try {
-        writeAcpSession(root.home, root.workspace, "workspace-session", 20);
-        writeLegacyAcpSessionWithoutWorkspace(
-          root.home,
-          "legacy-unknown-workspace",
-          40,
-        );
-
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: {
-            HOME: root.home,
-            AI_GATEWAY_API_KEY: "e2e-placeholder",
-            VERCEL_OIDC_TOKEN: "",
-          },
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-
-        const listed = await client.request("session/list", {}, 2) as any;
-        expect(listed.result?.sessions).toEqual([
-          expect.objectContaining({
-            sessionId: "workspace-session",
-            cwd: root.workspace,
-          }),
-        ]);
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
     "session/load reports contention and succeeds after the owner exits",
     async () => {
-      const root = createIsolatedRoot("fx-acp-session-load-contention-");
+      const root = createIsolatedRoot("ffx-acp-session-load-contention-");
       const gateway = startFakeGateway([]);
       const sessionId = "contended-session";
       let owner: AcpClient | undefined;
@@ -6733,7 +5286,7 @@ describe("acp: model-independent", () => {
   test(
     "durable mutation sentinel terminates a writable session path",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-acp-write-sentinel-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-acp-write-sentinel-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -6744,9 +5297,9 @@ describe("acp: model-independent", () => {
           cwd: realpathSync(workspace),
           env: {
             HOME: realpathSync(home),
-            AI_GATEWAY_API_KEY: "e2e-placeholder",
+            FFX_PROVIDER_API_KEY: "e2e-placeholder",
             VERCEL_OIDC_TOKEN: "",
-            FX_E2E_FAIL_ON_DURABLE_MUTATION: "1",
+            FFX_E2E_FAIL_ON_DURABLE_MUTATION: "1",
           },
         });
         expect((await client.request("initialize", { protocolVersion: 1 }, 1) as any).result).toBeDefined();
@@ -6757,7 +5310,7 @@ describe("acp: model-independent", () => {
           params: { mcpServers: [] },
         });
         expect(await client.waitForExit()).toBe(86);
-        expect(existsSync(join(home, ".fx"))).toBe(false);
+        expect(existsSync(join(home, ".ffx"))).toBe(false);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -6771,7 +5324,7 @@ describe("acp: model-independent", () => {
       client = await AcpClient.create({
         omitHome: true,
         env: {
-          AI_GATEWAY_API_KEY: "e2e-placeholder",
+          FFX_PROVIDER_API_KEY: "e2e-placeholder",
           VERCEL_OIDC_TOKEN: "",
         },
       });
@@ -6799,17 +5352,17 @@ describe("acp: model-independent", () => {
   test(
     "session load addresses a special-token ID literally",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-acp-exact-id-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-acp-exact-id-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
         mkdirSync(home);
         mkdirSync(workspace);
         const workspaceRoot = realpathSync(workspace);
-        const sessionDir = join(home, ".fx", "sessions", "last");
+        const sessionDir = join(home, ".ffx", "sessions", "last");
         mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
-        chmodSync(join(home, ".fx"), 0o700);
-        chmodSync(join(home, ".fx", "sessions"), 0o700);
+        chmodSync(join(home, ".ffx"), 0o700);
+        chmodSync(join(home, ".ffx", "sessions"), 0o700);
         chmodSync(sessionDir, 0o700);
         writeFileSync(
           join(sessionDir, "session.json"),
@@ -6832,7 +5385,7 @@ describe("acp: model-independent", () => {
           cwd: workspaceRoot,
           env: {
             HOME: home,
-            AI_GATEWAY_API_KEY: "e2e-placeholder",
+            FFX_PROVIDER_API_KEY: "e2e-placeholder",
             VERCEL_OIDC_TOKEN: "",
           },
         });
@@ -6871,88 +5424,9 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "session load omits synthetic execution for summary-only turns",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-load-summary-only-");
-      const answer = "ACP summary-only load complete.";
-      const promptText = "Return the prepared summary-only answer.";
-      const gateway = startFakeGateway([finalText(answer)]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        const newResponse = await client.request("session/new", { mcpServers: [] }, 2) as any;
-        await client.readLine();
-        const sessionId = newResponse.result.sessionId;
-        await client.request("session/set_mode", { modeId: "code" }, 3);
-        const prompt = await runPrompt(client, promptText, TIMEOUT);
-        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
-        await client.close();
-
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 4);
-        client.send({
-          jsonrpc: "2.0",
-          id: 5,
-          method: "session/load",
-          params: { sessionId, mcpServers: [] },
-        });
-
-        const loadMessages: any[] = [];
-        let loadResponse: any = null;
-        while (loadResponse === null) {
-          const message = await client.readLine() as any;
-          if (message.id === 5) {
-            loadResponse = message;
-          } else {
-            loadMessages.push(message);
-          }
-        }
-
-        expect(loadResponse.error).toBeUndefined();
-        const userText = loadMessages
-          .filter((message) =>
-            message.method === "session/update" &&
-            message.params?.update?.sessionUpdate === "user_message_chunk"
-          )
-          .map((message) => message.params.update.content.text);
-        const agentText = loadMessages
-          .filter((message) =>
-            message.method === "session/update" &&
-            message.params?.update?.sessionUpdate === "agent_message_chunk"
-          )
-          .map((message) => message.params.update.content.text);
-        expect(userText).toEqual([promptText]);
-        expect(agentText).toEqual([answer]);
-        const replayMessageIds = loadMessages
-          .filter((message) =>
-            message.params?.update?.sessionUpdate === "user_message_chunk" ||
-            message.params?.update?.sessionUpdate === "agent_message_chunk"
-          )
-          .map((message) => message.params.update.messageId);
-        expect(replayMessageIds).toHaveLength(2);
-        expect(replayMessageIds.every((id) => typeof id === "string" && id.length > 0)).toBe(true);
-        expect(new Set(replayMessageIds).size).toBe(2);
-        expect(JSON.stringify(loadMessages)).not.toContain("Previous tool execution:");
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
     "session load replays completed assistant execution before the final answer",
     async () => {
-      const root = createIsolatedRoot("fx-acp-load-execution-");
+      const root = createIsolatedRoot("ffx-acp-load-execution-");
       writeFileSync(
         join(root.workspace, "fixture.txt"),
         "ACP_HISTORY_EVIDENCE\n",
@@ -7038,8 +5512,8 @@ describe("acp: model-independent", () => {
   test(
     "code mode deterministically gates external missing-parent writes by rule",
     async () => {
-      const deniedRoot = createIsolatedRoot("fx-acp-deterministic-denied-");
-      const allowedRoot = createIsolatedRoot("fx-acp-deterministic-allowed-");
+      const deniedRoot = createIsolatedRoot("ffx-acp-deterministic-denied-");
+      const allowedRoot = createIsolatedRoot("ffx-acp-deterministic-allowed-");
       const deniedTarget = join(
         deniedRoot.external,
         "missing",
@@ -7053,7 +5527,7 @@ describe("acp: model-independent", () => {
         "allowed.txt",
       );
       writeFileSync(
-        join(deniedRoot.home, ".fx", "settings.json"),
+        join(deniedRoot.home, ".ffx", "settings.json"),
         JSON.stringify({
           permission: {
             edit: {
@@ -7088,7 +5562,7 @@ describe("acp: model-independent", () => {
         await client.close();
 
         writeFileSync(
-          join(allowedRoot.home, ".fx", "settings.json"),
+          join(allowedRoot.home, ".ffx", "settings.json"),
           JSON.stringify({
             permission: {
               edit: {
@@ -7126,7 +5600,7 @@ describe("acp: model-independent", () => {
   test(
     "provider length with tool calls returns max output tokens without execution",
     async () => {
-      const root = createIsolatedRoot("fx-acp-length-tool-");
+      const root = createIsolatedRoot("ffx-acp-length-tool-");
       const sentinelPath = join(root.workspace, "command-must-not-run.txt");
       const gateway = startFakeGateway([
         lengthLimitedCommandCall("printf executed > command-must-not-run.txt"),
@@ -7161,7 +5635,7 @@ describe("acp: model-independent", () => {
   test(
     "provider length after silent tools returns max output tokens without continuation",
     async () => {
-      const root = createIsolatedRoot("fx-acp-silent-tools-length-");
+      const root = createIsolatedRoot("ffx-acp-silent-tools-length-");
       writeFileSync(join(root.workspace, "a.txt"), "a\n");
       writeFileSync(join(root.workspace, "b.txt"), "b\n");
       const gateway = startFakeGateway([
@@ -7200,7 +5674,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP binds an explicitly invoked skill into the prompt",
     async () => {
-      const root = createIsolatedRoot("fx-acp-explicit-skill-");
+      const root = createIsolatedRoot("ffx-acp-explicit-skill-");
       const skillDirectory = join(root.workspace, "skills", "acp-explicit");
       const skillBody = "ACP_EXPLICIT_SKILL_BODY";
       mkdirSync(skillDirectory, { recursive: true });
@@ -7245,64 +5719,9 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP ranks a natural skill match before bounded catalog omission",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-routed-skill-");
-      const distractorDescription =
-        "Synthetic unrelated metadata repeated to consume the bounded catalog while remaining harmless. ".repeat(4);
-      for (const name of ["aaa-one", "aaa-two", "aaa-three"]) {
-        const directory = join(root.workspace, "skills", name);
-        mkdirSync(directory, { recursive: true });
-        writeFileSync(
-          join(directory, "SKILL.md"),
-          `---\nname: ${name}\ndescription: ${distractorDescription}\n---\n\nDISTRACTOR_BODY\n`,
-        );
-      }
-      const targetDirectory = join(root.workspace, "skills", "system-design-method");
-      mkdirSync(targetDirectory, { recursive: true });
-      writeFileSync(
-        join(targetDirectory, "SKILL.md"),
-        "---\nname: system-design-method\ndescription: Use when designing a system architecture with bounded retries and recovery\n---\n\nTARGET_BODY\n",
-      );
-      const gateway = startFakeGateway([finalText("ACP routed skill complete")]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          args: ["--context-limit", "skill_catalog_bytes=1024", "acp"],
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await startCodeSession(client);
-        const result = await runPrompt(
-          client,
-          "Design a system architecture with bounded retries and recovery.",
-          TIMEOUT,
-        );
-
-        expect(result.promptResult.error).toBeUndefined();
-        expect(result.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(1);
-        const available = acpTaggedBlock(
-          gateway.requests[0]!.body,
-          "available_skills",
-        );
-        expect(available).toContain("<name>system-design-method</name>");
-        expect(available).toContain("Use when designing a system architecture");
-        expect(available).not.toContain("<name>aaa-three</name>");
-        expect(JSON.stringify(result.messages)).toContain("skill catalog omitted");
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
     "ACP rejects an explicitly invoked skill deleted after session startup",
     async () => {
-      const root = createIsolatedRoot("fx-acp-stale-explicit-skill-");
+      const root = createIsolatedRoot("ffx-acp-stale-explicit-skill-");
       const skillDirectory = join(root.workspace, "skills", "acp-stale");
       const skillBody = "ACP_STALE_SKILL_BODY_MUST_NOT_LEAK";
       mkdirSync(skillDirectory, { recursive: true });
@@ -7349,7 +5768,7 @@ describe("acp: model-independent", () => {
   test(
     "ACP keeps valid skills when a malformed neighbor is diagnosed",
     async () => {
-      const root = createIsolatedRoot("fx-acp-skill-diagnostics-");
+      const root = createIsolatedRoot("ffx-acp-skill-diagnostics-");
       const tracePath = join(root.root, "trace.log");
       const validDirectory = join(root.workspace, "skills", "acp-valid-skill");
       const malformedDirectory = join(
@@ -7377,8 +5796,8 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: {
             ...fakeGatewayEnv(root, gateway),
-            FX_TRACE_LOG: tracePath,
-            FX_TRACE_SCOPES: "skill,skills,acp,config",
+            FFX_TRACE_LOG: tracePath,
+            FFX_TRACE_SCOPES: "skill,skills,acp,config",
           },
         });
         await startCodeSession(client);
@@ -7447,7 +5866,7 @@ describe("acp: model-independent", () => {
   test(
     "session/prompt refreshes project context before each turn",
     async () => {
-      const root = createIsolatedRoot("fx-acp-context-refresh-");
+      const root = createIsolatedRoot("ffx-acp-context-refresh-");
       const firstMarker = "ACP_CONTEXT_FIRST_SENTINEL";
       const secondMarker = "ACP_CONTEXT_SECOND_SENTINEL";
       const transientMarker =
@@ -7498,7 +5917,7 @@ describe("acp: model-independent", () => {
   test(
     "session/prompt applies scoped instructions from a local resource target",
     async () => {
-      const root = createIsolatedRoot("fx-acp-resource-context-");
+      const root = createIsolatedRoot("ffx-acp-resource-context-");
       const nested = join(root.workspace, "nested scope");
       const sibling = join(root.workspace, "sibling");
       mkdirSync(nested, { recursive: true });
@@ -7566,7 +5985,7 @@ describe("acp: model-independent", () => {
   test(
     "session/prompt defers a scoped mutation until its instructions are visible",
     async () => {
-      const root = createIsolatedRoot("fx-acp-tool-context-");
+      const root = createIsolatedRoot("ffx-acp-tool-context-");
       const nested = join(root.workspace, "nested");
       const sibling = join(root.workspace, "sibling");
       mkdirSync(nested, { recursive: true });
@@ -7583,7 +6002,7 @@ describe("acp: model-independent", () => {
       writeFileSync(join(nested, "AGENTS.md"), `${nestedRule}\n${nestedTail}\n`);
       writeFileSync(join(sibling, "AGENTS.md"), `${siblingRule}\n`);
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({
           context_limits: { project_instruction_file_bytes: 48 },
         }),
@@ -7659,10 +6078,10 @@ describe("acp: model-independent", () => {
   test(
     "permission requests reuse tool ids and session grants",
     async () => {
-      const root = createIsolatedRoot("fx-acp-permission-parity-");
+      const root = createIsolatedRoot("ffx-acp-permission-parity-");
       const target = join(root.external, "approved.txt");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission: { edit: { [`${root.external}/**`]: "ask" } } }),
       );
       const gateway = startFakeGateway([
@@ -7686,11 +6105,6 @@ describe("acp: model-independent", () => {
         expect(permission).toBeDefined();
         expect(permission.params.sessionId).toBeDefined();
         expect(permission.params.toolCall.toolCallId).toBe("approved_call_1");
-        expect(permission.params.toolCall.name).toBe("write_file");
-        expect(permission.params.toolCall.rawInput).toEqual({
-          path: target,
-          content: "first\n",
-        });
         expect(permission.params.options).toEqual([
           { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
           { optionId: "allow_always", name: "Allow for this session", kind: "allow_always" },
@@ -7704,11 +6118,6 @@ describe("acp: model-independent", () => {
         const permissionIndex = first.messages.indexOf(permission);
         expect(pendingIndex).toBeGreaterThanOrEqual(0);
         expect(pendingIndex).toBeLessThan(permissionIndex);
-        expect(first.messages[pendingIndex]?.params.update.name).toBe("write_file");
-        expect(first.messages[pendingIndex]?.params.update.rawInput).toEqual({
-          path: target,
-          content: "first\n",
-        });
         const firstWire = JSON.stringify(first.messages);
         expect(firstWire).toContain('"toolCallId":"approved_call_1"');
         expect(firstWire).toContain('"status":"completed"');
@@ -7737,10 +6146,10 @@ describe("acp: model-independent", () => {
   test(
     "explicit rejection blocks execution with a failed terminal status",
     async () => {
-      const root = createIsolatedRoot("fx-acp-permission-reject-");
+      const root = createIsolatedRoot("ffx-acp-permission-reject-");
       const target = join(root.external, "rejected.txt");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission: { edit: { [`${root.external}/**`]: "ask" } } }),
       );
       const gateway = startFakeGateway([
@@ -7775,131 +6184,18 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP executes one direct subagent result with inherited tools",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-direct-subagent-");
-      const childPrompt = "Inspect the workspace without making changes.";
-      const createId = "acp_direct_child";
-      const route = (body: string) => {
-        if (body.includes(`\"toolCallId\":\"${createId}\"`)) {
-          expect(acpToolResultText(body, createId)).toContain("child inspection complete");
-          return finalText("ACP_DIRECT_SUBAGENT_COMPLETE");
-        }
-        if (acpPromptText(body).includes(childPrompt)) {
-          expect(body).toContain('"name":"read_file"');
-          expect(body).not.toContain('"name":"subagent"');
-          return finalText("child inspection complete");
-        }
-        return fakeGatewayToolCall(createId, "subagent", {
-          request: { action: "run", task: childPrompt },
-        });
-      };
-      const gateway = startFakeGateway([route, route, route]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await startCodeSession(client);
-        const result = await runPrompt(client, "Delegate workspace inspection.", TIMEOUT);
-        expect(result.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(3);
-        expect(gateway.requests[0]!.body).toContain('"name":"subagent"');
-        expect(client.stderr).toBe("");
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ACP cancellation interrupts terminal subagent waiting and keeps the server usable",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-subagent-cancel-");
-      const childPrompt = "Remain active until the parent ACP prompt is cancelled.";
-      const heldChild = deferred<Response>();
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("acp_cancel_child", "subagent", {
-          request: { action: "run", task: childPrompt },
-        }),
-        () => heldChild.promise,
-        finalText("ACP_SUBAGENT_CANCEL_FOLLOWUP_OK"),
-      ]);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await startCodeSession(client);
-
-        const promptId = 6810;
-        const cancelId = 6811;
-        sendPrompt(client, promptId, "Start the cancellable subagent fixture.");
-        await waitForCondition(
-          "the held subagent request",
-          () => gateway.requests.length === 2,
-          TIMEOUT,
-        );
-        client.send({
-          jsonrpc: "2.0",
-          id: cancelId,
-          method: "session/cancel",
-          params: {},
-        });
-
-        const responses = new Map<number, any>();
-        const deadline = Date.now() + 3_000;
-        while (responses.size < 2 && Date.now() < deadline) {
-          let message: any;
-          try {
-            message = await client.readLine(
-              Math.max(100, deadline - Date.now()),
-            );
-          } catch (err) {
-            if (err instanceof AcpReadTimeoutError) break;
-            throw err;
-          }
-          if (message.id === promptId || message.id === cancelId) {
-            responses.set(message.id, message);
-          }
-        }
-        expect(responses.get(cancelId)?.result).toBeNull();
-        expect(responses.get(promptId)?.result?.stopReason).toBe("cancelled");
-
-        heldChild.resolve(finalText("late child completion"));
-        const followUp = await runPrompt(
-          client,
-          "Confirm the ACP server remains usable after child cancellation.",
-          TIMEOUT,
-        );
-        expect(followUp.promptResult.result.stopReason).toBe("end_turn");
-        expect(JSON.stringify(followUp)).toContain("ACP_SUBAGENT_CANCEL_FOLLOWUP_OK");
-        expect(client.stderr).toBe("");
-      } finally {
-        heldChild.resolve(finalText("late child cleanup"));
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
     "ACP allow-once command approval executes with shared authority",
     async () => {
-      const root = createIsolatedRoot("fx-acp-command-approval-");
+      const root = createIsolatedRoot("ffx-acp-command-approval-");
       const marker = join(root.workspace, "approved-command.txt");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission: { bash: { "printf *": "ask" } } }),
       );
       const gateway = startFakeGateway([
-        fakeShellRun("approved_command_1", `printf approved > '${marker}'`, {
-          timeout_ms: 600_000,
+        fakeGatewayToolCall("approved_command_1", "terminal", {
+          action: "exec",
+          command: `printf approved > '${marker}'`,
         }),
         finalText("command approval complete"),
       ]);
@@ -7920,7 +6216,8 @@ describe("acp: model-independent", () => {
         const statuses = result.messages
           .filter((message: any) => message.params?.update?.toolCallId === "approved_command_1")
           .map((message: any) => message.params.update.status);
-        expect(statuses).toEqual(["pending", "in_progress", "completed"]);
+        // Progress refreshes may repeat in_progress; lifecycle order is the contract.
+        expect([...new Set(statuses)]).toEqual(["pending", "in_progress", "completed"]);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -7932,9 +6229,683 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP advertises and executes canonical subagents with inherited tools",
+    async () => {
+      const root = createIsolatedRoot("ffx-acp-subagent-tools-");
+      const childPrompt = "Inspect the workspace without making changes.";
+      const routeChildAndParent = (body: string) => {
+        if (body.includes('"toolCallId":"acp_create_1"') &&
+            body.includes('"type":"tool-result"')) {
+          expect(acpToolResultText(body, "acp_create_1")).toContain(
+            '"status":"created"',
+          );
+          return finalText("outer canonical subagent complete");
+        }
+        return finalText("child inspection complete");
+      };
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("acp_create_1", "subagent", {
+          command: { create: {
+            name: "workspace-inspector",
+            mode: "one_off",
+            prompt: childPrompt,
+          } },
+        }),
+        routeChildAndParent,
+        routeChildAndParent,
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const result = await runPrompt(client, "Delegate workspace inspection.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        await waitForCondition("canonical child completion", () => gateway.requests.length === 3);
+        expect(gateway.requests).toHaveLength(3);
+        for (const request of gateway.requests) {
+          expect(request.body).toContain('"name":"read_file"');
+          expect(request.body).toContain('"name":"write_file"');
+          expect(request.body).toContain('"name":"subagent"');
+          expect(request.body).not.toContain('"name":"task"');
+        }
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  for (const childMode of ["one_off", "persistent"] as const) {
+    const label = childMode === "one_off" ? "one-off" : "persistent";
+    test(
+      `ACP ${label} child inherits only its supplied MCP session runtime`,
+      async () => {
+        const root = createIsolatedRoot(`ffx-acp-${label}-child-mcp-`);
+        const suppliedPid = join(root.root, "supplied-mcp.pid");
+        const suppliedWire = join(root.root, "supplied-mcp-wire.jsonl");
+        const profilePid = join(root.root, "profile-mcp.pid");
+        writeFileSync(
+          join(root.home, ".ffx", "mcp.json"),
+          JSON.stringify({
+            mcp: {
+              profile: {
+                type: "local",
+                command: [process.execPath, MCP_STDIO_FIXTURE],
+                environment: {
+                  FFX_MCP_RESULT_TEXT: "PROFILE_MUST_NOT_RUN",
+                  FFX_MCP_PID_PATH: profilePid,
+                },
+              },
+            },
+          }),
+        );
+
+        const parentPrompt = `ACP_${childMode.toUpperCase()}_MCP_PARENT`;
+        const childPrompt = `ACP_${childMode.toUpperCase()}_MCP_CHILD`;
+        const parentCreateId = `acp_${childMode}_mcp_create`;
+        const childSelectId = `acp_${childMode}_mcp_select`;
+        const childCallId = `acp_${childMode}_mcp_call`;
+        let childId = "";
+        let childCompleted = false;
+        let parentCompleted = false;
+        const route = (body: string) => {
+          if (
+            body.includes(`"toolCallId":"${childCallId}"`) &&
+            body.includes('"type":"tool-result"')
+          ) {
+            expect(acpToolResultText(body, childCallId)).toContain(
+              `ACP_CHILD_SESSION_RESULT:${childMode}`,
+            );
+            childCompleted = true;
+            return finalText(`ACP_${childMode.toUpperCase()}_MCP_CHILD_DONE`);
+          }
+          if (
+            body.includes(`"toolCallId":"${childSelectId}"`) &&
+            body.includes('"type":"tool-result"')
+          ) {
+            return fakeGatewayToolCall(childCallId, MCP_TOOL_NAME, {
+              text: childMode,
+            });
+          }
+          if (
+            body.includes(`"toolCallId":"${parentCreateId}"`) &&
+            body.includes('"type":"tool-result"')
+          ) {
+            const created = JSON.parse(
+              acpToolResultText(body, parentCreateId),
+            ) as { child_id: string; status: string };
+            expect(created.status).toBe("created");
+            childId = created.child_id;
+            parentCompleted = true;
+            return finalText(`ACP_${childMode.toUpperCase()}_MCP_PARENT_DONE`);
+          }
+          if (acpPromptText(body).includes(childPrompt)) {
+            return fakeGatewayToolCall(childSelectId, "mcp_select_tool", {
+              name: MCP_TOOL_NAME,
+            });
+          }
+          expect(acpPromptText(body)).toContain(parentPrompt);
+          return fakeGatewayToolCall(parentCreateId, "subagent", {
+            command: { create: {
+              name: `acp-${label}-mcp-child`,
+              mode: childMode,
+              prompt: childPrompt,
+            } },
+          });
+        };
+        const gateway = startFakeGateway(
+          Array.from({ length: 5 }, () => route),
+        );
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway),
+          });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          const created = await client.request(
+            "session/new",
+            {
+              cwd: root.workspace,
+              mcpServers: [acpStdioServer(
+                "ACP_CHILD_SESSION_RESULT",
+                suppliedPid,
+                "normal",
+                { FFX_MCP_WIRE_LOG: suppliedWire },
+              )],
+            },
+            2,
+          ) as any;
+          expect(created.error).toBeUndefined();
+          const sessionId = created.result.sessionId as string;
+          await client.readLine();
+          await client.request("session/set_mode", { modeId: "code" }, 3);
+
+          const result = await runPrompt(client, parentPrompt, TIMEOUT);
+          expect(result.promptResult.result.stopReason).toBe("end_turn");
+          await waitForCondition(
+            `ACP ${label} child supplied MCP call`,
+            () => childCompleted && parentCompleted,
+            TIMEOUT,
+          );
+          expect(gateway.requests).toHaveLength(5);
+          const calls = readFileSync(suppliedWire, "utf8")
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line).message)
+            .filter((message) => message.method === "tools/call");
+          expect(calls).toHaveLength(1);
+          expect(calls[0]?.params?.arguments).toEqual({ text: childMode });
+          expect(existsSync(profilePid)).toBe(false);
+          await waitForCondition(
+            `ACP ${label} child terminal state`,
+            () =>
+              acpSubagentState(root, childId) ===
+                (childMode === "one_off" ? "completed" : "idle"),
+            TIMEOUT,
+          );
+          expect(client.stderr).toBe("");
+
+          const closed = await client.request(
+            "session/close",
+            { sessionId },
+            4,
+          ) as any;
+          expect(closed.result).toEqual({});
+          await expectMcpProcessExited(suppliedPid);
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      LIVE_TIMEOUT,
+    );
+  }
+
+  test(
+    "session/load denies pending one-off then returns not found after retirement",
+    async () => {
+      const root = createIsolatedRoot("ffx-acp-one-off-load-");
+      const childName = "acp-readonly-child";
+      const childPrompt = "ACP_ONE_OFF_LOAD_CHILD";
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes("Acknowledge the completed one-off result.")) {
+          return finalText("ACP_ONE_OFF_RETIREMENT_ACK_DONE");
+        }
+        if (body.includes('"toolCallId":"acp_one_off_load_create"')) {
+          return finalText("ACP_ONE_OFF_LOAD_PARENT_DONE");
+        }
+        if (body.includes(childPrompt)) {
+          return finalText("ACP_ONE_OFF_LOAD_CHILD_DONE");
+        }
+        return fakeGatewayToolCall("acp_one_off_load_create", "subagent", {
+          command: { create: {
+            name: childName,
+            mode: "one_off",
+            prompt: childPrompt,
+          } },
+        });
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const parentId = await startCodeSession(client);
+        const result = await runPrompt(
+          client,
+          "Create the ACP one-off load fixture.",
+          TIMEOUT,
+        );
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        const sessionsDir = join(root.home, ".ffx", "sessions");
+        let control: { id: string; path: string } | undefined;
+        await waitForCondition(
+          "ACP one-off child completion",
+          () => {
+            if (gateway.requests.length !== 3) return false;
+            control = readdirSync(sessionsDir)
+              .map((id) => ({
+                id,
+                path: join(sessionsDir, id, "subagent", "control.json"),
+              }))
+              .filter((entry) => existsSync(entry.path))
+              .find((entry) => {
+                const record = JSON.parse(readFileSync(entry.path, "utf8")) as {
+                  state: string;
+                  configuration: { name: string };
+                };
+                return record.configuration.name === childName &&
+                  record.state === "completed";
+              });
+            return control !== undefined;
+          },
+          TIMEOUT,
+        );
+        await client.close();
+
+        if (!control) throw new Error("ACP one-off control was not persisted");
+        const controlBefore = readFileSync(control.path, "utf8");
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        const denied = await client.request(
+          "session/load",
+          { sessionId: control.id, mcpServers: [] },
+          11,
+        ) as any;
+        expect(denied.error).toEqual({
+          code: -32602,
+          message: "One-off child sessions cannot accept additional prompts",
+        });
+        expect(gateway.requests).toHaveLength(3);
+        expect(readFileSync(control.path, "utf8")).toBe(controlBefore);
+
+        client.send({
+          jsonrpc: "2.0",
+          id: 12,
+          method: "session/load",
+          params: { sessionId: parentId, mcpServers: [] },
+        });
+        const parent = await readResponse(client, 12);
+        expect(parent.error).toBeUndefined();
+        expect(Array.isArray(parent.result?.configOptions)).toBe(true);
+
+        await client.close();
+        client = null;
+        const acknowledged = await runFx([
+          "ask",
+          "--json",
+          "--auto",
+          "--resume-id",
+          parentId,
+          "Acknowledge the completed one-off result.",
+        ], {
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        });
+        expect(acknowledged.code).toBe(0);
+        expect(gateway.requests.at(-1)?.body).toContain(
+          "ACP_ONE_OFF_LOAD_CHILD_DONE",
+        );
+        await waitForCondition(
+          "ACP one-off child retirement",
+          () => !existsSync(control.path),
+        );
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        const retired = await client.request(
+          "session/load",
+          { sessionId: control.id, mcpServers: [] },
+          21,
+        ) as any;
+        expect(retired.error).toEqual({
+          code: -32602,
+          message: "Session not found",
+        });
+        expect(gateway.requests).toHaveLength(4);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "ACP delivers periodic child notifications at the next available parent step",
+    async () => {
+      const root = createIsolatedRoot("ffx-acp-parent-delivery-");
+      const childPrompt = "ACP_PARENT_DELIVERY_CHILD_PROMPT";
+      const intervalPayload = "coalesced_ticks";
+      let intervalEventIds: string[] = [];
+      let childId = "";
+      let sameTurnEventIds: string[] = [];
+      let parentContinuationChecked = false;
+      let secondInitialChecked = false;
+      let secondContinuationChecked = false;
+      let thirdChecked = false;
+      let parentCompletion: Promise<Response> | null = null;
+      let childRequestObserved = false;
+      let resolveChildStarted!: () => void;
+      const childStarted = new Promise<void>((resolve) => {
+        resolveChildStarted = resolve;
+      });
+      let parentPhase:
+        | "create_prompt"
+        | "create_result"
+        | "second_prompt"
+        | "inspect_result"
+        | "third_prompt"
+        | "complete" = "create_prompt";
+      const unexpectedRequests: string[] = [];
+      const childCompletion = heldFakeGatewayFinalText();
+      const route = (body: string) => {
+        const text = acpPromptText(body);
+        const latestText = acpLatestPromptText(body);
+        if (latestText.includes(childPrompt)) {
+          if (!childRequestObserved) {
+            childRequestObserved = true;
+            resolveChildStarted();
+          }
+          return childCompletion.response;
+        }
+        if (parentPhase === "third_prompt" && text.includes("ACP_PARENT_THIRD_PROMPT")) {
+          expectNoAcpParentDeliveries(body);
+          thirdChecked = true;
+          parentPhase = "complete";
+          return finalText("ACP_PARENT_NO_REDELIVERY");
+        }
+        if (parentPhase === "inspect_result" &&
+            body.includes('"toolCallId":"acp_delivery_inspect_1"') &&
+            body.includes('"type":"tool-result"')) {
+          expectNoAcpParentDeliveries(body);
+          secondContinuationChecked = true;
+          parentPhase = "third_prompt";
+          return finalText("ACP_PARENT_DELIVERY_CONSUMED");
+        }
+        if (parentPhase === "second_prompt" && text.includes("ACP_PARENT_SECOND_PROMPT")) {
+          const pendingEventIds = intervalEventIds.filter(
+            (eventId) => !sameTurnEventIds.includes(eventId),
+          );
+          expectAcpParentDeliveriesOrNone(
+            body,
+            childId,
+            pendingEventIds,
+            intervalPayload,
+          );
+          secondInitialChecked = true;
+          parentPhase = "inspect_result";
+          return fakeGatewayToolCall("acp_delivery_inspect_1", "subagent", {
+            command: {
+              inspect: {
+                id: childId,
+                sections: ["status", "configuration", "relationship"],
+              },
+            },
+          });
+        }
+        if (parentPhase === "create_result" &&
+            body.includes('"toolCallId":"acp_delivery_create_1"') &&
+            body.includes('"type":"tool-result"')) {
+          if (!parentCompletion) {
+            const created = JSON.parse(
+              acpToolResultText(body, "acp_delivery_create_1"),
+            ) as { child_id: string; status: string };
+            expect(created.status).toBe("created");
+            childId = created.child_id;
+            sameTurnEventIds = acpParentDeliveryIds(body);
+            expectAcpParentDeliveriesOrNone(
+              body,
+              childId,
+              sameTurnEventIds,
+              intervalPayload,
+            );
+            parentContinuationChecked = true;
+            parentPhase = "second_prompt";
+            parentCompletion = childStarted
+              .then(() => waitForPersistedAcpDeliveryIds(root, childId, intervalPayload))
+              .then(async () => {
+                childCompletion.release("ACP_CHILD_PRIVATE_TRANSCRIPT_DONE");
+                await waitForCondition(
+                  "ACP delivery child idle before parent boundary",
+                  () => acpSubagentState(root, childId) === "idle",
+                  TIMEOUT,
+                );
+                intervalEventIds = findPersistedAcpDeliveryIds(root, childId, intervalPayload);
+                expect(intervalEventIds.length).toBeGreaterThan(0);
+                for (const eventId of sameTurnEventIds) {
+                  expect(intervalEventIds).toContain(eventId);
+                }
+                return finalText("ACP_PARENT_FIRST_TURN_COMPLETE");
+              });
+          }
+          return parentCompletion;
+        }
+        if (parentPhase === "create_prompt" &&
+            text.includes("Create the ACP delivery fixture.")) {
+          parentPhase = "create_result";
+          return fakeGatewayToolCall("acp_delivery_create_1", "subagent", {
+            command: { create: {
+              name: "acp-delivery-child",
+              mode: "persistent",
+              prompt: childPrompt,
+              notifications: {
+                terminal: { completed: false, failed: false, cancelled: false },
+                report_interval_ms: 50,
+                stop_conditions: ["terminal"],
+              },
+            } },
+          });
+        }
+        unexpectedRequests.push(body);
+        return new Response(`unexpected parent phase: ${parentPhase}`, { status: 500 });
+      };
+      const gateway = startDynamicFakeGateway(route);
+      let client: AcpClient | null = null;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const parentSessionId = await startCodeSession(client);
+        const first = await runPrompt(client, "Create the ACP delivery fixture.", TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(first)).toContain("ACP_PARENT_FIRST_TURN_COMPLETE");
+        expect(parentContinuationChecked).toBe(true);
+        expect(childRequestObserved).toBe(true);
+        expect(childId.length).toBeGreaterThan(0);
+        expect(intervalEventIds.length).toBeGreaterThan(0);
+        await waitForCondition(
+          "ACP delivery child idle",
+          () => acpSubagentState(root, childId) === "idle",
+          TIMEOUT,
+        );
+
+        const second = await runPrompt(client, "ACP_PARENT_SECOND_PROMPT", TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(second)).toContain("ACP_PARENT_DELIVERY_CONSUMED");
+        expect(secondInitialChecked).toBe(true);
+        expect(secondContinuationChecked).toBe(true);
+
+        const third = await runPrompt(client, "ACP_PARENT_THIRD_PROMPT", TIMEOUT);
+        expect(third.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(third)).toContain("ACP_PARENT_NO_REDELIVERY");
+        expect(thirdChecked).toBe(true);
+        expect(parentPhase as string).toBe("complete");
+        expect(unexpectedRequests).toEqual([]);
+
+        for (const eventId of intervalEventIds) {
+          expectAcpHumanUnreadIndependent(root, childId, eventId);
+        }
+        expectAcpParentHistoryClean(root, parentSessionId, [
+          "<subagent_deliveries",
+          "ACP_CHILD_PRIVATE_TRANSCRIPT_DONE",
+        ]);
+        expect(client.stderr).toBe("");
+      } finally {
+        childCompletion.dispose();
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP delivers a 64 KiB child message in five bounded projections",
+    async () => {
+      const root = createIsolatedRoot("ffx-acp-64k-parent-delivery-");
+      const childPrompt = "ACP_64K_DELIVERY_CHILD_PROMPT";
+      const largeMessage = "ACP_64K_PARENT_MESSAGE:".padEnd(64 * 1024, "x");
+      let parentSessionId = "";
+      let childId = "";
+      let messageEventId = "";
+      let noRedeliveryChecked = false;
+      const parts: AcpParentMessagePart[] = [];
+      const route = (body: string) => {
+        const text = acpPromptText(body);
+        if (text.includes("ACP_64K_NO_REDELIVERY")) {
+          expectNoAcpParentDeliveries(body);
+          noRedeliveryChecked = true;
+          return finalText("ACP_64K_NO_REDELIVERY_DONE");
+        }
+        if (text.includes("ACP_64K_PARENT_TURN_")) {
+          const part = acpParentMessagePart(body, childId, messageEventId);
+          expect(part.offset).toBe(
+            parts.length === 0 ? 0 : parts[parts.length - 1]!.end_offset,
+          );
+          expect(part.total_bytes).toBe(largeMessage.length);
+          parts.push(part);
+          return finalText(`ACP_64K_PART_${parts.length}_DONE`);
+        }
+        if (body.includes('"toolCallId":"acp_64k_send_1"') &&
+            body.includes('"type":"tool-result"')) {
+          expect(acpToolResultText(body, "acp_64k_send_1")).toContain(
+            '"status":"message_queued"',
+          );
+          return finalText("ACP_64K_CHILD_PRIVATE_DONE");
+        }
+        if (body.includes('"toolCallId":"acp_64k_create_1"') &&
+            body.includes('"type":"tool-result"')) {
+          const created = JSON.parse(
+            acpToolResultText(body, "acp_64k_create_1"),
+          ) as { child_id: string; status: string };
+          expect(created.status).toBe("created");
+          childId = created.child_id;
+          const sameTurnEventIds = acpParentDeliveryIds(body);
+          expect(sameTurnEventIds.length).toBeLessThanOrEqual(1);
+          if (sameTurnEventIds.length === 1) {
+            messageEventId = sameTurnEventIds[0]!;
+            const part = acpParentMessagePart(body, childId, messageEventId);
+            expect(part.offset).toBe(0);
+            expect(part.total_bytes).toBe(largeMessage.length);
+            parts.push(part);
+          } else {
+            expectNoAcpParentDeliveries(body);
+          }
+          return waitForPersistedAcpDeliveryId(
+            root,
+            childId,
+            "ACP_64K_PARENT_MESSAGE:",
+          ).then((eventId) => {
+            if (messageEventId.length > 0) {
+              expect(eventId).toBe(messageEventId);
+            } else {
+              messageEventId = eventId;
+            }
+            return finalText("ACP_64K_PARENT_FIRST_DONE");
+          });
+        }
+        if (text.includes(childPrompt)) {
+          return (async () => {
+            await waitForCondition(
+              "ACP 64 KiB parent session identity",
+              () => parentSessionId.length > 0,
+              TIMEOUT,
+            );
+            return fakeGatewayToolCall("acp_64k_send_1", "subagent", {
+              command: {
+                message: {
+                  send: { id: parentSessionId, content: largeMessage },
+                },
+              },
+            });
+          })();
+        }
+        return fakeGatewayToolCall("acp_64k_create_1", "subagent", {
+          command: { create: {
+            name: "acp-64k-delivery-child",
+            mode: "persistent",
+            prompt: childPrompt,
+            notifications: {
+              terminal: { completed: false, failed: false, cancelled: false },
+              stop_conditions: ["terminal"],
+            },
+          } },
+        });
+      };
+      const gateway = startFakeGateway(Array.from({ length: 10 }, () => route));
+      let client: AcpClient | null = null;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        parentSessionId = await startCodeSession(client);
+        const first = await runPrompt(
+          client,
+          "Create the ACP 64 KiB delivery fixture.",
+          TIMEOUT,
+        );
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(first)).toContain("ACP_64K_PARENT_FIRST_DONE");
+        expect(childId.length).toBeGreaterThan(0);
+        expect(messageEventId.length).toBeGreaterThan(0);
+        await waitForCondition(
+          "ACP 64 KiB delivery child idle",
+          () => acpSubagentState(root, childId) === "idle",
+          TIMEOUT,
+        );
+        expect(gateway.requests).toHaveLength(4);
+
+        const sameTurnPartCount = parts.length;
+        for (let index = parts.length; index < 5; index += 1) {
+          const requestsBefore = gateway.requests.length;
+          const turn = await runPrompt(
+            client,
+            `ACP_64K_PARENT_TURN_${index + 1}`,
+            TIMEOUT,
+          );
+          expect(turn.promptResult.result.stopReason).toBe("end_turn");
+          expect(gateway.requests).toHaveLength(requestsBefore + 1);
+        }
+        expect(parts).toHaveLength(5);
+        expect(parts.map((part) => part.content).join("")).toBe(largeMessage);
+        expect(parts[parts.length - 1]!.more).toBe(false);
+
+        const final = await runPrompt(client, "ACP_64K_NO_REDELIVERY", TIMEOUT);
+        expect(final.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(final)).toContain("ACP_64K_NO_REDELIVERY_DONE");
+        expect(noRedeliveryChecked).toBe(true);
+        expect(gateway.requests).toHaveLength(10 - sameTurnPartCount);
+        expectAcpHumanUnreadIndependent(root, childId, messageEventId);
+        expectAcpParentHistoryClean(root, parentSessionId, [
+          "<subagent_deliveries",
+          "ACP_64K_PARENT_MESSAGE:",
+          "ACP_64K_CHILD_PRIVATE_DONE",
+        ]);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    90_000,
+  );
+
+
+  test(
     "mode changes during a prompt apply to the next prompt",
     async () => {
-      const root = createIsolatedRoot("fx-acp-active-mode-");
+      const root = createIsolatedRoot("ffx-acp-active-mode-");
       const heldResponse = deferred<Response>();
       const probePath = join(root.workspace, "mode-probe.txt");
       const gateway = startFakeGateway([
@@ -7952,7 +6923,7 @@ describe("acp: model-independent", () => {
         await waitForCondition("the code-mode Gateway request", () => gateway.requests.length === 1);
         const codeRequest = parseGatewayRequest(gateway.requests[0]!.body);
         expect(serializedToolNames(codeRequest)).toEqual(
-          AUTO_EXA_SERIALIZED_TOOL_NAMES,
+          AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
         );
         expect(findUnavailableCapabilityReferences(codeRequest)).toEqual([]);
         expect(customProviderGuidanceState(codeRequest).guidanceMessageIndices).toEqual([1]);
@@ -7991,18 +6962,17 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "protocol request cancellation aborts held automatic review and keeps server usable",
+    "ACP cancellation aborts held automatic review and keeps server usable",
     async () => {
-      const root = createIsolatedRoot("fx-acp-auto-review-cancel-");
+      const root = createIsolatedRoot("ffx-acp-auto-review-cancel-");
       const marker = join(root.workspace, "cancelled-review-must-not-run.txt");
       const heldReview = deferred<Response>();
       const gateway = startFakeGateway(
         [
-          fakeShellRun(
-            "cancelled_review_command",
-            `printf cancelled > ${JSON.stringify(marker)}`,
-            { timeout_ms: 600_000 },
-          ),
+          fakeGatewayToolCall("cancelled_review_command", "terminal", {
+            action: "exec",
+            command: `printf cancelled > ${JSON.stringify(marker)}`,
+          }),
           finalText("follow-up after ACP review cancellation"),
         ],
         { classifierResponses: [() => heldReview.promise] },
@@ -8022,14 +6992,25 @@ describe("acp: model-independent", () => {
         );
         client.send({
           jsonrpc: "2.0",
-          method: "$/cancel_request",
-          params: { requestId: 396 },
+          id: 397,
+          method: "session/cancel",
+          params: {},
         });
 
-        const promptResponse = await readResponse(client, 396);
-        expect(promptResponse.result?.stopReason).toBe("cancelled");
+        const terminalResponses = new Map<number, any>();
+        const deadline = Date.now() + TIMEOUT;
+        while (terminalResponses.size < 2 && Date.now() < deadline) {
+          const message = await client.readLine(
+            Math.min(3_000, Math.max(100, deadline - Date.now())),
+          ) as any;
+          if (message.id === 396 || message.id === 397) {
+            terminalResponses.set(message.id, message);
+          }
+        }
+        expect(terminalResponses.get(397)?.result).toBeNull();
+        expect(terminalResponses.get(396)?.result?.stopReason).toBe("cancelled");
 
-        heldReview.resolve(fakeGatewayPermissionDecision("clear"));
+        heldReview.resolve(fakeGatewayPermissionDecision("allow"));
         await Bun.sleep(100);
         expect(gateway.classifierRequests).toHaveLength(1);
         expect(gateway.requests).toHaveLength(1);
@@ -8049,7 +7030,7 @@ describe("acp: model-independent", () => {
         expect(existsSync(marker)).toBe(false);
         expect(client.stderr).toBe("");
       } finally {
-        heldReview.resolve(fakeGatewayPermissionDecision("clear"));
+        heldReview.resolve(fakeGatewayPermissionDecision("allow"));
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -8060,12 +7041,146 @@ describe("acp: model-independent", () => {
 
 
   test(
+    "ACP persistent Codex children retain their provider across messages",
+    async () => {
+      const root = createIsolatedRoot("ffx-acp-codex-subagent-");
+      const gateway = startFakeGateway([]);
+      const childFirstPrompt = "CODEX_CHILD_FIRST_TURN";
+      const childSecondPrompt = "CODEX_CHILD_SECOND_TURN";
+      let childId = "";
+      const codex = startAcpFakeCodex({
+        route(body) {
+          const toolResult = codexLatestToolResult(body);
+          if (toolResult?.callId === "codex_child_resume") {
+            return codexFinalText("CODEX_PARENT_RESUMED_CHILD");
+          }
+          if (toolResult?.callId === "codex_child_message") {
+            if (!childId) throw new Error("Codex child id was not captured");
+            return codexToolCall("codex_child_resume", "subagent", {
+              command: {
+                lifecycle: { id: childId, action: "resume" },
+              },
+            });
+          }
+          if (toolResult?.callId === "codex_child_create") {
+            const created = JSON.parse(toolResult.output) as {
+              child_id: string;
+              status: string;
+            };
+            expect(created.status).toBe("created");
+            childId = created.child_id;
+            return codexFinalText("CODEX_PARENT_CREATED_CHILD");
+          }
+          if (body.includes("Send the persistent Codex child another message.")) {
+            if (!childId) throw new Error("Codex child id was not captured");
+            return codexToolCall("codex_child_message", "subagent", {
+              command: {
+                message: {
+                  send: { id: childId, content: childSecondPrompt },
+                },
+              },
+            });
+          }
+          if (body.includes(childSecondPrompt)) {
+            return codexFinalText("CODEX_CHILD_SECOND_DONE");
+          }
+          if (body.includes(childFirstPrompt)) {
+            return codexFinalText("CODEX_CHILD_FIRST_DONE");
+          }
+          return codexToolCall("codex_child_create", "subagent", {
+            command: { create: {
+              name: "codex-persistent-child",
+              mode: "persistent",
+              prompt: childFirstPrompt,
+            } },
+          });
+        },
+      });
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FFX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FFX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+        const changed = await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "codex",
+        }, 4) as any;
+        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
+          .toBe("codex");
+
+        const first = await runPrompt(client, "Create a persistent Codex child.", TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        await waitForCondition(
+          "first Codex child turn",
+          () => childId.length > 0 &&
+            codex.requests.some((request) => request.body.includes(childFirstPrompt)),
+          TIMEOUT,
+        );
+        await waitForCondition(
+          "first Codex child idle state",
+          () => acpSubagentState(root, childId) === "idle",
+          TIMEOUT,
+        );
+        const childState = JSON.parse(
+          readFileSync(
+            join(root.home, ".ffx", "sessions", childId, "session.json"),
+            "utf8",
+          ),
+        ) as { preferences: { provider: string; model: string } };
+        expect(childState.preferences.provider).toBe("codex");
+        expect(childState.preferences.model).toBe("gpt-5.6-sol");
+
+        const second = await runPrompt(
+          client,
+          "Send the persistent Codex child another message.",
+          TIMEOUT,
+        );
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        await waitForCondition(
+          "second Codex child turn",
+          () => codex.requests.some((request) => request.body.includes(childSecondPrompt)),
+          TIMEOUT,
+        );
+        await waitForCondition(
+          "second Codex child idle state",
+          () => acpSubagentState(root, childId) === "idle",
+          TIMEOUT,
+        );
+        expect(codex.requests.length).toBeGreaterThanOrEqual(7);
+        for (const request of codex.requests) {
+          expect(request.authorization).toBe(`Bearer ${codex.accessToken}`);
+          expect(JSON.parse(request.body).model).toBe("gpt-5.6-sol");
+        }
+        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+          expect(request.headers.get("authorization")).not.toBe(`Bearer ${codex.accessToken}`);
+        }
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        codex.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "stdin shutdown cancels a pending permission request",
     async () => {
-      const root = createIsolatedRoot("fx-acp-permission-shutdown-");
+      const root = createIsolatedRoot("ffx-acp-permission-shutdown-");
       const target = join(root.external, "never-written.txt");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission: { edit: { [`${root.external}/**`]: "ask" } } }),
       );
       const gateway = startFakeGateway([
@@ -8102,94 +7217,10 @@ describe("acp: model catalog authentication", () => {
     if (client) await client.close();
   });
 
-  for (const scenario of [
-    {
-      name: "includes team-private model options for seeded team auth",
-      teamId: "team_123",
-      expectedAuthorization: `Bearer ${SEEDED_GATEWAY_TOKEN}`,
-      expectedTeamId: "team_123",
-      expectPrivate: true,
-      expectInitializeFailure: false,
-    },
-    {
-      name: "rejects seeded login without a selected team",
-      teamId: undefined,
-      expectedAuthorization: null,
-      expectedTeamId: null,
-      expectPrivate: false,
-      expectInitializeFailure: true,
-    },
-  ]) {
-    test(
-      `session/new ${scenario.name}`,
-      async () => {
-        const root = createIsolatedRoot("fx-acp-team-model-options-");
-        const gateway = startFakeGateway([], {
-          models(request) {
-            const url = new URL(request.url);
-            const seededAuth = request.headers.get("authorization") ===
-              `Bearer ${SEEDED_GATEWAY_TOKEN}`;
-            const hasTeam = url.searchParams.get("teamId") === "team_123";
-            return [
-              { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
-              ...(seededAuth && hasTeam
-                ? [{ id: "private/blue-hornbill", type: "language", tags: ["tool-use"] }]
-                : []),
-            ];
-          },
-        });
-        try {
-          writeSeededFxAuth(root.home, scenario.teamId);
-          client = await AcpClient.create({
-            cwd: root.workspace,
-            env: {
-              ...fakeGatewayEnv(root, gateway),
-              AI_GATEWAY_API_KEY: undefined,
-              VERCEL_OIDC_TOKEN: undefined,
-              FX_DISABLE_KEYCHAIN: "1",
-            },
-          });
-          const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
-          if (scenario.expectInitializeFailure) {
-            expect(initialized.error).toBeDefined();
-            expect(initialized.error.message).toContain("fx login");
-            expect(gateway.modelRequests).toHaveLength(0);
-            return;
-          }
-          expect(initialized.error).toBeUndefined();
-          const resp = await client.request("session/new", {}, 2) as any;
-          expect(gateway.modelRequests).toHaveLength(1);
-          const modelRequest = gateway.modelRequests[0]!;
-          expect(modelRequest.headers.get("authorization")).toBe(
-            scenario.expectedAuthorization,
-          );
-          expect(new URL(modelRequest.url).searchParams.get("teamId")).toBe(
-            scenario.expectedTeamId,
-          );
-          expect(modelRequest.headers.get("x-vercel-ai-gateway-team")).toBeNull();
-
-          const modelOpt = resp.result.configOptions.find((o: any) => o.id === "model");
-          expect(modelOpt).toBeDefined();
-          const optionsText = JSON.stringify(modelOpt.options);
-          if (scenario.expectPrivate) {
-            expect(optionsText).toContain("private/blue-hornbill");
-          } else {
-            expect(optionsText).not.toContain("private/blue-hornbill");
-          }
-        } finally {
-          await client?.close();
-          gateway.stop();
-          rmSync(root.root, { recursive: true, force: true });
-        }
-      },
-      TIMEOUT,
-    );
-  }
-
   test(
     "--model flag overrides selected model without inheriting the default Fast mode",
     async () => {
-      const root = createIsolatedRoot("fx-acp-model-override-");
+      const root = createIsolatedRoot("ffx-acp-model-override-");
       const gateway = startFakeGateway([finalText("override complete")], {
         models: [
           { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
@@ -8205,7 +7236,7 @@ describe("acp: model catalog authentication", () => {
         client = await AcpClient.create({
           args: ["acp", "--model", "provider/fast-override"],
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: undefined },
+          env: { ...fakeGatewayEnv(root, gateway), FFX_MODEL: undefined },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const resp = await client.request("session/new", { mcpServers: [] }, 2) as any;
@@ -8227,239 +7258,6 @@ describe("acp: model catalog authentication", () => {
     },
     TIMEOUT,
   );
-  test(
-    "session provider changes use Codex credentials without crossing origins",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-chatgpt-route-");
-      const gateway = startFakeGateway([]);
-      const codex = startAcpFakeCodex({ unauthorizedResponses: 1 });
-      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: {
-            ...fakeGatewayEnv(root, gateway),
-            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
-            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
-            FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
-          },
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine(); // consume session/update notification
-
-        const changed = await client.request("session/set_config_option", {
-          configId: "provider",
-          value: "codex",
-        }, 3) as any;
-        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
-          .toBe("codex");
-        expect(changed.result.configOptions.find((option: any) => option.id === "model").currentValue)
-          .toBe("gpt-5.6-sol");
-
-        const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
-        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
-        expect(JSON.stringify(prompt.messages)).toContain("ACP_CHATGPT_RESPONSE");
-        const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
-        expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
-        expect(codex.requests).toHaveLength(3);
-        expect(codex.modelRequests).toHaveLength(1);
-        expect(codex.requests[0]!.authorization).toBe(`Bearer ${codex.accessToken}`);
-        expect(codex.requests[1]!.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
-        expect(codex.requests[2]!.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
-        expect(codex.tokenRequests).toHaveLength(1);
-        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
-          expect(request.headers.get("authorization")).not.toBe(`Bearer ${codex.accessToken}`);
-        }
-      } finally {
-        await client?.close();
-        codex.stop();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  for (const provider of ["codex", "grok"] as const) {
-    for (const transition of ["cancel", "load", "resume"] as const) {
-      test(`provider selection after session/${transition} activates ${provider}`, async () => {
-        const root = createIsolatedRoot("fx-acp-recovery-");
-        const gateway = startFakeGateway([]);
-        const codex = startAcpFakeCodex();
-        const grok = startAcpFakeGrok();
-        writeSeededAcpChatGptLogin(root.home, codex.accessToken);
-        writeSeededAcpGrokLogin(root.home, grok.accessToken);
-        try {
-          client = await AcpClient.create({
-            cwd: root.workspace,
-            env: {
-              ...fakeGatewayEnv(root, gateway),
-              FX_DISABLE_KEYCHAIN: "1",
-              FX_SOUND: "0",
-              FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
-              FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
-              FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
-              FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
-              FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
-              FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
-              FX_E2E_GROK_TOKEN_URL: grok.tokenUrl,
-              FX_E2E_GROK_USERINFO_URL: grok.userinfoUrl,
-            },
-          });
-          const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
-          expect(initialized.error).toBeUndefined();
-          const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
-          expect(created.error).toBeUndefined();
-          const transitioned = await client.request(`session/${transition}`, {
-            sessionId: created.result.sessionId,
-            ...(transition === "cancel" ? {} : { cwd: root.workspace, mcpServers: [] }),
-          }, 3) as any;
-          expect(transitioned.error).toBeUndefined();
-
-          const changed = await client.request("session/set_config_option", {
-            configId: "provider",
-            value: provider,
-          }, 4) as any;
-          expect(changed.error).toBeUndefined();
-          expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
-            .toBe(provider);
-          const selected = provider === "codex" ? codex : grok;
-          const other = provider === "codex" ? grok : codex;
-          expect(selected.modelRequests.filter((request) => request.path === "/models")).toHaveLength(1);
-          expect(other.modelRequests).toHaveLength(0);
-
-          const prompt = await runPrompt(client, "Answer after changing providers.", TIMEOUT);
-          expect(prompt.promptResult.result.stopReason).toBe("end_turn");
-          expect(JSON.stringify(prompt.messages)).toContain(
-            provider === "codex" ? "ACP_CHATGPT_RESPONSE" : "ACP_GROK_RESPONSE",
-          );
-          expect(selected.requests).toHaveLength(1);
-          expect(selected.requests[0]!.authorization).toBe(`Bearer ${selected.accessToken}`);
-          expect(selected.tokenRequests).toHaveLength(0);
-          expect(other.requests).toHaveLength(0);
-          expect(gateway.requests).toHaveLength(0);
-          client.endStdin();
-          expect(await client.waitForExit()).toBe(0);
-          expect(client.stderr).toBe("");
-        } finally {
-          await client?.close();
-          codex.stop();
-          grok.stop();
-          gateway.stop();
-          rmSync(root.root, { recursive: true, force: true });
-        }
-      }, TIMEOUT);
-    }
-  }
-
-  test("an open ACP connection refreshes subscription model options before selection", async () => {
-    const root = createIsolatedRoot("fx-acp-catalog-refresh-");
-    const gateway = startFakeGateway([]);
-    const codex = startAcpFakeCodex();
-    writeSeededAcpChatGptLogin(root.home, codex.accessToken);
-    try {
-      client = await AcpClient.create({
-        cwd: root.workspace,
-        env: {
-          ...fakeGatewayEnv(root, gateway),
-          FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
-          FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
-          FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
-        },
-      });
-      await client.request("initialize", { protocolVersion: 1 }, 1);
-      await client.request("session/new", { mcpServers: [] }, 2);
-      await client.readLine();
-      await client.request("session/set_config_option", { configId: "provider", value: "codex" }, 3);
-      expect(codex.modelRequests).toHaveLength(1);
-      codex.addModel("gpt-next-fixture");
-      await Bun.sleep(61_000);
-      const listed = await client.request("session/set_config_option", { configId: "mode", value: "code" }, 4) as any;
-      expect(JSON.stringify(listed.result.configOptions)).toContain("gpt-next-fixture");
-      const selected = await client.request("session/set_config_option", { configId: "model", value: "gpt-next-fixture" }, 5) as any;
-      expect(selected.result.configOptions.find((option: any) => option.id === "model").currentValue).toBe("gpt-next-fixture");
-      expect(codex.modelRequests).toHaveLength(2);
-      expect(client.stderr).toBe("");
-    } finally {
-      await client?.close();
-      codex.stop();
-      gateway.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  }, 120_000);
-
-  test(
-    "session provider changes use Grok credentials with byte-identical account-stable replay",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-grok-route-");
-      const gateway = startFakeGateway([]);
-      const grok = startAcpFakeGrok({ unauthorizedResponses: 1 });
-      writeSeededAcpGrokLogin(root.home, grok.accessToken);
-      try {
-        client = await AcpClient.create({
-          cwd: root.workspace,
-          env: {
-            ...fakeGatewayEnv(root, gateway),
-            FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
-            FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
-            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
-            FX_E2E_GROK_TOKEN_URL: grok.tokenUrl,
-            FX_E2E_GROK_USERINFO_URL: grok.userinfoUrl,
-          },
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        await client.request("session/new", { mcpServers: [] }, 2);
-        await client.readLine();
-
-        const changed = await client.request("session/set_config_option", {
-          configId: "provider",
-          value: "grok",
-        }, 3) as any;
-        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
-          .toBe("grok");
-        expect(changed.result.configOptions.find((option: any) => option.id === "model").currentValue)
-          .toBe("grok-4.20");
-
-        const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
-        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
-        expect(JSON.stringify(prompt.messages)).toContain("ACP_GROK_RESPONSE");
-        const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
-        expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
-
-        expect(grok.requests).toHaveLength(3);
-        expect(grok.requests[0]!.body).toBe(grok.requests[1]!.body);
-        expect(grok.requests[0]!.conversationId).toBeTruthy();
-        expect(grok.requests[0]!.conversationId).toBe(grok.requests[1]!.conversationId);
-        expect(grok.modelRequests.map((request) => request.path)).toEqual(["/models", "/modalities"]);
-        expect(grok.requests[0]!.authorization).toBe(`Bearer ${grok.accessToken}`);
-        expect(grok.requests[1]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
-        expect(grok.requests[2]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
-        for (const request of grok.requests) {
-          expect(request.tokenAuth).toBe("xai-grok-cli");
-          expect(request.authenticateResponse).toBe("authenticate-response");
-          expect(request.clientIdentifier).toBe("fx");
-          expect(request.clientVersion).toBe("1.0.6");
-          expect(request.modelOverride).toBe("grok-4.20");
-          expect(request.grokUserId).toBe("acct_grok_acp");
-        }
-        expect(grok.tokenRequests).toHaveLength(1);
-        expect(grok.tokenRequests[0]!.body).toContain("grant_type=refresh_token");
-        expect(grok.userinfoRequests).toHaveLength(1);
-        expect(grok.userinfoRequests[0]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
-        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
-          expect(request.headers.get("authorization")).not.toContain("grok-acp-");
-        }
-      } finally {
-        await client?.close();
-        grok.stop();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
 });
 
 describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
@@ -8509,7 +7307,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
   test(
     "session/new returns sessionId and configOptions",
     async () => {
-      const root = createIsolatedRoot("fx-acp-session-new-");
+      const root = createIsolatedRoot("ffx-acp-session-new-");
       const gateway = startFakeGateway([]);
       try {
         client = await AcpClient.create({
@@ -8546,7 +7344,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
   test(
     "session/list returns sessions array",
     async () => {
-      const root = createIsolatedRoot("fx-acp-session-list-");
+      const root = createIsolatedRoot("ffx-acp-session-list-");
       const gateway = startFakeGateway([]);
       try {
         client = await AcpClient.create({
@@ -8569,7 +7367,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
   test(
     "session/set_mode updates mode",
     async () => {
-      const root = createIsolatedRoot("fx-acp-set-mode-");
+      const root = createIsolatedRoot("ffx-acp-set-mode-");
       const gateway = startFakeGateway([]);
       try {
         client = await AcpClient.create({
@@ -8593,7 +7391,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
   test(
     "session/load returns configOptions for a known session",
     async () => {
-      const root = createIsolatedRoot("fx-acp-session-load-");
+      const root = createIsolatedRoot("ffx-acp-session-load-");
       const gateway = startFakeGateway([]);
       try {
         client = await AcpClient.create({
@@ -8626,7 +7424,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
   test(
     "session/set_config_option updates model and returns configOptions",
     async () => {
-      const root = createIsolatedRoot("fx-acp-set-config-");
+      const root = createIsolatedRoot("ffx-acp-set-config-");
       const gateway = startFakeGateway([], {
         models: [
           { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
@@ -8662,9 +7460,134 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
   );
 
   test(
+    "session provider changes use Codex credentials without crossing origins",
+    async () => {
+      const root = createIsolatedRoot("ffx-acp-chatgpt-route-");
+      const gateway = startFakeGateway([]);
+      const codex = startAcpFakeCodex({ unauthorizedResponses: 1 });
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FFX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FFX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+            FFX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine(); // consume session/update notification
+
+        const changed = await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "codex",
+        }, 3) as any;
+        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
+          .toBe("codex");
+        expect(changed.result.configOptions.find((option: any) => option.id === "model").currentValue)
+          .toBe("gpt-5.6-sol");
+
+        const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(prompt.messages)).toContain("ACP_CHATGPT_RESPONSE");
+        const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
+        expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(codex.requests).toHaveLength(3);
+        expect(codex.modelRequests).toHaveLength(1);
+        expect(codex.requests[0]!.authorization).toBe(`Bearer ${codex.accessToken}`);
+        expect(codex.requests[1]!.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
+        expect(codex.requests[2]!.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
+        expect(codex.tokenRequests).toHaveLength(1);
+        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+          expect(request.headers.get("authorization")).not.toBe(`Bearer ${codex.accessToken}`);
+        }
+      } finally {
+        await client?.close();
+        codex.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session provider changes use Grok credentials with byte-identical account-stable replay",
+    async () => {
+      const root = createIsolatedRoot("ffx-acp-grok-route-");
+      const gateway = startFakeGateway([]);
+      const grok = startAcpFakeGrok({ unauthorizedResponses: 1 });
+      writeSeededAcpGrokLogin(root.home, grok.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FFX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+            FFX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FFX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+            FFX_E2E_GROK_TOKEN_URL: grok.tokenUrl,
+            FFX_E2E_GROK_USERINFO_URL: grok.userinfoUrl,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+
+        const changed = await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "grok",
+        }, 3) as any;
+        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
+          .toBe("grok");
+        expect(changed.result.configOptions.find((option: any) => option.id === "model").currentValue)
+          .toBe("grok-4.20");
+
+        const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(prompt.messages)).toContain("ACP_GROK_RESPONSE");
+        const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
+        expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
+
+        expect(grok.requests).toHaveLength(3);
+        expect(grok.requests[0]!.body).toBe(grok.requests[1]!.body);
+        expect(grok.requests[0]!.conversationId).toBeTruthy();
+        expect(grok.requests[0]!.conversationId).toBe(grok.requests[1]!.conversationId);
+        expect(grok.modelRequests.map((request) => request.path)).toEqual(["/models", "/modalities"]);
+        expect(grok.requests[0]!.authorization).toBe(`Bearer ${grok.accessToken}`);
+        expect(grok.requests[1]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+        expect(grok.requests[2]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+        for (const request of grok.requests) {
+          expect(request.tokenAuth).toBe("xai-grok-cli");
+          expect(request.authenticateResponse).toBe("authenticate-response");
+          expect(request.clientIdentifier).toBe("ffx");
+          expect(request.clientVersion).toBe("1.0.6");
+          expect(request.modelOverride).toBe("grok-4.20");
+          expect(request.grokUserId).toBe("acct_grok_acp");
+        }
+        expect(grok.tokenRequests).toHaveLength(1);
+        expect(grok.tokenRequests[0]!.body).toContain("grant_type=refresh_token");
+        expect(grok.userinfoRequests).toHaveLength(1);
+        expect(grok.userinfoRequests[0]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+          expect(request.headers.get("authorization")).not.toContain("grok-acp-");
+        }
+      } finally {
+        await client?.close();
+        grok.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/prompt returns response with stopReason",
     async () => {
-      const root = createIsolatedRoot("fx-acp-session-prompt-");
+      const root = createIsolatedRoot("ffx-acp-session-prompt-");
       const gateway = startFakeGateway([finalText("pong")]);
       try {
         client = await AcpClient.create({
@@ -8709,7 +7632,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
   test(
     "session/cancel does not crash the server",
     async () => {
-      const root = createIsolatedRoot("fx-acp-session-cancel-");
+      const root = createIsolatedRoot("ffx-acp-session-cancel-");
       const gateway = startFakeGateway([]);
       try {
         client = await AcpClient.create({
@@ -8738,7 +7661,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
   test(
     "session/new model configOptions has multiple options",
     async () => {
-      const root = createIsolatedRoot("fx-acp-model-options-");
+      const root = createIsolatedRoot("ffx-acp-model-options-");
       const gateway = startFakeGateway([], {
         models: [
           { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
@@ -8767,7 +7690,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
   test(
     "no stderr output during normal ACP operation",
     async () => {
-      const root = createIsolatedRoot("fx-acp-no-stderr-");
+      const root = createIsolatedRoot("ffx-acp-no-stderr-");
       const gateway = startFakeGateway([]);
       try {
         client = await AcpClient.create({

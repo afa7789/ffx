@@ -212,7 +212,7 @@ fn duplicateHistoryPage(alloc: Allocator, turns: []const session.HistoryTurn) ![
 fn historyPrefixDigest(turns: []const session.HistoryTurn) error{ WriteFailed, NoSpaceLeft }![32]u8 {
     var buffer: [256]u8 = undefined;
     var hashing: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
-    try hashing.writer.writeAll("fx.history-page-prefix.v2\x00");
+    try hashing.writer.writeAll("ffx.history-page-prefix.v2\x00");
     for (turns) |turn| {
         try session_codec.writeHistoryTurn(&hashing.writer, turn);
         // Canonical JSON never contains a literal NUL, so this makes the
@@ -641,14 +641,11 @@ pub const Store = struct {
         options: session_log.Options,
     ) !LoadedWritableSession {
         var root = self.canonical_root;
-        const lifecycle: ?session_log.CommitLifecycle = if (state.subagent_child)
-            null
-        else
-            try self.makeLatestCacheLifecycle(
-                alloc,
-                initialIndexEffect(state),
-                options.test_controls,
-            );
+        const lifecycle = try self.makeLatestCacheLifecycle(
+            alloc,
+            initialIndexEffect(state),
+            options.test_controls,
+        );
         var loaded = try root.startWritableSessionWithLifecycle(
             alloc,
             state,
@@ -870,7 +867,6 @@ pub const Store = struct {
             alloc,
             loaded,
             "pristine_session_discard",
-            true,
         );
     }
 
@@ -885,7 +881,6 @@ pub const Store = struct {
             alloc,
             loaded,
             "committed_session_delete",
-            true,
         );
     }
 
@@ -894,7 +889,6 @@ pub const Store = struct {
         alloc: Allocator,
         loaded: *LoadedWritableSession,
         event_name: []const u8,
-        cascade_children: bool,
     ) PristineDiscardDisposition {
         defer loaded.deinit(alloc);
         if (self.canonical_root.mode != .writable or
@@ -943,13 +937,6 @@ pub const Store = struct {
             );
             return .indeterminate;
         });
-        if (cascade_children and !self.deleteOwnedSubagentChildren(
-            alloc,
-            loaded.active_id,
-            event_name,
-        )) {
-            return .indeterminate;
-        }
         const log_options: session_log.Options = .{};
         lifecycle.prepare(
             alloc,
@@ -998,147 +985,6 @@ pub const Store = struct {
             .{event_name},
         );
         return .discarded;
-    }
-
-    fn deleteOwnedSubagentChildren(
-        self: Store,
-        alloc: Allocator,
-        parent_id: []const u8,
-        event_name: []const u8,
-    ) bool {
-        const children = self.loadOwnedSubagentChildIds(alloc, parent_id) catch |err| {
-            debug_trace.logf(
-                "session",
-                "event={s} disposition=indeterminate stage=child_index err={s}",
-                .{ event_name, @errorName(err) },
-            );
-            return false;
-        };
-        defer {
-            for (children) |child_id| alloc.free(child_id);
-            if (children.len > 0) alloc.free(children);
-        }
-        for (children) |child_id| {
-            if (!(self.childOwnerMatches(alloc, child_id, parent_id) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event={s} disposition=indeterminate stage=child_owner child_id={s} err={s}",
-                    .{ event_name, child_id, @errorName(err) },
-                );
-                return false;
-            })) {
-                debug_trace.logf(
-                    "session",
-                    "event={s} disposition=indeterminate stage=child_owner child_id={s} err=OwnerMismatch",
-                    .{ event_name, child_id },
-                );
-                return false;
-            }
-            var child = self.resumeForWrite(alloc, child_id) catch |err| switch (err) {
-                error.SessionNotFound => continue,
-                else => {
-                    debug_trace.logf(
-                        "session",
-                        "event={s} disposition=indeterminate stage=child_resume child_id={s} err={s}",
-                        .{ event_name, child_id, @errorName(err) },
-                    );
-                    return false;
-                },
-            };
-            if (self.deleteWriterOwnedSession(
-                alloc,
-                &child,
-                event_name,
-                false,
-            ) != .discarded) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    fn loadOwnedSubagentChildIds(
-        self: Store,
-        alloc: Allocator,
-        parent_id: []const u8,
-    ) ![][]u8 {
-        var capability = try self.openSubagentControlCapabilityReadOnly(
-            alloc,
-            parent_id,
-            .{},
-        );
-        defer capability.deinit();
-        var file = capability.openFileReadOnly(
-            alloc,
-            .subagent_control,
-            "children.json",
-        ) catch |err| switch (err) {
-            error.FileNotFound => return alloc.alloc([]u8, 0),
-            else => return err,
-        };
-        defer file.deinit();
-        const bytes = try file.readToEnd(alloc, 512 * 1024);
-        defer alloc.free(bytes);
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidSubagentState;
-        const stored_parent = parsed.value.object.get("parent_id") orelse
-            return error.InvalidSubagentState;
-        const children_value = parsed.value.object.get("children") orelse
-            return error.InvalidSubagentState;
-        if (stored_parent != .string or
-            !std.mem.eql(u8, stored_parent.string, parent_id) or
-            children_value != .array or children_value.array.items.len > 256)
-        {
-            return error.InvalidSubagentState;
-        }
-        const result = try alloc.alloc([]u8, children_value.array.items.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (result[0..initialized]) |child_id| alloc.free(child_id);
-            alloc.free(result);
-        }
-        for (children_value.array.items) |item| {
-            if (item != .object) return error.InvalidSubagentState;
-            const id = item.object.get("id") orelse return error.InvalidSubagentState;
-            if (id != .string) return error.InvalidSubagentState;
-            session_layout.validateSessionId(id.string) catch
-                return error.InvalidSubagentState;
-            result[initialized] = try alloc.dupe(u8, id.string);
-            initialized += 1;
-        }
-        return result;
-    }
-
-    fn childOwnerMatches(
-        self: Store,
-        alloc: Allocator,
-        child_id: []const u8,
-        parent_id: []const u8,
-    ) !bool {
-        var capability = self.openSubagentControlCapabilityReadOnly(
-            alloc,
-            child_id,
-            .{},
-        ) catch |err| switch (err) {
-            error.SessionNotFound => return true,
-            else => return err,
-        };
-        defer capability.deinit();
-        var file = try capability.openFileReadOnly(
-            alloc,
-            .subagent_control,
-            "owner.json",
-        );
-        defer file.deinit();
-        const bytes = try file.readToEnd(alloc, 4096);
-        defer alloc.free(bytes);
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
-        defer parsed.deinit();
-        if (parsed.value != .object) return false;
-        const stored_parent = parsed.value.object.get("parent_id") orelse return false;
-        return stored_parent == .string and
-            std.mem.eql(u8, stored_parent.string, parent_id);
     }
 
     /// Resumes a specific session by id for writing, rebinding it to this store's
@@ -1455,7 +1301,7 @@ pub const Store = struct {
             alloc,
             workspace_root,
             options,
-        ) orelse return session_log.failLoadedWritableSession(error.NoSavedSessions);
+        ) orelse return error.NoSavedSessions;
         defer alloc.free(selected);
         var loaded = try self.resumeExactForWrite(
             alloc,
@@ -1514,16 +1360,6 @@ pub const Store = struct {
         const state = detail.state;
         detail.state = undefined;
         return state;
-    }
-
-    /// Reads only the immutable initial-event child identity for a materialized
-    /// schema-v3 session. Index-only and legacy rows have no such payload.
-    pub fn loadSubagentChildIdentity(
-        self: Store,
-        alloc: Allocator,
-        session_id: []const u8,
-    ) !bool {
-        return self.canonical_root.loadSubagentChildIdentity(alloc, session_id);
     }
 
     /// Reads one bounded chronological history page without acquiring the
@@ -1808,7 +1644,7 @@ pub const Store = struct {
         return .{
             .model = try alloc.dupe(
                 u8,
-                detailed.settings.models.get(.gateway) orelse "anthropic/claude-opus-4.7",
+                detailed.settings.model orelse "anthropic/claude-opus-4.7",
             ),
             .effort = detailed.settings.effort orelse .auto,
             .fast_mode = detailed.settings.fast_mode orelse false,
@@ -3049,28 +2885,6 @@ pub const Store = struct {
             session_id,
         );
         defer capability.deinit();
-        var children_file = capability.openFileReadOnly(
-            alloc,
-            .subagent_control,
-            "children.json",
-        ) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (children_file) |*file| {
-            defer file.deinit();
-            const bytes = try file.readToEnd(alloc, 512 * 1024);
-            defer alloc.free(bytes);
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
-            defer parsed.deinit();
-            if (parsed.value != .object) return error.InvalidSubagentState;
-            const children = parsed.value.object.get("children") orelse
-                return error.InvalidSubagentState;
-            if (children != .array or children.array.items.len > 256) {
-                return error.InvalidSubagentState;
-            }
-            return children.array.items.len != 0;
-        }
         var header_file = capability.openFileReadOnly(
             alloc,
             .subagent_control,
@@ -3402,7 +3216,7 @@ pub const Store = struct {
             loaded.active_id,
         );
 
-        if (loaded.commit_lifecycle == null and !loaded.state.subagent_child) {
+        if (loaded.commit_lifecycle == null) {
             try self.installLatestCacheLifecycle(
                 alloc,
                 &loaded,
@@ -3413,9 +3227,7 @@ pub const Store = struct {
         if (std.mem.eql(u8, loaded.state.workspace_root, workspace_root)) {
             return loaded;
         }
-        if (!allow_rebind) {
-            return session_log.failLoadedWritableSession(error.SessionTargetChanged);
-        }
+        if (!allow_rebind) return error.SessionTargetChanged;
 
         const rebound = session_event.Event{ .workspace_rebound = .{
             .previous_workspace_root = loaded.state.workspace_root,
@@ -3428,7 +3240,7 @@ pub const Store = struct {
             .rollback_before_adapter_continue,
             options.log,
         ) catch |err| switch (err) {
-            error.SessionPersistenceDegraded => return session_log.failLoadedWritableSession(error.SessionWorkspaceRebindFailed),
+            error.SessionPersistenceDegraded => return error.SessionWorkspaceRebindFailed,
             else => return err,
         };
         return loaded;
@@ -3641,29 +3453,6 @@ pub const Store = struct {
         preference_source: MigrationPreferenceSource,
         options: ResumeOptions,
     ) !LoadedWritableSession {
-        var loaded: LoadedWritableSession = undefined;
-        try self.migrateLegacyForWriteInto(
-            &loaded,
-            alloc,
-            session_id,
-            workspace_root,
-            preference_source,
-            options,
-        );
-        return loaded;
-    }
-
-    // Keep cold fallible constructors behind noinline out-parameter boundaries
-    // so error returns do not materialize the full LoadedWritableSession payload.
-    noinline fn migrateLegacyForWriteInto(
-        self: Store,
-        out: *LoadedWritableSession,
-        alloc: Allocator,
-        session_id: []const u8,
-        workspace_root: []const u8,
-        preference_source: MigrationPreferenceSource,
-        options: ResumeOptions,
-    ) !void {
         if (self.canonical_root.mode != .writable or
             self.canonical_root.sessions == null)
         {
@@ -3705,7 +3494,7 @@ pub const Store = struct {
             .writer_lock = writer_lock,
             .session_id = owned_id,
         };
-        const loaded = self.migrateLegacyWithLatestCache(
+        return self.migrateLegacyWithLatestCache(
             alloc,
             &writable,
             workspace_root,
@@ -3715,7 +3504,6 @@ pub const Store = struct {
             writable.deinit(alloc);
             return err;
         };
-        out.* = loaded;
     }
 
     fn migrateLegacyWithLatestCache(
@@ -3751,27 +3539,6 @@ pub const Store = struct {
         preference_source: MigrationPreferenceSource,
         options: ResumeOptions,
     ) !LoadedWritableSession {
-        var loaded: LoadedWritableSession = undefined;
-        try self.resolveAuthorityTransitionForWriteInto(
-            &loaded,
-            alloc,
-            session_id,
-            workspace_root,
-            preference_source,
-            options,
-        );
-        return loaded;
-    }
-
-    noinline fn resolveAuthorityTransitionForWriteInto(
-        self: Store,
-        out: *LoadedWritableSession,
-        alloc: Allocator,
-        session_id: []const u8,
-        workspace_root: []const u8,
-        preference_source: MigrationPreferenceSource,
-        options: ResumeOptions,
-    ) !void {
         var read_dir = try self.openSessionDir(session_id);
         var transition = (try loadAuthorityTransitionOptional(
             alloc,
@@ -3786,13 +3553,11 @@ pub const Store = struct {
 
         if (transition.kind == .session_create) {
             var root = self.canonical_root;
-            const loaded = try root.resumeForWrite(
+            return root.resumeForWrite(
                 alloc,
                 session_id,
                 options.log,
             );
-            out.* = loaded;
-            return;
         }
 
         var writable = try self.openWritableSessionDir(
@@ -3870,8 +3635,7 @@ pub const Store = struct {
             errdefer loaded.deinit(alloc);
             try loaded.installCommitLifecycle(lifecycle);
             _ = loaded.publishCommitLifecycle(alloc);
-            out.* = loaded;
-            return;
+            return loaded;
         }
 
         try restoreLegacyAuthority(alloc, &writable, current);
@@ -3884,7 +3648,7 @@ pub const Store = struct {
             preference_source,
             options,
         );
-        out.* = loaded;
+        return loaded;
     }
 
     fn openWritableSessionDir(
@@ -4411,6 +4175,7 @@ fn copyRecoveredImageSnapshots(
         const images = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| entry.user.images,
+            .background_command => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
         for (images) |*image| {
@@ -4449,6 +4214,7 @@ fn rebaseRecoveredImageSnapshots(
         const images = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| entry.user.images,
+            .background_command => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
         for (images) |*image| {
@@ -4480,6 +4246,7 @@ fn copyRecoveredManagedChildren(
         const execution = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| &entry.execution,
+            .background_command => |*entry| &entry.execution,
             .interrupted => |*entry| &entry.execution,
         };
         for (execution.tool_steps) |*step| {
@@ -4785,6 +4552,7 @@ fn resolveSessionSnapshotLocators(
         const images = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| entry.user.images,
+            .background_command => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
         for (images) |*image| {
@@ -4805,11 +4573,13 @@ fn deleteSnapshotFilesAddedByMigration(
         const candidate_images = switch (candidate_turn) {
             .compacted_summary => &.{},
             .assistant => |entry| entry.user.images,
+            .background_command => |entry| entry.user.images,
             .interrupted => |entry| entry.user.images,
         };
         const original_images = switch (original_turn) {
             .compacted_summary => &.{},
             .assistant => |entry| entry.user.images,
+            .background_command => |entry| entry.user.images,
             .interrupted => |entry| entry.user.images,
         };
         image_attachments.deleteUnreferencedImageSnapshots(
@@ -4850,16 +4620,16 @@ test "session snapshot locators resolve through their owning store" {
     try resolveSessionSnapshotLocators(
         alloc,
         history,
-        "/new/fx-home/sessions",
+        "/new/ffx-home/sessions",
         "id",
     );
 
     try std.testing.expectEqualStrings(
-        "/new/fx-home/sessions/id/images/image-1-aaaaaaaaaaaaaaaa.bin",
+        "/new/ffx-home/sessions/id/images/image-1-aaaaaaaaaaaaaaaa.bin",
         history[0].assistant.user.images[0].snapshot_path.?,
     );
     try std.testing.expectEqualStrings(
-        "/new/fx-home/sessions/id/images/image-2-bbbbbbbbbbbbbbbb.bin",
+        "/new/ffx-home/sessions/id/images/image-2-bbbbbbbbbbbbbbbb.bin",
         history[0].assistant.user.images[1].snapshot_path.?,
     );
     try std.testing.expect(history[0].assistant.user.images[2].snapshot_path == null);
@@ -4883,7 +4653,7 @@ test "current session snapshot locators reject absolute paths" {
         resolveSessionSnapshotLocators(
             alloc,
             history,
-            "/new/fx-home/sessions",
+            "/new/ffx-home/sessions",
             "id",
         ),
     );
@@ -4922,7 +4692,7 @@ test "session snapshot locator resolver rejects noncanonical tampering" {
             resolveSessionSnapshotLocators(
                 alloc,
                 history,
-                "/new/fx-home/sessions",
+                "/new/ffx-home/sessions",
                 "id",
             ),
         );
@@ -5223,7 +4993,7 @@ const TempStore = struct {
 };
 
 fn initTempStore(alloc: Allocator, tmp: *std.testing.TmpDir) !TempStore {
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     errdefer alloc.free(home);
@@ -5725,15 +5495,15 @@ fn writeWritableManagedHistoryFixture(
         .lower,
     );
     const replay_handle = if (artifacts.legacy_replay)
-        try alloc.dupe(u8, "fx-command-replay-legacy.bin")
+        try alloc.dupe(u8, "ffx-command-replay-legacy.bin")
     else
         try std.fmt.allocPrint(
             alloc,
-            "fx-command-replay-test-{s}.bin",
+            "ffx-command-replay-test-{s}.bin",
             .{&replay_digest_hex},
         );
     defer alloc.free(replay_handle);
-    const interrupted_artifact_handle = "fx-command-cancelled.log";
+    const interrupted_artifact_handle = "ffx-command-cancelled.log";
     const interrupted_artifact = "interrupted command artifact";
     if (write_sidecars) {
         var output_file = try capability.createExclusiveFile(
@@ -6556,7 +6326,7 @@ test "pristine discard retains active recovery and permits cleared recovery" {
         .assistant_source = @constCast(""),
         .cause = .network_interrupted,
         .action = .retrying_request,
-        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .route_model = @constCast("test/model"),
         .requested_fast_mode = false,
         .fast_mode = false,
         .max_provider_attempts = 10,
@@ -6722,71 +6492,6 @@ test "committed session deletion consumes its exact writer" {
     try std.testing.expectError(
         error.SessionNotFound,
         ctx.store.loadReadOnly(alloc, state.id),
-    );
-}
-
-test "committed parent deletion removes exactly its marked direct child" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var ctx = try initTempStore(alloc, &tmp);
-    defer ctx.deinit(alloc);
-
-    var parent_state = try testDurableState(alloc, "delete-parent", ctx.workspace);
-    defer parent_state.deinit(alloc);
-    var parent = try ctx.store.startWritableSession(alloc, parent_state);
-    _ = try parent.appendEvent(
-        alloc,
-        .{ .preferences_changed = .{ .fast_mode = true } },
-        20,
-        .retry_expected_tail,
-        .{},
-    );
-
-    var child_state = try testDurableState(alloc, "delete-child", ctx.workspace);
-    defer child_state.deinit(alloc);
-    var child = try ctx.store.startWritableSession(alloc, child_state);
-    child.deinit(alloc);
-
-    var parent_capability = try ctx.store.openSubagentControlCapabilityWritable(
-        alloc,
-        parent_state.id,
-        .{},
-    );
-    defer parent_capability.deinit();
-    var children_entry = try parent_capability.atomicReplace(
-        alloc,
-        .subagent_control,
-        "children.json",
-        "{\"schema_version\":1,\"parent_id\":\"delete-parent\",\"generation\":1,\"children\":[{\"id\":\"delete-child\"}]}",
-    );
-    children_entry.deinit(alloc);
-
-    var child_capability = try ctx.store.openSubagentControlCapabilityWritable(
-        alloc,
-        child_state.id,
-        .{},
-    );
-    defer child_capability.deinit();
-    var owner_entry = try child_capability.atomicReplace(
-        alloc,
-        .subagent_control,
-        "owner.json",
-        "{\"schema_version\":1,\"parent_id\":\"delete-parent\"}",
-    );
-    owner_entry.deinit(alloc);
-
-    try std.testing.expectEqual(
-        PristineDiscardDisposition.discarded,
-        ctx.store.deleteCommittedSession(alloc, &parent),
-    );
-    try std.testing.expectError(
-        error.SessionNotFound,
-        ctx.store.loadReadOnly(alloc, parent_state.id),
-    );
-    try std.testing.expectError(
-        error.SessionNotFound,
-        ctx.store.loadReadOnly(alloc, child_state.id),
     );
 }
 
@@ -7565,7 +7270,7 @@ test "a writable session publishes latest after its Store is deinitialized" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -7644,7 +7349,7 @@ test "workspace rebind invalidates the old latest pointer before publishing the 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -7699,7 +7404,7 @@ fn expectWorkspaceRebindPublicationFailureRepair(
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -7788,7 +7493,7 @@ test "workspace rebind honors an immediate commit lock deadline" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -7855,7 +7560,7 @@ test "workspace rebind honors an immediate latest cache lock deadline" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -8106,13 +7811,13 @@ test "migration and recovery replacements keep latest cache contention strict" {
     }
 }
 
-test "empty session creation survives latest cache contention" {
+test "session creation keeps latest cache contention strict" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var ctx = try initTempStore(alloc, &tmp);
     defer ctx.deinit(alloc);
-    var state = try testDurableState(alloc, "contended-empty-session", ctx.workspace);
+    var state = try testDurableState(alloc, "strict-creation-cache-lock", ctx.workspace);
     defer state.deinit(alloc);
 
     var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
@@ -8121,56 +7826,19 @@ test "empty session creation survives latest cache contention" {
         latest_sessions_lock_file,
         2000,
     );
-    var latest_lock_held = true;
-    defer if (latest_lock_held) latest_lock.release();
-
-    var loaded = try ctx.store.startWritableSessionWithOptions(
-        alloc,
-        state,
-        .{ .commit_lock_deadline_ms = 0 },
-    );
-    var loaded_open = true;
-    defer if (loaded_open) loaded.deinit(alloc);
-    if (!loaded.state_replacement_pending) return error.ExpectedDeferredCreation;
-    if (loaded.state.history.len != 0) return error.ExpectedEmptyCreatedSession;
-    var readable = try ctx.store.loadReadOnly(alloc, state.id);
-    defer readable.deinit(alloc);
-    if (readable.history.len != 0) return error.ExpectedReadableEmptySession;
+    defer latest_lock.release();
     try std.testing.expectError(
-        error.InvalidSessionIndex,
-        readLatestPointer(ctx.store, alloc, ctx.workspace),
+        error.SessionCommitBoundaryUnavailable,
+        ctx.store.startWritableSessionWithOptions(
+            alloc,
+            state,
+            .{ .commit_lock_deadline_ms = 0 },
+        ),
     );
     try std.testing.expectError(
-        error.InvalidSessionIndex,
-        readSessionIndex(alloc, &sessions),
+        error.SessionNotFound,
+        ctx.store.openSessionDir(state.id),
     );
-    var initial_token = (try summary_codec.readDeferredCacheToken(
-        alloc,
-        &sessions,
-        state.id,
-    )) orelse return error.TestExpectedEqual;
-    if (!std.meta.eql(loaded.position, initial_token.position)) return error.ExpectedInitialDeferredPosition;
-    initial_token.deinit(alloc);
-
-    const committed = try loaded.appendEvent(
-        alloc,
-        .{ .preferences_changed = .{ .fast_mode = true } },
-        20,
-        .retry_expected_tail,
-        .{ .commit_lock_deadline_ms = 0 },
-    );
-    var token = (try summary_codec.readDeferredCacheToken(
-        alloc,
-        &sessions,
-        state.id,
-    )) orelse return error.TestExpectedEqual;
-    defer token.deinit(alloc);
-    if (!std.meta.eql(committed, token.position)) return error.ExpectedAdvancedDeferredPosition;
-
-    latest_lock.release();
-    latest_lock_held = false;
-    loaded.deinit(alloc);
-    loaded_open = false;
 }
 
 test "read-only session page replays canonical state for a deferred token" {
@@ -8843,7 +8511,7 @@ test "workspace latest pointer bypasses unrelated authority repair" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -9042,6 +8710,7 @@ test "session store delegates schema v3 authority operations" {
 }
 
 test "schema v3 load repairs duplicate-key tool arguments before gateway projection" {
+    const gateway_json = @import("../gateway/gateway_json.zig");
     const types = @import("../shared/types.zig");
     const alloc = std.testing.allocator;
     const duplicate_arguments = "{\"depth\":1,\"depth\":2}";
@@ -9058,12 +8727,12 @@ test "schema v3 load repairs duplicate-key tool arguments before gateway project
 
     var calls = [_]session.ToolCall{.{
         .id = @constCast("persisted_duplicate_call"),
-        .name = @constCast("glob_files"),
+        .name = @constCast("list_files"),
         .arguments_json = @constCast(duplicate_arguments),
     }};
     var results = [_]session.PersistedToolResult{.{
         .tool_call_id = @constCast("persisted_duplicate_call"),
-        .tool_name = @constCast("glob_files"),
+        .tool_name = @constCast("list_files"),
         .status = .success,
         .output = @constCast("stale success"),
         .output_bytes = 13,
@@ -9124,8 +8793,17 @@ test "schema v3 load repairs duplicate-key tool arguments before gateway project
     var messages: std.ArrayList(types.ChatMessage) = .empty;
     try session.appendHistoryChatMessages(arena, &messages, loaded.history);
     try messages.append(arena, .{ .role = .user, .content = "continue" });
-    try std.testing.expectEqualStrings("{}", messages.items[1].tool_calls[0].arguments_json);
-    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "tool_execution_failed") != null);
+    const body = try gateway_json.buildGatewayRequestBodyWithOptions(
+        alloc,
+        "[]",
+        messages.items,
+        .{},
+        .auto,
+    );
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"input\":{}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "tool_execution_failed") != null);
+    try std.testing.expect(std.mem.find(u8, body, duplicate_arguments) == null);
 
     debug_trace.shutdown();
     var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
@@ -9273,6 +8951,51 @@ test "doctor reports unsafe managed child artifacts" {
     for (diagnostics.items) |diagnostic| {
         if (std.mem.eql(u8, diagnostic.session_id, state.id) and
             diagnostic.kind == .unsafe_path)
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "doctor reports corrupt subagent control records without hiding the session" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    var state = try testDurableState(alloc, "doctor-subagent-corrupt", ctx.workspace);
+    defer state.deinit(alloc);
+    var writable = try ctx.store.startWritableSession(alloc, state);
+    {
+        var capability = try writable.childCapability();
+        var corrupt = try capability.createExclusiveFile(
+            alloc,
+            .subagent_control,
+            "control.json",
+        );
+        defer corrupt.deinit();
+        try corrupt.writeAll("{\"schema_version\":1");
+        try corrupt.sync();
+    }
+    writable.deinit(alloc);
+
+    var summaries = try ctx.store.list(alloc);
+    defer freeSummaries(alloc, &summaries);
+    var listed = false;
+    for (summaries.items) |summary| {
+        if (std.mem.eql(u8, summary.id, "doctor-subagent-corrupt")) listed = true;
+    }
+    try std.testing.expect(listed);
+
+    var diagnostics = try ctx.store.inspectForDoctor(alloc);
+    defer freeDoctorDiagnostics(alloc, &diagnostics);
+    var found = false;
+    for (diagnostics.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.session_id, "doctor-subagent-corrupt") and
+            diagnostic.kind == .canonical_state_invalid)
         {
             found = true;
             break;
@@ -10069,7 +9792,7 @@ test "cross-workspace recovery preserves each workspace latest pointer" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -10827,7 +10550,7 @@ test "recovery authenticates content-addressed command artifacts" {
     std.crypto.hash.sha2.Sha256.hash(contents, &digest, .{});
     const handle = try artifact_digest.contentAddressedHandle(
         alloc,
-        "fx-command-cancelled.log",
+        "ffx-command-cancelled.log",
         ".log",
         digest,
     );
@@ -12464,7 +12187,7 @@ test "workspace latest pointer ignores a mutated session from another workspace"
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -12623,7 +12346,7 @@ test "writable last ignores unavailable boundary from another workspace" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -12758,7 +12481,7 @@ test "empty home read only operations create nothing" {
 
     try std.testing.expectError(
         error.FileNotFound,
-        tmp.dir.access(io_mod.getIo(), "home/.fx", .{}),
+        tmp.dir.access(io_mod.getIo(), "home/.ffx", .{}),
     );
 }
 
@@ -12791,7 +12514,7 @@ test "missing home is empty for reads and bootstrapped privately for writes" {
     const home_stat = try home_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(std.Io.File.Kind.directory, home_stat.kind);
     try std.testing.expectEqual(@as(u32, 0o700), home_stat.permissions.toMode() & 0o777);
-    const sessions_path = try std.fs.path.join(alloc, &.{ missing_home, ".fx", "sessions" });
+    const sessions_path = try std.fs.path.join(alloc, &.{ missing_home, ".ffx", "sessions" });
     defer alloc.free(sessions_path);
     try std.Io.Dir.accessAbsolute(io_mod.getIo(), sessions_path, .{});
 }
@@ -12840,7 +12563,7 @@ test "first write traces and maps shared layout failure" {
     try std.testing.expect(std.mem.find(u8, trace, workspace) == null);
     try std.testing.expectError(
         error.FileNotFound,
-        tmp.dir.access(io_mod.getIo(), "home/.fx", .{}),
+        tmp.dir.access(io_mod.getIo(), "home/.ffx", .{}),
     );
 }
 
@@ -12875,10 +12598,10 @@ test "first write creates only the private session layout" {
     var home_iter = home_dir.iterate();
     const durable_entry = (try home_iter.next(io_mod.getIo())) orelse
         return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings(".fx", durable_entry.name);
+    try std.testing.expectEqualStrings(".ffx", durable_entry.name);
     try std.testing.expect((try home_iter.next(io_mod.getIo())) == null);
 
-    var durable_dir = try home_dir.openDir(io_mod.getIo(), ".fx", .{
+    var durable_dir = try home_dir.openDir(io_mod.getIo(), ".ffx", .{
         .iterate = true,
     });
     defer durable_dir.close(io_mod.getIo());
@@ -12946,7 +12669,7 @@ test "malformed settings do not block legacy detail or migration" {
     defer tmp.cleanup();
     var ctx = try initTempStore(alloc, &tmp);
     defer ctx.deinit(alloc);
-    const settings_path = try std.fs.path.join(alloc, &.{ ctx.home, ".fx", "settings.json" });
+    const settings_path = try std.fs.path.join(alloc, &.{ ctx.home, ".ffx", "settings.json" });
     defer alloc.free(settings_path);
     try writeRawFile(settings_path, "{broken");
     try writeLegacyFixture(alloc, ctx.store, "legacy-with-bad-settings", ctx.workspace, 20);
@@ -12966,7 +12689,7 @@ test "explicit schema v3 resume rebinds workspace" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -13889,7 +13612,7 @@ test "history page maps missing unsafe unavailable unsupported and corrupt sessi
     tmp.dir.symLink(
         io_mod.getIo(),
         "../../../outside-history-session",
-        "home/.fx/sessions/history-unsafe",
+        "home/.ffx/sessions/history-unsafe",
         .{ .is_directory = true },
     ) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
@@ -13985,9 +13708,12 @@ test "history page preserves specialized canonical turns and deep-copy ownership
             .assistant = @constCast("assistant λ"),
             .execution = .{ .tool_steps = &steps },
         } },
-        .{ .assistant = .{
+        .{ .background_command = .{
             .user = .{ .text = @constCast("background") },
-            .assistant = @constCast("historical command"),
+            .assistant = @constCast("started"),
+            .log_path = @constCast("/tmp/background.log"),
+            .expect_url = true,
+            .url = @constCast("https://example.test"),
         } },
         .{ .interrupted = .{
             .user = .{ .text = @constCast("interrupted") },
@@ -14006,7 +13732,7 @@ test "history page preserves specialized canonical turns and deep-copy ownership
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 4), first.turns.len);
     try std.testing.expectEqualStrings("tool output", first.turns[0].assistant.execution.tool_steps[0].tool_results[0].output);
-    try std.testing.expectEqualStrings("historical command", first.turns[1].assistant.assistant);
+    try std.testing.expectEqualStrings("/tmp/background.log", first.turns[1].background_command.log_path);
     try std.testing.expectEqualStrings("partial", first.turns[2].interrupted.assistant.?);
     try std.testing.expectEqualStrings("compacted λ", first.turns[3].compacted_summary.summary);
     first.turns[0].assistant.assistant[0] = 'X';

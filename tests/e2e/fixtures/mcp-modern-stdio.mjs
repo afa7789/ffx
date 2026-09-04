@@ -1,29 +1,24 @@
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 
 const protocolVersion = "2026-07-28";
-const wireLogPath = process.env.FX_MCP_WIRE_LOG;
-const pidPath = process.env.FX_MCP_PID_PATH;
-const resultText = process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT";
-const mode = process.env.FX_MCP_MODE ?? "normal";
-const crashMarkerPath = process.env.FX_MCP_CRASH_MARKER;
+const wireLogPath = process.env.FFX_MCP_WIRE_LOG;
+const pidPath = process.env.FFX_MCP_PID_PATH;
+const resultText = process.env.FFX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT";
+const mode = process.env.FFX_MCP_MODE ?? "normal";
+const crashMarkerPath = process.env.FFX_MCP_CRASH_MARKER;
 const recoveryFailureMarkerPath = crashMarkerPath
   ? `${crashMarkerPath}.recovery-failed`
   : undefined;
-const recoveryReadyPath = process.env.FX_MCP_RECOVERY_READY_PATH;
-const recoveryReleasePath = process.env.FX_MCP_RECOVERY_RELEASE_PATH;
-const initialToolName = process.env.FX_MCP_INITIAL_TOOL_NAME ?? "echo";
-const recoveredToolName = process.env.FX_MCP_RECOVERED_TOOL_NAME ?? initialToolName;
-const expectedElicitation = process.env.FX_MCP_EXPECT_ELICITATION ?? "none";
-const environmentCapturePath = process.env.FX_MCP_ENV_CAPTURE;
-const resourcesSubscribe = process.env.FX_MCP_RESOURCES_SUBSCRIBE !== "0";
-const resourceTtlMs = process.env.FX_MCP_RESOURCE_TTL_MS === undefined
+const recoveryReadyPath = process.env.FFX_MCP_RECOVERY_READY_PATH;
+const recoveryReleasePath = process.env.FFX_MCP_RECOVERY_RELEASE_PATH;
+const initialToolName = process.env.FFX_MCP_INITIAL_TOOL_NAME ?? "echo";
+const recoveredToolName = process.env.FFX_MCP_RECOVERED_TOOL_NAME ?? initialToolName;
+const expectedElicitation = process.env.FFX_MCP_EXPECT_ELICITATION ?? "none";
+const resourcesSubscribe = process.env.FFX_MCP_RESOURCES_SUBSCRIBE !== "0";
+const resourceTtlMs = process.env.FFX_MCP_RESOURCE_TTL_MS === undefined
   ? null
-  : Number(process.env.FX_MCP_RESOURCE_TTL_MS);
-const catalogDelayMs = Math.max(
-  0,
-  Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
-);
-const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/connect";
+  : Number(process.env.FFX_MCP_RESOURCE_TTL_MS);
+const elicitationUrl = process.env.FFX_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
   { const: "Use default", title: "Use default" },
@@ -40,27 +35,10 @@ const stalledRequestIds = new Set();
 let buffer = Buffer.alloc(0);
 
 if (pidPath) writeFileSync(pidPath, String(process.pid));
-if (environmentCapturePath) {
-  writeFileSync(environmentCapturePath, JSON.stringify({
-    configured: process.env.FX_MCP_ENV_SENTINEL,
-    inherited: process.env.FX_MCP_INHERITED_SENTINEL,
-    path: process.env.PATH,
-    home: process.env.HOME,
-    httpsProxy: process.env.HTTPS_PROXY,
-  }));
-}
 if (stallRecovery) setInterval(() => {}, 1000);
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
-}
-
-function sendCatalogResponse(message) {
-  if (catalogDelayMs === 0) {
-    send(message);
-    return;
-  }
-  setTimeout(() => send(message), catalogDelayMs);
 }
 
 function log(message) {
@@ -85,7 +63,7 @@ function hasModernMetadata(message) {
         ? { elicitation: { form: {}, url: {} } }
         : {};
   return meta?.["io.modelcontextprotocol/protocolVersion"] === protocolVersion &&
-    meta?.["io.modelcontextprotocol/clientInfo"]?.name === "fx" &&
+    meta?.["io.modelcontextprotocol/clientInfo"]?.name === "ffx" &&
     typeof meta?.["io.modelcontextprotocol/clientInfo"]?.version === "string" &&
     JSON.stringify(capabilities) === JSON.stringify(expectedCapabilities);
 }
@@ -180,11 +158,6 @@ function handle(message) {
       result: {
         resultType: "complete",
         supportedVersions: [protocolVersion],
-        _meta: {
-          "io.modelcontextprotocol/serverInfo": {
-            name: "modern-stdio-fixture",
-          },
-        },
         capabilities: {
           tools: mode === "subscription_cache" || mode === "crash_once_new_tool" || mode === "features"
             ? { listChanged: true }
@@ -265,15 +238,6 @@ function handle(message) {
                 properties: { text: { type: "string" } },
                 required: ["text"],
               },
-              ...(mode === "tool_failure"
-                ? {
-                    outputSchema: {
-                      type: "object",
-                      properties: { result: { type: "string" } },
-                      required: ["result"],
-                    },
-                  }
-                : {}),
             }],
         ttlMs: 60_000,
         cacheScope: "public",
@@ -295,7 +259,7 @@ function handle(message) {
   }
   if (message.method === "resources/list") {
     const secondPage = message.params?.cursor === "";
-    sendCatalogResponse({
+    send({
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -330,7 +294,7 @@ function handle(message) {
     return;
   }
   if (message.method === "resources/templates/list") {
-    sendCatalogResponse({
+    send({
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -343,12 +307,6 @@ function handle(message) {
           mimeType: "text/plain",
           annotations: { audience: ["assistant"], priority: 0.7 },
           _meta: { fixture: "template" },
-        }, {
-          uriTemplate: "custom://project/{project}/{path}",
-          name: "project-file-multi",
-          title: "Project file with project",
-          description: "Read a fixture path from a selected project",
-          mimeType: "text/plain",
         }],
         ttlMs: 60_000,
         cacheScope: "public",
@@ -427,7 +385,7 @@ function handle(message) {
   }
   if (message.method === "prompts/list") {
     const secondPage = message.params?.cursor === "";
-    sendCatalogResponse({
+    send({
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -437,14 +395,6 @@ function handle(message) {
               { name: "collision", title: "Collision prompt" },
               { name: "mrtr", title: "MRTR prompt" },
               { name: "stall", title: "Stalled prompt" },
-              {
-                name: "multi",
-                title: "Multi prompt",
-                arguments: [
-                  { name: "topic", required: true },
-                  { name: "tone", required: true },
-                ],
-              },
             ]
           : [{
               name: "review",

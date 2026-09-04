@@ -1,6 +1,5 @@
 const std = @import("std");
 const credentials = @import("../auth/credentials.zig");
-const model_provider = @import("../config/model_provider.zig");
 const collections = @import("../shared/collections.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -139,8 +138,6 @@ pub const Provider = struct {
     /// When set, context must remain valid until every in-flight `fetch` returns.
     context: ?*anyopaque = null,
     fetch_fn: FetchFn,
-    provider_id: model_provider.ProviderId = .gateway,
-    refresh_interval_ms: ?i64 = null,
 
     /// Returns owned catalog entries; the caller frees them with `freeModelCatalog`.
     pub fn fetch(self: Provider, alloc: Allocator, input: FetchInput) Allocator.Error!ProviderResult {
@@ -675,7 +672,7 @@ test "catalog authentication fallback is anonymous and bounded" {
     defer debug_trace.resetForTest();
     try debug_trace.configureForTestWithScopes(alloc, trace_path, "catalog");
 
-    const access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", "team_123");
+    const access = credentials.catalogAccessForCredential(.env_var, "test-key", "team_123");
     const rejection = Failure{ .category = .authentication, .http_status = .unauthorized };
     var accepted = FallbackProbe{ .failures = .{ rejection, null } };
     var loaded = fetchWithPublicFallback(accepted.provider(), std.testing.allocator, .{
@@ -684,7 +681,7 @@ test "catalog authentication fallback is anonymous and bounded" {
     });
     defer freeModelCatalog(std.testing.allocator, &loaded.loaded.catalog);
     try std.testing.expectEqual(AccessLevel.public_only, loaded.loaded.provenance.access.level);
-    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, loaded.loaded.provenance.access.source.?);
+    try std.testing.expectEqual(credentials.Source.env_var, loaded.loaded.provenance.access.source.?);
     try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.authenticated_credential_rejected, loaded.loaded.provenance.access.public_only_reason.?);
     try std.testing.expect(loaded.loaded.provenance.access.private_models_may_be_hidden);
     try std.testing.expect(loaded.loaded.provenance.anonymous_fallback_used);
@@ -729,39 +726,21 @@ test "catalog authentication fallback is anonymous and bounded" {
     try std.testing.expect(std.mem.find(
         u8,
         trace,
-        "requested_access=authenticated credential_source=ai_gateway_api_key effective_access=public_only public_only_reason=authenticated_credential_rejected anonymous_fallback=true outcome=loaded failure_category=authentication http_status=401 retryable=false",
+        "requested_access=authenticated credential_source=env_var effective_access=public_only public_only_reason=authenticated_credential_rejected anonymous_fallback=true outcome=loaded failure_category=authentication http_status=401 retryable=false",
     ) != null);
     try std.testing.expect(std.mem.find(
         u8,
         trace,
-        "requested_access=authenticated credential_source=ai_gateway_api_key effective_access=authenticated public_only_reason=none anonymous_fallback=false outcome=failed failure_category=transport http_status=none retryable=true",
+        "requested_access=authenticated credential_source=env_var effective_access=authenticated public_only_reason=none anonymous_fallback=false outcome=failed failure_category=transport http_status=none retryable=true",
     ) != null);
     try std.testing.expect(std.mem.find(u8, trace, "test-key") == null);
     try std.testing.expect(std.mem.find(u8, trace, "team_123") == null);
     try std.testing.expect(std.mem.find(u8, trace, "/v1/models") == null);
 }
 
-test "strict authenticated catalog requests never retry anonymously" {
-    const access = credentials.catalogAccessForCredential(
-        .fx_login,
-        "test-token",
-        "team_123",
-    ).withExplicitAuthority();
-    const rejection = Failure{ .category = .authentication, .http_status = .unauthorized };
-    var probe = FallbackProbe{ .failures = .{ rejection, null } };
-
-    const failed = fetchWithPublicFallback(probe.provider(), std.testing.allocator, .{
-        .access = access,
-        .endpoint = "/v1/models",
-    }).failed;
-    try std.testing.expectEqual(AccessLevel.authenticated, failed.access.level);
-    try std.testing.expect(!failed.anonymous_fallback_used);
-    try std.testing.expectEqual(@as(usize, 1), probe.calls);
-}
-
 test "catalog fallback classification stays bounded across repeated cycles" {
     const access = credentials.catalogAccessForCredential(
-        .ai_gateway_api_key,
+        .env_var,
         "repeated-test-key",
         "repeated-team",
     );

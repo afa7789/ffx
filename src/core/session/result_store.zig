@@ -56,9 +56,7 @@ pub fn prepare(
     inline_cap: usize,
 ) !PreparedResult {
     if (result_dir) |dir| {
-        if (output_bytes > large_result_threshold_bytes or
-            durable_output.len > inline_cap)
-        {
+        if (output_bytes > large_result_threshold_bytes) {
             return prepareStoredResult(
                 alloc,
                 .{ .legacy_dir = dir },
@@ -90,9 +88,7 @@ pub fn prepareManaged(
     inline_cap: usize,
 ) !PreparedResult {
     if (capability) |managed| {
-        if (output_bytes > large_result_threshold_bytes or
-            durable_output.len > inline_cap)
-        {
+        if (output_bytes > large_result_threshold_bytes) {
             return prepareStoredResult(
                 alloc,
                 .{ .managed = managed },

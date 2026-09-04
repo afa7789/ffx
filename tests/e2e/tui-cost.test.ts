@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FFX_BIN } from "../evals/eval-helpers";
 import {
   fakeGatewaySse,
   startFakeGateway,
@@ -43,10 +43,10 @@ function gatewayEnvironment(home: string) {
   if (!gateway) throw new Error("fake gateway not started");
   return {
     HOME: home,
-    AI_GATEWAY_API_KEY: "test-key",
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FFX_PROVIDER_API_KEY: "test-key",
+    FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FFX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };
 }
 
@@ -130,7 +130,7 @@ async function waitForProfileUsage(
   generationId: string,
 ): Promise<void> {
   const deadline = Date.now() + TIMEOUT;
-  const usagePath = join(home, ".fx", "usage.jsonl");
+  const usagePath = join(home, ".ffx", "usage.jsonl");
   while (Date.now() < deadline) {
     try {
       if (readFileSync(usagePath, "utf8").includes(generationId)) return;
@@ -141,9 +141,9 @@ async function waitForProfileUsage(
 }
 
 test(
-  "fx ask settles authoritative stream usage without delayed reconciliation",
+  "ffx ask settles authoritative stream usage without delayed reconciliation",
   async () => {
-    root = mkdtempSync(join(tmpdir(), "fx-cost-ask-exit-"));
+    root = mkdtempSync(join(tmpdir(), "ffx-cost-ask-exit-"));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     mkdirSync(home, { recursive: true });
@@ -194,7 +194,7 @@ test(
       },
     );
 
-    const proc = Bun.spawn([FX_BIN, "ask", "Reply with the sentinel."], {
+    const proc = Bun.spawn([FFX_BIN, "ask", "Reply with the sentinel."], {
       cwd: workspace,
       env: { ...process.env, ...gatewayEnvironment(home) },
       stdout: "pipe",
@@ -230,8 +230,8 @@ test(
   10_000,
 );
 
-test("fx ask gives immediate generation reconciliation a bounded drain", async () => {
-  root = mkdtempSync(join(tmpdir(), "fx-cost-ask-reconcile-"));
+test("ffx ask gives immediate generation reconciliation a bounded drain", async () => {
+  root = mkdtempSync(join(tmpdir(), "ffx-cost-ask-reconcile-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   mkdirSync(home, { recursive: true });
@@ -263,7 +263,7 @@ test("fx ask gives immediate generation reconciliation a bounded drain", async (
     },
   );
 
-  const proc = Bun.spawn([FX_BIN, "ask", "Reply with the sentinel."], {
+  const proc = Bun.spawn([FFX_BIN, "ask", "Reply with the sentinel."], {
     cwd: workspace,
     env: { ...process.env, ...gatewayEnvironment(home) },
     stdout: "pipe",
@@ -283,8 +283,8 @@ test("fx ask gives immediate generation reconciliation a bounded drain", async (
   expect(usage.pending).toEqual([]);
 });
 
-test("fx usage reports an unresolved delayed fallback as pending", async () => {
-  root = mkdtempSync(join(tmpdir(), "fx-cost-pending-profile-"));
+test("ffx usage reports an unresolved delayed fallback as pending", async () => {
+  root = mkdtempSync(join(tmpdir(), "ffx-cost-pending-profile-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   mkdirSync(home, { recursive: true });
@@ -316,7 +316,7 @@ test("fx usage reports an unresolved delayed fallback as pending", async () => {
     },
   );
 
-  const ask = Bun.spawn([FX_BIN, "ask", "Reply with the sentinel."], {
+  const ask = Bun.spawn([FFX_BIN, "ask", "Reply with the sentinel."], {
     cwd: workspace,
     env: { ...process.env, ...gatewayEnvironment(home) },
     stdout: "pipe",
@@ -327,7 +327,7 @@ test("fx usage reports an unresolved delayed fallback as pending", async () => {
   await waitForProfileUsage(home, GENERATION_ID);
 
   const usage = Bun.spawn(
-    [FX_BIN, "usage", "--period", "24h", "--json"],
+    [FFX_BIN, "usage", "--period", "24h", "--json"],
     {
       cwd: workspace,
       env: { ...process.env, HOME: home },
@@ -344,8 +344,8 @@ test("fx usage reports an unresolved delayed fallback as pending", async () => {
   expect(gateway.generationRequests).toEqual([GENERATION_ID]);
 });
 
-test("fx usage reports a missing generation identity as incomplete", async () => {
-  root = mkdtempSync(join(tmpdir(), "fx-cost-incomplete-profile-"));
+test("ffx usage reports a missing generation identity as incomplete", async () => {
+  root = mkdtempSync(join(tmpdir(), "ffx-cost-incomplete-profile-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   mkdirSync(home, { recursive: true });
@@ -368,7 +368,7 @@ test("fx usage reports a missing generation identity as incomplete", async () =>
     },
   );
 
-  const ask = Bun.spawn([FX_BIN, "ask", "Reply with the sentinel."], {
+  const ask = Bun.spawn([FFX_BIN, "ask", "Reply with the sentinel."], {
     cwd: workspace,
     env: { ...process.env, ...gatewayEnvironment(home) },
     stdout: "pipe",
@@ -378,7 +378,7 @@ test("fx usage reports a missing generation identity as incomplete", async () =>
   expect(await ask.exited, askStderr).toBe(0);
 
   const usage = Bun.spawn(
-    [FX_BIN, "usage", "--period", "24h", "--json"],
+    [FFX_BIN, "usage", "--period", "24h", "--json"],
     {
       cwd: workspace,
       env: { ...process.env, HOME: home },
@@ -400,7 +400,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
     test(
       `pending generation reconciliation survives ${resumeMode} resume`,
       async () => {
-        root = mkdtempSync(join(tmpdir(), `fx-cost-${resumeMode}-resume-`));
+        root = mkdtempSync(join(tmpdir(), `ffx-cost-${resumeMode}-resume-`));
         const home = join(root, "home");
         const workspace = join(root, "workspace");
         const stderrPath = join(root, "stderr.log");
@@ -457,7 +457,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         );
 
         const fixture = Bun.spawn(
-          [FX_BIN, "ask", "Create pending usage for resume."],
+          [FFX_BIN, "ask", "Create pending usage for resume."],
           {
             cwd: workspace,
             env: { ...process.env, ...gatewayEnvironment(home) },
@@ -479,7 +479,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
           .toEqual([GENERATION_ID]);
 
         session = await TmuxSession.create({
-          cmd: resumeMode === "startup" ? `${FX_BIN} --resume-last` : FX_BIN,
+          cmd: resumeMode === "startup" ? `${FFX_BIN} --resume-last` : FFX_BIN,
           cwd: workspace,
           env: gatewayEnvironment(home),
           stderrPath,
@@ -501,12 +501,11 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         await waitForProfileUsage(home, GENERATION_ID);
 
         await session.sendText("/cost");
-        const cost = await session.waitForText(/\$0\.01 spent/, TIMEOUT);
-        expect(cost).toMatch(/155 tokens/);
-        expect(cost).toMatch(/130 input/);
-        expect(cost).toMatch(/25 output/);
-        expect(cost).toMatch(/20 cache read/);
-        expect(cost).toMatch(/10 cache write/);
+        const cost = await session.waitForText(/\$0\.0123/, TIMEOUT);
+        expect(cost).toMatch(/Total tokens +155/);
+        expect(cost).toMatch(/Input +130/);
+        expect(cost).toMatch(/Output +25/);
+        expect(cost).toMatch(/Cache +20 read · 10 write/);
         await session.sendKeys("Escape");
         await session.waitForComposer(TIMEOUT);
         await session.sendText("Confirm resumed input still works.");
@@ -539,7 +538,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
   test(
     "authoritative generation totals survive process resume",
     async () => {
-      root = mkdtempSync(join(tmpdir(), "fx-cost-"));
+      root = mkdtempSync(join(tmpdir(), "ffx-cost-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       mkdirSync(home, { recursive: true });
@@ -596,20 +595,19 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       expect(gateway.generationRequests).toEqual([GENERATION_ID, GENERATION_ID]);
       await Bun.sleep(50);
       await session.sendText("/cost");
-      const firstCost = await session.waitForText(/\$0\.01 spent/, TIMEOUT);
-      expect(firstCost).toMatch(/155 tokens/);
-      expect(firstCost).toMatch(/130 input/);
-      expect(firstCost).toMatch(/25 output/);
-      expect(firstCost).toMatch(/20 cache read/);
-      expect(firstCost).toMatch(/10 cache write/);
+      const firstCost = await session.waitForText(/\$0\.0123/, TIMEOUT);
+      expect(firstCost).toMatch(/Total tokens +155/);
+      expect(firstCost).toMatch(/Input +130/);
+      expect(firstCost).toMatch(/Output +25/);
+      expect(firstCost).toMatch(/Cache +20 read · 10 write/);
       await session.sendKeys("Left");
-      await session.waitForText("[7 days]", TIMEOUT);
+      await session.waitForText("Usage · 7 days", TIMEOUT);
       await session.sendKeys("Left");
-      await session.waitForText("[24 hours]", TIMEOUT);
+      await session.waitForText("Usage · 24 hours", TIMEOUT);
       await session.sendKeys("Left");
-      const firstSession = await session.waitForText("[Session]", TIMEOUT);
-      expect(firstSession).toMatch(/5 reasoning/);
-      expect(firstSession).toMatch(/1 request/);
+      const firstSession = await session.waitForText("Usage · Session", TIMEOUT);
+      expect(firstSession).toMatch(/Reasoning +5/);
+      expect(firstSession).toMatch(/Requests +1/);
       await session.sendKeys("Escape");
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/quit");
@@ -617,29 +615,28 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       session = null;
 
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FFX_BIN} --resume-last`,
         cwd: workspace,
         env: gatewayEnvironment(home),
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/cost");
-      const resumedCost = await session.waitForText(/\$0\.01 spent/, TIMEOUT);
-      expect(resumedCost).toMatch(/155 tokens/);
-      expect(resumedCost).toMatch(/130 input/);
-      expect(resumedCost).toMatch(/25 output/);
-      expect(resumedCost).toMatch(/20 cache read/);
-      expect(resumedCost).toMatch(/10 cache write/);
+      const resumedCost = await session.waitForText(/\$0\.0123/, TIMEOUT);
+      expect(resumedCost).toMatch(/Total tokens +155/);
+      expect(resumedCost).toMatch(/Input +130/);
+      expect(resumedCost).toMatch(/Output +25/);
+      expect(resumedCost).toMatch(/Cache +20 read · 10 write/);
       await session.sendKeys("Left");
-      await session.waitForText("[7 days]", TIMEOUT);
+      await session.waitForText("Usage · 7 days", TIMEOUT);
       await session.sendKeys("Left");
-      await session.waitForText("[24 hours]", TIMEOUT);
+      await session.waitForText("Usage · 24 hours", TIMEOUT);
       await session.sendKeys("Left");
       const resumedSession = await session.waitForText(
-        "[Session]",
+        "Usage · Session",
         TIMEOUT,
       );
-      expect(resumedSession).toMatch(/5 reasoning/);
-      expect(resumedSession).toMatch(/1 request/);
+      expect(resumedSession).toMatch(/Reasoning +5/);
+      expect(resumedSession).toMatch(/Requests +1/);
       expect(gateway.generationRequests).toEqual([GENERATION_ID, GENERATION_ID]);
     },
     TIMEOUT * 3,

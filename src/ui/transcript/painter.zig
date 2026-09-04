@@ -1305,7 +1305,6 @@ fn prepareTranscriptSurfacePaintWithOwnedSource(
         true,
         false,
         .apply,
-        null,
     );
     if (source.bytes.len > 0) {
         prepared.owns_bytes = true;
@@ -1331,7 +1330,6 @@ pub fn prepareTranscriptSurfacePaintFromSourceForArea(
         false,
         false,
         .apply,
-        null,
     );
 }
 
@@ -1352,7 +1350,6 @@ pub fn preparePreselectedTranscriptSurfacePaintFromSourceForArea(
         false,
         false,
         .skip,
-        null,
     );
 }
 
@@ -1374,29 +1371,6 @@ pub fn prepareTranscriptSurfacePaintFromSourceForFrame(
         false,
         allow_projection_rebase,
         .apply,
-        null,
-    );
-}
-
-pub fn prepareIndexedFullTranscriptSurfacePaintForArea(
-    self: anytype,
-    alloc: Allocator,
-    metrics: *Metrics,
-    source: *const TranscriptPreparationSource,
-    area: render_engine.frame_layout.FrameRect,
-    visual_offset: u32,
-) !PreparedTranscriptSurfacePaint {
-    return prepareTranscriptSurfacePaintInternal(
-        self,
-        alloc,
-        metrics,
-        0,
-        area,
-        source,
-        false,
-        false,
-        .skip,
-        visual_offset,
     );
 }
 
@@ -1675,7 +1649,6 @@ fn prepareTranscriptSurfacePaintInternal(
     commit_runtime_state: bool,
     allow_projection_rebase: bool,
     resize_history_policy: ResizeHistoryPolicy,
-    forced_visual_offset: ?u32,
 ) !PreparedTranscriptSurfacePaint {
     if (commit_runtime_state) try self.ensurePaintReservation(alloc);
 
@@ -1816,6 +1789,7 @@ fn prepareTranscriptSurfacePaintInternal(
     var repl_line_idx: usize = total_lines;
     var tracked_visible_line: ?usize = null;
     const precomputed_plain_lines =
+        !self.fullTranscriptActive() and
         !effective_replaceable_last_line and
         tracked_entry_start_line == null and
         total_lines == transcript_line_count and
@@ -2064,41 +2038,6 @@ fn prepareTranscriptSurfacePaintInternal(
             welcome_decision = .none;
             self.tail_viewport_resolution = resolution;
         }
-    }
-    if (forced_visual_offset) |visual_offset| {
-        const remaining_visual_rows = projectionRemainingVisualRows(
-            &prepared,
-            visual_offset,
-        ) orelse return error.InvalidTranscriptTransition;
-        const projection_rows = @min(
-            remaining_visual_rows,
-            @as(u32, visible_rows),
-        );
-        if (projection_rows == 0) return error.InvalidTranscriptTransition;
-        const visual_end = visual_offset + projection_rows;
-        const start = sourceStartPosition(&prepared, visual_offset) orelse
-            return error.InvalidTranscriptTransition;
-        const boundary = preparedProjectionBoundary(
-            &prepared,
-            self.layout.cols,
-            visual_end,
-        ) orelse return error.InvalidTranscriptTransition;
-        try replacePreparedProjectionResumeBytes(
-            alloc,
-            &prepared,
-            self.layout.cols,
-            visual_offset,
-        );
-        prepared.projection_visual_rows = @intCast(projection_rows);
-        prepared.projection_ends_with_newline = boundary.line_terminated;
-        viewport_selection_snapshot.start_line = start.line;
-        viewport_selection_snapshot.partial_skip_rows = start.intra_line_rows;
-        viewport_selection_snapshot.line_count = prepared.sourceVisibleLines().len;
-        viewport_selection_snapshot.last_visible_row = 0;
-        viewport_selection_snapshot.last_visible_row_blank = false;
-        viewport_selection_snapshot.replaceable_start_row = top_row;
-        rows_budget = visible_rows - @as(u16, @intCast(projection_rows));
-        welcome_decision = .none;
     }
     const start_line = viewport_selection_snapshot.start_line;
     const partial_skip_rows = viewport_selection_snapshot.partial_skip_rows;
@@ -2845,7 +2784,7 @@ test "document append preparation emits terminal-ready newlines" {
 }
 
 test "document append preparation preserves presentation boundaries" {
-    const open = "\x1b]8;id=fx-42;https://example.com\x1b\\";
+    const open = "\x1b]8;id=ffx-42;https://example.com\x1b\\";
     const raw = "old\nnew";
     const close = "\x1b]8;;\x1b\\";
     const source = open ++ raw ++ close;
@@ -3972,7 +3911,7 @@ test "resize history offset replays the welcome tail when history returns" {
 
 test "transcript surface painter renders welcome plus user rows" {
     const alloc = std.testing.allocator;
-    var batch = try transcriptTestBatch(alloc, "fx welcome\n\n╭ user prompt\n╰ done", 24);
+    var batch = try transcriptTestBatch(alloc, "ffx welcome\n\n╭ user prompt\n╰ done", 24);
     defer batch.deinit(alloc);
     const layout = testLayout(24, 10, 6);
     var target = try expectTranscriptSurfacePaint(alloc, layout, .{
@@ -3983,7 +3922,7 @@ test "transcript surface painter renders welcome plus user rows" {
         .line_count = batch.lines.len,
     }, batch);
     defer target.deinit();
-    try expectGridContains(&target, alloc, "fx welcome");
+    try expectGridContains(&target, alloc, "ffx welcome");
     try expectGridContains(&target, alloc, "user prompt");
 }
 

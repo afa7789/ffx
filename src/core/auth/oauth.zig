@@ -5,7 +5,7 @@ const secret = @import("secret.zig");
 const Allocator = std.mem.Allocator;
 
 // Sign in with Vercel supports exactly openid, email, profile and offline_access,
-// and silently filters anything else. fx only needs identity plus a refresh token,
+// and silently filters anything else. ffx only needs identity plus a refresh token,
 // so it asks for those two and nothing more. An earlier `use:ai-gateway` entry was
 // never a real scope: it was dropped on every grant and bought nothing.
 pub const default_scope = "openid offline_access";
@@ -31,7 +31,6 @@ pub const OAuthError = error{
     AccessDenied,
     ExpiredToken,
     InvalidClient,
-    InvalidGrant,
     OAuthRequestFailed,
 };
 
@@ -332,7 +331,6 @@ fn mapOAuthHttpError(alloc: Allocator, body: []const u8) !void {
     if (std.mem.eql(u8, value.string, "access_denied")) return OAuthError.AccessDenied;
     if (std.mem.eql(u8, value.string, "expired_token")) return OAuthError.ExpiredToken;
     if (std.mem.eql(u8, value.string, "invalid_client")) return OAuthError.InvalidClient;
-    if (std.mem.eql(u8, value.string, "invalid_grant")) return OAuthError.InvalidGrant;
     return OAuthError.OAuthRequestFailed;
 }
 
@@ -527,7 +525,7 @@ test "a reduced grant names the scope the issuer withheld" {
         "offline_access",
         missingGrantedScope("openid offline_access", "openid").?,
     );
-    // The scope fx used to request was never advertised, so every grant dropped it.
+    // The scope ffx used to request was never advertised, so every grant dropped it.
     try std.testing.expectEqualStrings(
         "use:ai-gateway",
         missingGrantedScope("openid offline_access use:ai-gateway", "openid offline_access").?,
@@ -553,7 +551,6 @@ test "oauth maps provider errors" {
     try std.testing.expectError(OAuthError.OAuthRequestFailed, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"invalid_request\"}"));
     try std.testing.expectError(OAuthError.OAuthRequestFailed, mapOAuthHttpError(std.testing.allocator, "{\"error\":42}"));
     try std.testing.expectError(OAuthError.InvalidClient, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"invalid_client\"}"));
-    try std.testing.expectError(OAuthError.InvalidGrant, mapOAuthHttpError(std.testing.allocator, "{\"error\":\"invalid_grant\"}"));
 }
 
 test "oauth parses token set" {

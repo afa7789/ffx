@@ -8,27 +8,20 @@ const mcp_servers = @import("mcp_servers.zig");
 const server = @import("server.zig");
 const session_test_controls = @import("session_test_controls.zig");
 const session_codec = @import("../core/session/session_codec.zig");
-const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
-const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
-const mcp_contract = @import("../core/mcp/mcp_contract.zig");
-const project_config = @import("../core/mcp/project_config.zig");
-const workspace_config = @import("../core/mcp/workspace_config.zig");
-const config_runtime = @import("../core/config/config_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
-const provider_set = @import("../core/gateway/provider_set.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
-const image_attachments = @import("../core/images/image_attachments.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
+const command_specs = @import("../core/slash_commands/command_specs.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../builtins/gateway.zig")
 else
@@ -37,51 +30,6 @@ else
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
-
-pub fn handleNewLibfxSession(
-    state: *server.ServerState,
-    alloc: Allocator,
-    msg: *jsonrpc.Message,
-) !void {
-    try server.releaseActiveSession(state);
-    const session_id = try session_store.generateSessionId(alloc);
-    var session_id_owned = true;
-    defer if (session_id_owned) alloc.free(session_id);
-    const model = try alloc.dupe(u8, state.selected_model);
-    var model_owned = true;
-    defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(
-        state.cfg.max_history_turns,
-        state.cfg.provider_set.deferredUsageProviders(),
-    );
-    var session_rt_owned = true;
-    defer if (session_rt_owned) session_rt.deinit(alloc);
-
-    state.active_session = .{
-        .session_id = session_id,
-        .model = model,
-        .provider = state.provider,
-        .mode = state.cfg.mode_registry.default_mode_id,
-        .workspace_root = state.workspace_root,
-        .api_key = state.api_key,
-        .credential_source = state.credential_source,
-        .account_id = state.account_id,
-        .agent_step_limit = state.agent_step_limit,
-        .max_tool_result_bytes = state.max_tool_result_bytes,
-        .fast_mode = state.fast_mode,
-        .effort = state.effort,
-        .first_call_tool_choice = state.first_call_tool_choice,
-        .permission_mode = state.permission_mode,
-        .permission_rules = state.permission_rules,
-        .session_rt = session_rt,
-        .cancel_flag = std.atomic.Value(bool).init(false),
-        .pending_prompt_id = null,
-    };
-    session_id_owned = false;
-    model_owned = false;
-    session_rt_owned = false;
-    try writeNewSessionResponse(state, alloc, msg, session_id);
-}
 
 pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     try server.releaseActiveSession(state);
@@ -95,9 +43,9 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     const model = try alloc.dupe(u8, durable.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(
+    var session_rt = session_runtime.SessionRuntime.init(
         state.cfg.max_history_turns,
-        state.cfg.provider_set.deferredUsageProviders(),
+        state.cfg.gateway_provider.generation_usage,
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
@@ -119,7 +67,6 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
-        .credential_refresh_after_ms = state.credential_refresh_after_ms,
         .account_id = state.account_id,
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
@@ -193,8 +140,6 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
             .message = "MCP servers are unavailable in this runtime",
         });
     }
-    if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
-    retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
@@ -248,9 +193,9 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     defer if (model_owned) alloc.free(model_copy);
     const session_dir = try session_store.sessionDirPath(alloc, store.sessions_dir, writable.active_id);
     defer alloc.free(session_dir);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(
+    var session_rt = session_runtime.SessionRuntime.init(
         state.cfg.max_history_turns,
-        state.cfg.provider_set.deferredUsageProviders(),
+        state.cfg.gateway_provider.generation_usage,
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
@@ -301,7 +246,6 @@ fn writeNewSessionResponse(
     msg: *jsonrpc.Message,
     session_id: []const u8,
 ) !void {
-    try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
@@ -331,7 +275,9 @@ fn writeNewSessionResponse(
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 
-    try sendAvailableCommands(state, alloc, session_id, "[]");
+    const commands_json = try buildSlashCommandsJson(alloc);
+    defer alloc.free(commands_json);
+    try sendAvailableCommands(state, alloc, session_id, commands_json);
 }
 
 pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -352,8 +298,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
 
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
-            for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
-            try sendActiveSessionInfoUpdate(state, alloc);
+            for (active.session_rt.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
             return writeLoadSessionResponse(state, alloc, msg, active.model);
         }
     }
@@ -375,7 +320,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     const model_copy = try alloc.dupe(u8, loaded.state.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(state.cfg.max_history_turns, state.cfg.provider_set.deferredUsageProviders());
+    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns, state.cfg.gateway_provider.generation_usage);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     try session_rt.restoreWithPermissionState(
@@ -398,7 +343,6 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
-        .credential_refresh_after_ms = state.credential_refresh_after_ms,
         .account_id = state.account_id,
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
@@ -415,8 +359,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     sid_owned = false;
     model_owned = false;
     session_rt_owned = false;
-    for (state.active_session.?.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
-    try sendActiveSessionInfoUpdate(state, alloc);
+    for (state.active_session.?.session_rt.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
     try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model);
 }
 
@@ -512,17 +455,6 @@ fn handleRestoreSession(
         }),
     };
     defer mcp_configs.deinit(alloc);
-    if (!state.cfg.allow_acp_mcp) {
-        if (mcp_configs.items.items.len > 0) {
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_params,
-                .message = "MCP servers are unavailable in this runtime",
-            });
-        }
-    } else {
-        try appendProjectMcpConfigs(state, alloc, &mcp_configs);
-    }
-    retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
@@ -567,7 +499,7 @@ fn handleRestoreSession(
             }
             server.enableSubagentHost(state);
             if (kind.replaysHistory()) {
-                for (active.session_rt.agent.history.items) |turn| {
+                for (active.session_rt.history.items) |turn| {
                     try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
                 }
             }
@@ -577,7 +509,6 @@ fn handleRestoreSession(
                 session_id,
                 if (active.writable) |*writable| writable.state.recovery_checkpoint else null,
             );
-            try sendActiveSessionInfoUpdate(state, alloc);
             return writeLoadSessionResponse(
                 state,
                 alloc,
@@ -643,9 +574,9 @@ fn handleRestoreSession(
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
 
-    var session_rt = session_runtime.SessionRuntime.initWithProviders(
+    var session_rt = session_runtime.SessionRuntime.init(
         state.cfg.max_history_turns,
-        state.cfg.provider_set.deferredUsageProviders(),
+        state.cfg.gateway_provider.generation_usage,
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
@@ -704,97 +635,12 @@ fn handleRestoreSession(
         session_id,
         state.active_session.?.writable.?.state.recovery_checkpoint,
     );
-    try sendActiveSessionInfoUpdate(state, alloc);
 
     try writeLoadSessionResponse(
         state,
         alloc,
         msg,
         state.active_session.?.model,
-    );
-}
-
-fn detachActiveMcpForAuthorityReduction(
-    state: *server.ServerState,
-    active: *server.ActiveSessionState,
-) *mcp_runtime.McpRuntime {
-    server.cancelAndReapActivePrompt(state);
-    server.disableSubagentHost(state);
-    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-    const previous = active.mcp.?;
-    active.mcp = null;
-    state.subagent_authority_mutex.unlock(io_mod.getIo());
-    return previous;
-}
-
-fn retireReducedActiveMcp(
-    state: *server.ServerState,
-    alloc: Allocator,
-    next_configs: []const mcp_contract.McpServerConfig,
-) void {
-    const active = if (state.active_session) |*value| value else return;
-    const runtime = active.mcp orelse return;
-    if (!runtime.workspaceAuthorityReducedAgainstConfigs(
-        next_configs,
-        .acp_startup,
-    )) return;
-    const previous = detachActiveMcpForAuthorityReduction(state, active);
-    previous.retireAndWait();
-    previous.deinit();
-    alloc.destroy(previous);
-    server.enableSubagentHost(state);
-}
-
-fn appendProjectMcpConfigs(
-    state: *server.ServerState,
-    alloc: Allocator,
-    configs: *mcp_servers.OwnedServerConfigs,
-) !void {
-    var choices = if (state.cfg.home_override) |home|
-        config_runtime.loadProjectMcpChoicesFromHome(alloc, home, state.workspace_root) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            return;
-        }
-    else
-        config_runtime.loadProjectMcpChoices(alloc, state.workspace_root) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            return;
-        };
-    defer choices.deinit(alloc);
-
-    var workspace = try workspace_config.load(
-        alloc,
-        state.workspace_root,
-        .workspace,
-        choices.choices,
-    );
-    defer workspace.deinit(alloc);
-    for (workspace.diagnostics.items) |diagnostic| {
-        var name_buf: [256]u8 = undefined;
-        var variable_buf: [160]u8 = undefined;
-        debug_trace.logf(
-            "mcp",
-            "ACP workspace MCP config skipped cause={s} server={s} field={s} variable={s}",
-            .{
-                @tagName(diagnostic.cause),
-                if (diagnostic.server_name) |name|
-                    debug_trace.terminalPreview(name_buf[0..], name)
-                else
-                    "none",
-                if (diagnostic.environment_field) |field| @tagName(field) else "none",
-                if (diagnostic.environment_variable) |name|
-                    debug_trace.terminalPreview(variable_buf[0..], name)
-                else
-                    "none",
-            },
-        );
-    }
-    try project_config.appendWorkspaceAfterAcpPrimary(
-        alloc,
-        &configs.items,
-        &workspace.configs,
     );
 }
 
@@ -805,7 +651,7 @@ fn sendPendingRecoveryUpdate(
     checkpoint: ?session_codec.RecoveryCheckpoint,
 ) !void {
     const recovery = checkpoint orelse return;
-    try sendUserHistoryTurn(state, alloc, session_id, recovery.user);
+    try sendUserHistoryChunk(state, alloc, session_id, recovery.user.text);
     try sendExecutionHistory(state, alloc, session_id, recovery.execution);
     if (recovery.assistant_source.len > 0) {
         try sendAgentHistoryChunk(state, alloc, session_id, recovery.assistant_source);
@@ -846,7 +692,6 @@ fn writeLoadSessionResponse(
     msg: *jsonrpc.Message,
     model: []const u8,
 ) !void {
-    try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
@@ -935,7 +780,6 @@ fn activateSession(
         .workspace_root = state.workspace_root,
         .api_key = state.api_key,
         .credential_source = state.credential_source,
-        .credential_refresh_after_ms = state.credential_refresh_after_ms,
         .account_id = state.account_id,
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
@@ -951,40 +795,35 @@ fn activateSession(
     };
     server.enableSubagentHost(state);
     state.active_session.?.session_rt.attachProfileUsagePublisher(state.alloc);
-    if (state.cfg.provider_set.select(activation.provider).deferred_usage == null) {
+    if (state.credential_source == .stored_key or state.credential_source == .stored_key) {
         state.active_session.?.session_rt.usage.clearReconciliationCredential();
-    } else if (state.credential_source) |source| {
-        state.active_session.?.session_rt.usage.replaceProviderReconciliationCredential(
+    } else {
+        state.active_session.?.session_rt.usage.startReconciliation(
             state.alloc,
-            activation.provider,
-            source,
-            state.account_id,
             state.api_key,
         );
-    } else {
-        state.active_session.?.session_rt.usage.clearReconciliationCredential();
     }
-    if (state.active_session.?.writable) |*writable| {
-        if (writable.childCapability()) |capability| {
-            _ = legacy_background_migration.migrate(
-                state.alloc,
-                capability,
-                state.cfg.process_provider,
-            ) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "legacy process migration deferred session={s} err={s}",
-                    .{ writable.active_id, @errorName(err) },
-                );
-            };
-        } else |err| {
-            debug_trace.logf(
-                "session",
-                "legacy process migration unavailable session={s} err={s}",
-                .{ writable.active_id, @errorName(err) },
-            );
-        }
-    }
+    activateManagedBackground(state, store);
+}
+
+fn activateManagedBackground(
+    state: *server.ServerState,
+    store: session_store.Store,
+) void {
+    const active = if (state.active_session) |*session| session else return;
+    const writable = if (active.writable) |*value| value else return;
+    state.background.restoreWorkspaceFromStore(
+        std.heap.c_allocator,
+        store,
+        state.workspace_root,
+        writable.active_id,
+    ) catch {};
+    state.background.restoreFromManagedPersistence(
+        std.heap.c_allocator,
+        writable.childCapability() catch return,
+        writable.active_id,
+        state.workspace_root,
+    ) catch {};
 }
 
 fn handleLoadFailure(
@@ -1027,7 +866,7 @@ fn handleLoadFailure(
     if (err == error.OneOffSessionNotResumable) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "Subagent child sessions cannot be resumed directly",
+            .message = "One-off child sessions cannot accept additional prompts",
         });
     }
     if (err == error.InvalidSessionFormat or
@@ -1051,150 +890,68 @@ fn handleLoadFailure(
 }
 
 pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    var params_arena = std.heap.ArenaAllocator.init(alloc);
-    defer params_arena.deinit();
-    const params = parseListSessionsParams(params_arena.allocator(), msg) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Invalid params",
-        });
-    var store = (if (state.cfg.home_override) |home|
-        session_store.Store.initReadOnlyFromHome(alloc, home, params.cwd orelse state.workspace_root)
-    else
-        session_store.Store.initReadOnly(alloc, params.cwd orelse state.workspace_root)) catch {
+    var store = session_store.Store.initReadOnly(
+        alloc,
+        state.workspace_root,
+    ) catch {
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
     defer store.deinit(alloc);
 
-    var page = subagent_resume_admission.listVisiblePage(
-        store,
-        alloc,
-        if (params.cwd != null) .current_workspace else .all_workspaces,
-        params.continuation,
-        session_store.session_list_default_limit,
-    ) catch {
+    var session_list = store.listForWorkspace(alloc) catch {
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
-    defer page.deinit(alloc);
-    var next_cursor_buf: [320]u8 = undefined;
-    const next_cursor = if (page.has_more and page.summaries.items.len > 0)
-        try std.fmt.bufPrint(&next_cursor_buf, "v1:{d}:{s}", .{
-            page.summaries.items[page.summaries.items.len - 1].updated_at_ms,
-            page.summaries.items[page.summaries.items.len - 1].id,
-        })
-    else
-        null;
+    defer {
+        for (session_list.items) |*s| s.deinit(alloc);
+        session_list.deinit(alloc);
+    }
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
     try out.writer.writeAll("{\"sessions\":[");
-    var wrote_session = false;
-    for (page.summaries.items) |summary| {
-        const workspace_root = summary.workspace_root orelse {
-            debug_trace.logf(
-                "acp",
-                "session operation=list outcome=omitted id={s} reason=workspace_unknown",
-                .{summary.id},
-            );
-            continue;
-        };
-        if (!std.fs.path.isAbsolute(workspace_root)) {
-            debug_trace.logf(
-                "acp",
-                "session operation=list outcome=omitted id={s} reason=workspace_not_absolute",
-                .{summary.id},
-            );
-            continue;
-        }
-        if (wrote_session) try out.writer.writeAll(",");
-        wrote_session = true;
+    for (session_list.items, 0..) |summary, i| {
+        if (i > 0) try out.writer.writeAll(",");
         try out.writer.writeAll("{\"sessionId\":");
         try writeJsonStr(summary.id, &out.writer);
         try out.writer.writeAll(",\"cwd\":");
-        try writeJsonStr(workspace_root, &out.writer);
-        if (summary.title) |title| {
-            try out.writer.writeAll(",\"title\":");
-            try writeJsonStr(title, &out.writer);
-        }
+        try writeJsonStr(state.workspace_root, &out.writer);
         try out.writer.writeAll(",\"updatedAt\":");
         const iso = try formatIso8601(alloc, summary.updated_at_ms);
         defer alloc.free(iso);
         try writeJsonStr(iso, &out.writer);
         try out.writer.writeAll("}");
     }
-    try out.writer.writeAll("]");
-    if (next_cursor) |cursor| {
-        try out.writer.writeAll(",\"nextCursor\":");
-        try writeJsonStr(cursor, &out.writer);
-    }
-    try out.writer.writeAll("}");
+    try out.writer.writeAll("]}");
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
-const ListSessionsParams = struct {
-    cwd: ?[]const u8 = null,
-    continuation: ?session_store.ResumableSessionContinuation = null,
-};
-
-fn parseListSessionsParams(
-    alloc: Allocator,
-    msg: *jsonrpc.Message,
-) !ListSessionsParams {
-    const raw = msg.params_raw orelse return .{};
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
-        return error.InvalidParams;
-    if (parsed.value != .object) return error.InvalidParams;
-    var result = ListSessionsParams{};
-    if (parsed.value.object.get("cwd")) |cwd| {
-        if (cwd != .null) {
-            if (cwd != .string or !std.fs.path.isAbsolute(cwd.string)) {
-                return error.InvalidParams;
-            }
-            result.cwd = cwd.string;
-        }
-    }
-    if (parsed.value.object.get("cursor")) |cursor| {
-        if (cursor != .null) {
-            if (cursor != .string) return error.InvalidParams;
-            result.continuation = parseListCursor(cursor.string) catch
-                return error.InvalidParams;
-        }
-    }
-    return result;
-}
-
-fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation {
-    if (raw.len == 0 or raw.len > 320) return error.InvalidParams;
-    var fields = std.mem.splitScalar(u8, raw, ':');
-    if (!std.mem.eql(u8, fields.next() orelse return error.InvalidParams, "v1")) {
-        return error.InvalidParams;
-    }
-    const updated_at_ms = std.fmt.parseInt(
-        i64,
-        fields.next() orelse return error.InvalidParams,
-        10,
-    ) catch return error.InvalidParams;
-    const id = fields.next() orelse return error.InvalidParams;
-    if (updated_at_ms < 0 or fields.next() != null) return error.InvalidParams;
-    session_store.validateSessionId(id) catch return error.InvalidParams;
-    return .{ .updated_at_ms = updated_at_ms, .id = id };
-}
-
 fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
-    switch (turn) {
-        .assistant => |assistant| try sendUserHistoryTurn(state, alloc, session_id, assistant.user),
-        .interrupted => |interrupted| try sendUserHistoryTurn(state, alloc, session_id, interrupted.user),
-        .compacted_summary => |compacted| try sendUserHistoryText(state, alloc, session_id, compacted.summary),
-    }
+    const user_text: []const u8 = switch (turn) {
+        .assistant => |a| a.user.text,
+        .background_command => |b| b.user.text,
+        .interrupted => |i| i.user.text,
+        .compacted_summary => |c| c.summary,
+    };
+
+    try sendUserHistoryChunk(state, alloc, session_id, user_text);
 
     switch (turn) {
         .assistant => |assistant| {
             try sendExecutionHistory(state, alloc, session_id, assistant.execution);
             try sendAgentHistoryChunk(state, alloc, session_id, assistant.assistant);
+        },
+        .background_command => |background| {
+            try sendExecutionHistory(state, alloc, session_id, background.execution);
+            if (background.assistant) |assistant| {
+                if (assistant.len > 0) {
+                    try sendAgentHistoryChunk(state, alloc, session_id, assistant);
+                }
+            }
+            try sendAgentHistoryChunk(state, alloc, session_id, "[background command]");
         },
         .interrupted => |i| {
             try sendExecutionHistory(state, alloc, session_id, i.execution);
@@ -1212,79 +969,13 @@ fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, sessio
     }
 }
 
-fn sendUserHistoryTurn(
-    state: *server.ServerState,
-    alloc: Allocator,
-    session_id: []const u8,
-    user: types.UserTurn,
-) !void {
-    var message_id: acp_types.MessageIdBuffer = undefined;
-    const stable_message_id = acp_types.generateMessageId(&message_id);
-    if (user.text.len > 0) {
-        try sendUserHistoryChunk(state, alloc, session_id, stable_message_id, user.text);
-    }
-    for (user.images) |attachment| {
-        var snapshot = image_attachments.loadVerifiedSnapshot(alloc, attachment, .{}) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            debug_trace.logf(
-                "acp",
-                "image history replay omitted id={d} err={s}",
-                .{ attachment.id, @errorName(err) },
-            );
-            var unavailable: [96]u8 = undefined;
-            const notice = try std.fmt.bufPrint(
-                &unavailable,
-                "Image #{d} unavailable",
-                .{attachment.id},
-            );
-            try sendUserHistoryChunk(state, alloc, session_id, stable_message_id, notice);
-            continue;
-        };
-        defer snapshot.deinit(alloc);
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        try out.writer.writeAll("{\"sessionId\":");
-        try writeJsonStr(session_id, &out.writer);
-        try out.writer.writeAll(",\"update\":");
-        try acp_types.writeUserImageChunk(
-            &out.writer,
-            stable_message_id,
-            snapshot.media_type,
-            snapshot.bytes,
-        );
-        try out.writer.writeAll("}");
-        try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
-    }
-}
-
-fn sendUserHistoryText(state: *server.ServerState, alloc: Allocator, session_id: []const u8, user_text: []const u8) !void {
-    var message_id: acp_types.MessageIdBuffer = undefined;
-    try sendUserHistoryChunk(
-        state,
-        alloc,
-        session_id,
-        acp_types.generateMessageId(&message_id),
-        user_text,
-    );
-}
-
-fn sendUserHistoryChunk(
-    state: *server.ServerState,
-    alloc: Allocator,
-    session_id: []const u8,
-    message_id: []const u8,
-    text: []const u8,
-) !void {
+fn sendUserHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeUserMessageChunk(
-        &out.writer,
-        message_id,
-        text,
-    );
+    try acp_types.writeUserMessageChunk(&out.writer, text);
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
@@ -1301,17 +992,12 @@ fn sendExecutionHistory(
 }
 
 fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
-    var message_id: acp_types.MessageIdBuffer = undefined;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeAgentMessageChunk(
-        &out.writer,
-        acp_types.generateMessageId(&message_id),
-        text,
-    );
+    try acp_types.writeAgentMessageChunk(&out.writer, text);
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
@@ -1327,55 +1013,47 @@ fn sendAvailableCommands(state: *server.ServerState, alloc: Allocator, session_i
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator) !void {
-    const active = if (state.active_session) |*session| session else return;
-    var metadata = try session_display_metadata.deriveFromHistory(
-        alloc,
-        active.session_rt.agent.history.items,
-    );
-    defer metadata.deinit(alloc);
-    const updated_at_ms = if (active.writable) |*writable|
-        writable.state.updated_at_ms
-    else if (active.wasm_state) |durable|
-        durable.updated_at_ms
-    else
-        io_mod.milliTimestamp();
-    const updated_at = try formatIso8601(alloc, @max(updated_at_ms, 0));
-    defer alloc.free(updated_at);
-
+fn buildSlashCommandsJson(alloc: Allocator) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.writeAll("{\"sessionId\":");
-    try writeJsonStr(active.session_id, &out.writer);
-    try out.writer.writeAll(",\"update\":");
-    try acp_types.writeSessionInfoUpdate(&out.writer, metadata.title, updated_at);
-    try out.writer.writeAll("}");
-    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
-}
 
-pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator) !void {
-    const active = if (state.active_session) |*session| session else return;
-    const usage = active.session_rt.usage.liveContextSnapshot() orelse return;
-    const provider_bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
-        active.model,
-        provider_bundle.fallbackModelCapabilities(active.model),
-    );
-    const context_window = capabilities.context_window orelse return;
+    const commands = [_]struct { name: []const u8, description: []const u8, hint: ?[]const u8 }{
+        .{ .name = "compact", .description = "Compact conversation history", .hint = null },
+        .{ .name = "undo", .description = "Undo last file change", .hint = null },
+        .{ .name = "changes", .description = "Show file changes in this session", .hint = null },
+        .{ .name = "review", .description = "Toggle post-edit review", .hint = null },
+        .{ .name = "clear", .description = "Clear the screen", .hint = null },
+        .{ .name = "reset", .description = "Reset session", .hint = null },
+        .{ .name = "help", .description = "Show available commands", .hint = null },
+        .{ .name = "status", .description = "Show current status", .hint = null },
+        .{ .name = "model", .description = "Switch model", .hint = "model name" },
+        .{ .name = "permissions", .description = "Show permission settings", .hint = null },
+        .{ .name = "allowlist", .description = "Manage persistent allow rules", .hint = "add command \"git *\"" },
+        .{ .name = "rules", .description = "Show active rules", .hint = null },
+        .{ .name = "settings", .description = "Show settings", .hint = null },
+        .{ .name = "credits", .description = "Show credit balance", .hint = null },
+        .{ .name = "mcp", .description = "Show MCP server status", .hint = null },
+        .{ .name = "skills", .description = "Show installed skills", .hint = null },
+        .{ .name = "fast", .description = "Toggle fast mode for supported models", .hint = null },
+    };
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"sessionId\":");
-    try writeJsonStr(active.session_id, &out.writer);
-    try out.writer.writeAll(",\"update\":");
-    try acp_types.writeUsageUpdate(
-        &out.writer,
-        usage.used,
-        context_window,
-        usage.complete_cost,
-    );
-    try out.writer.writeAll("}");
-    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+    try out.writer.writeAll("[");
+    for (commands, 0..) |cmd, i| {
+        if (i > 0) try out.writer.writeAll(",");
+        try out.writer.writeAll("{\"name\":");
+        try writeJsonStr(cmd.name, &out.writer);
+        try out.writer.writeAll(",\"description\":");
+        try writeJsonStr(cmd.description, &out.writer);
+        if (cmd.hint) |hint| {
+            try out.writer.writeAll(",\"input\":{\"hint\":");
+            try writeJsonStr(hint, &out.writer);
+            try out.writer.writeAll("}");
+        }
+        try out.writer.writeAll("}");
+    }
+    try out.writer.writeAll("]");
+
+    return try alloc.dupe(u8, out.writer.buffered());
 }
 
 fn formatIso8601(alloc: Allocator, timestamp_ms: i64) ![]u8 {
@@ -1484,6 +1162,40 @@ test "formatIso8601 produces valid format" {
     try std.testing.expect(result.len > 0);
     try std.testing.expect(std.mem.endsWith(u8, result, "Z"));
     try std.testing.expect(std.mem.find(u8, result, "T") != null);
+}
+
+test "buildSlashCommandsJson produces valid array" {
+    const alloc = std.testing.allocator;
+    const json = try buildSlashCommandsJson(alloc);
+    defer alloc.free(json);
+    try std.testing.expect(json.len > 0);
+    try std.testing.expect(json[0] == '[');
+    try std.testing.expect(json[json.len - 1] == ']');
+    try std.testing.expect(std.mem.find(u8, json, "compact") != null);
+}
+
+test "buildSlashCommandsJson includes all expected commands" {
+    const alloc = std.testing.allocator;
+    const json = try buildSlashCommandsJson(alloc);
+    defer alloc.free(json);
+
+    const expected_commands = [_][]const u8{
+        "compact",   "undo",  "changes",  "review",  "clear",
+        "reset",     "help",  "status",   "model",   "permissions",
+        "allowlist", "rules", "settings", "credits", "mcp",
+        "skills",    "fast",
+    };
+    for (expected_commands) |cmd| {
+        try std.testing.expect(std.mem.find(u8, json, cmd) != null);
+    }
+    try std.testing.expect(std.mem.find(u8, json, "\"name\":\"summary\"") == null);
+}
+
+test "buildSlashCommandsJson includes input hint for model" {
+    const alloc = std.testing.allocator;
+    const json = try buildSlashCommandsJson(alloc);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"input\":{\"hint\":\"model name\"}") != null);
 }
 
 test "formatIso8601 produces known timestamp" {
@@ -1659,7 +1371,7 @@ test "ACP load maps one-off child denial to invalid params" {
     try std.testing.expect(std.mem.find(
         u8,
         captured,
-        "Subagent child sessions cannot be resumed directly",
+        "One-off child sessions cannot accept additional prompts",
     ) != null);
 }
 
@@ -1739,7 +1451,6 @@ fn acpSessionTestConfig() server.Config {
         .gateway_chat_url = "http://127.0.0.1/unused",
         .gateway_models_path = "/v1/models",
         .gateway_provider = test_builtin_gateway.provider,
-        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "test" },
         .ignored_list_entries = &.{},
@@ -1775,186 +1486,12 @@ fn initAcpSessionTestState(
         .writer = .{ .stdout = capture },
         .workspace_root = workspace,
         .api_key = api_key,
-        .credential_source = .ai_gateway_api_key,
+        .credential_source = .env_var,
         .selected_model = selected_model,
         .configured_model = configured_model,
         .agent_step_limit = 8,
         .max_tool_result_bytes = 64 * 1024,
     };
-}
-
-test "ACP project MCP loading expands workspace environment templates" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.writeFile(io_mod.getIo(), .{
-        .sub_path = "workspace/.mcp.json",
-        .data =
-        \\{"mcpServers":{"expanded":{"command":"${ACP_MCP_COMMAND}","args":["${ACP_MCP_ARG:-fallback}"],"env":{"TOKEN":"${ACP_MCP_TOKEN}"}}}}
-        ,
-    });
-    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-    const workspace_path = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace_path);
-    const test_home = try AcpSessionTestHome.install(alloc, home_path);
-    defer test_home.deinit();
-    try test_home.map.put("ACP_MCP_COMMAND", "node");
-    try test_home.map.put("ACP_MCP_TOKEN", "secret-value");
-    var approved_names = [_][]u8{@constCast("expanded")};
-
-    var result = try workspace_config.load(
-        alloc,
-        workspace_path,
-        .workspace,
-        .{ .approved = &approved_names },
-    );
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
-    const config = result.configs.items[0];
-    try std.testing.expectEqualStrings("node", config.command.?);
-    try std.testing.expectEqualStrings("fallback", config.args[0]);
-    try std.testing.expectEqualStrings("secret-value", config.env[0].value);
-}
-
-test "ACP host-disabled new load and resume skip project MCP effects" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-    const workspace_path = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace_path);
-    const marker_path = try std.fs.path.join(
-        alloc,
-        &.{ workspace_path, "project-mcp-launched" },
-    );
-    defer alloc.free(marker_path);
-    const project_json = try std.fmt.allocPrint(
-        alloc,
-        "{{\"mcpServers\":{{\"fixture\":{{\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf launched > {s}\"]}},\"remote\":{{\"type\":\"http\",\"url\":\"http://127.0.0.1:1/mcp\",\"startup_timeout_ms\":5000}}}}}}",
-        .{marker_path},
-    );
-    defer alloc.free(project_json);
-    try tmp.dir.writeFile(io_mod.getIo(), .{
-        .sub_path = "workspace/.mcp.json",
-        .data = project_json,
-    });
-    try tmp.dir.writeFile(io_mod.getIo(), .{
-        .sub_path = "home/.fx/settings.json",
-        .data = "{}",
-    });
-    const test_home = try AcpSessionTestHome.install(alloc, home_path);
-    defer test_home.deinit();
-
-    var capture = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "acp-host-disabled.jsonl",
-        .{ .read = true },
-    );
-    defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
-    defer state.deinit();
-    state.cfg.allow_acp_mcp = false;
-
-    var new_msg = jsonrpc.Message{
-        .id = .{ .integer = 1 },
-        .method = "session/new",
-        .params_raw = "{\"mcpServers\":[]}",
-    };
-    try handleNewSession(&state, arena, &new_msg);
-    try std.testing.expect(state.active_session.?.mcp == null);
-    const session_id = try alloc.dupe(u8, state.active_session.?.session_id);
-    defer alloc.free(session_id);
-
-    inline for (.{
-        .{ .method = "session/load", .handler = handleLoadSession },
-        .{ .method = "session/resume", .handler = handleResumeSession },
-    }, 0..) |restore, index| {
-        const params = try std.fmt.allocPrint(
-            arena,
-            "{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}",
-            .{session_id},
-        );
-        var msg = jsonrpc.Message{
-            .id = .{ .integer = @intCast(index + 2) },
-            .method = restore.method,
-            .params_raw = params,
-        };
-        try restore.handler(&state, arena, &msg);
-        try std.testing.expect(state.active_session.?.mcp == null);
-    }
-
-    const local_request = try std.fmt.allocPrint(
-        arena,
-        "{{\"name\":\"request-local\",\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf launched > {s}\"],\"env\":[]}}",
-        .{marker_path},
-    );
-    const remote_request =
-        "{\"type\":\"http\",\"name\":\"request-remote\",\"url\":\"http://127.0.0.1:1/mcp\",\"headers\":[]}";
-    inline for (.{
-        .{ .method = "session/new", .handler = handleNewSession, .server = local_request },
-        .{ .method = "session/load", .handler = handleLoadSession, .server = remote_request },
-        .{ .method = "session/resume", .handler = handleResumeSession, .server = local_request },
-    }, 0..) |request, index| {
-        const params = if (std.mem.eql(u8, request.method, "session/new"))
-            try std.fmt.allocPrint(
-                arena,
-                "{{\"mcpServers\":[{s}]}}",
-                .{request.server},
-            )
-        else
-            try std.fmt.allocPrint(
-                arena,
-                "{{\"sessionId\":\"{s}\",\"mcpServers\":[{s}]}}",
-                .{ session_id, request.server },
-            );
-        var msg = jsonrpc.Message{
-            .id = .{ .integer = @intCast(index + 10) },
-            .method = request.method,
-            .params_raw = params,
-        };
-        try request.handler(&state, arena, &msg);
-        try std.testing.expect(state.active_session.?.mcp == null);
-        try std.testing.expectEqualStrings(
-            session_id,
-            state.active_session.?.session_id,
-        );
-    }
-
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.openFile(io_mod.getIo(), "workspace/project-mcp-launched", .{}),
-    );
-    try capture.sync(io_mod.getIo());
-    var captured_file = try tmp.dir.openFile(
-        io_mod.getIo(),
-        "acp-host-disabled.jsonl",
-        .{},
-    );
-    defer captured_file.close(io_mod.getIo());
-    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
-    defer alloc.free(captured);
-    try std.testing.expectEqual(
-        @as(usize, 3),
-        std.mem.count(u8, captured, "MCP servers are unavailable in this runtime"),
-    );
 }
 
 test "ACP new and loaded sessions provide a writable subagent host" {
@@ -1964,7 +1501,7 @@ test "ACP new and loaded sessions provide a writable subagent host" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -2009,8 +1546,8 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         try std.testing.expectEqualStrings("review", new_active.mode);
         try std.testing.expect(new_writable.state.usage != null);
         try std.testing.expect(
-            new_active.session_rt.usage.generation_usage_providers.select(.gateway).?.lookup_fn ==
-                state.cfg.provider_set.deferredUsageProviders().select(.gateway).?.lookup_fn,
+            new_active.session_rt.usage.generation_usage_provider.lookup_fn ==
+                state.cfg.gateway_provider.generation_usage.lookup_fn,
         );
         io_mod.sleep(10 * std.time.ns_per_ms);
         var live_usage = try new_active.session_rt.usage.snapshot(alloc);
@@ -2048,8 +1585,8 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         try std.testing.expect(state.subagent_store != null);
         try std.testing.expect(state.subagent_host != null);
         try std.testing.expect(
-            loaded_active.session_rt.usage.generation_usage_providers.select(.gateway).?.lookup_fn ==
-                state.cfg.provider_set.deferredUsageProviders().select(.gateway).?.lookup_fn,
+            loaded_active.session_rt.usage.generation_usage_provider.lookup_fn ==
+                state.cfg.gateway_provider.generation_usage.lookup_fn,
         );
 
         try capture.sync(io_mod.getIo());
@@ -2077,7 +1614,7 @@ test "ACP same-session restore retires the replaced MCP runtime after active use
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");

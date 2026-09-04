@@ -31,7 +31,7 @@ pub const Metadata = struct {
     }
 };
 
-extern "fx" fn fx_session_load(
+extern "ffx" fn fx_session_load(
     id_ptr: [*]const u8,
     id_len: usize,
     bytes_ptr: [*]u8,
@@ -41,7 +41,7 @@ extern "fx" fn fx_session_load(
     revision_len_out: *usize,
 ) i32;
 
-extern "fx" fn fx_session_commit(
+extern "ffx" fn fx_session_commit(
     id_ptr: [*]const u8,
     id_len: usize,
     bytes_ptr: [*]const u8,
@@ -53,12 +53,12 @@ extern "fx" fn fx_session_commit(
     revision_len_out: *usize,
 ) i32;
 
-extern "fx" fn fx_session_list(
+extern "ffx" fn fx_session_list(
     response_ptr: [*]u8,
     response_cap: usize,
 ) i32;
 
-extern "fx" fn fx_session_remove(
+extern "ffx" fn fx_session_remove(
     id_ptr: [*]const u8,
     id_len: usize,
 ) i32;

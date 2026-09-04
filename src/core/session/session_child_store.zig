@@ -502,19 +502,6 @@ const CapabilityImpl = struct {
 pub const SessionChildCapability = struct {
     impl: *CapabilityImpl,
 
-    pub fn duplicate(
-        self: *const SessionChildCapability,
-        alloc: Allocator,
-    ) !SessionChildCapability {
-        return initWithOptions(
-            alloc,
-            self.impl.session_dir.dir,
-            self.impl.display_session_path,
-            self.impl.mode,
-            .{},
-        );
-    }
-
     pub fn init(
         alloc: Allocator,
         session_dir: std.Io.Dir,
@@ -770,7 +757,7 @@ pub const SessionChildCapability = struct {
     }
 
     /// Opens a capability restricted to holder proofs in the owning durable
-    /// fx session. It does not imply access to host-owned terminal state.
+    /// ffx session. It does not imply access to host-owned terminal state.
     pub fn initTerminalProofs(
         alloc: Allocator,
         session_dir: std.Io.Dir,
@@ -799,26 +786,6 @@ pub const SessionChildCapability = struct {
         self.impl.deinit();
         alloc.destroy(self.impl);
         self.* = undefined;
-    }
-
-    pub fn cloneReadOnly(
-        self: *const SessionChildCapability,
-        alloc: Allocator,
-    ) !SessionChildCapability {
-        if (self.impl.legacy_direct_kind != null or
-            self.impl.legacy_background_root)
-        {
-            return error.SessionChildStoreFailed;
-        }
-        var cloned = try initWithOptions(
-            alloc,
-            self.impl.session_dir.dir,
-            self.impl.display_session_path,
-            .read_only,
-            .{},
-        );
-        cloned.impl.allowed_kind = self.impl.allowed_kind;
-        return cloned;
     }
 
     pub fn createExclusiveFile(
@@ -994,9 +961,7 @@ pub const SessionChildCapability = struct {
                 else => return err,
             };
             try verifyPrivateStat(file_stat);
-            const owned_name = try alloc.dupe(u8, entry.name);
-            errdefer alloc.free(owned_name);
-            try names.append(alloc, owned_name);
+            try names.append(alloc, try alloc.dupe(u8, entry.name));
         }
         return .{
             .alloc = alloc,
@@ -1448,53 +1413,6 @@ test "managed child capability rejects invalid names and unsafe routes" {
     try std.testing.expectError(
         error.SessionPathUnsafe,
         capability.iterate(alloc, .browser_artifacts),
-    );
-}
-
-test "read-only capability clone owns independent retained routes" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try openTestSession(alloc, &tmp);
-    defer session.dir.close(io_mod.getIo());
-    defer alloc.free(session.display_path);
-    var original = try SessionChildCapability.initForTesting(
-        alloc,
-        session.dir,
-        session.display_path,
-        .writable,
-        .{},
-    );
-    var original_open = true;
-    defer if (original_open) original.deinit();
-
-    var file = try original.createExclusiveFile(
-        alloc,
-        .tool_results,
-        "result.txt",
-    );
-    try file.writeAll("retained result");
-    try file.sync();
-    file.deinit();
-
-    var cloned = try original.cloneReadOnly(alloc);
-    defer cloned.deinit();
-    original.deinit();
-    original_open = false;
-
-    var retained = try cloned.openFileReadOnly(
-        alloc,
-        .tool_results,
-        "result.txt",
-    );
-    defer retained.deinit();
-    const bytes = try retained.readToEnd(alloc, 64);
-    defer alloc.free(bytes);
-    try std.testing.expectEqualStrings("retained result", bytes);
-    try std.testing.expectError(
-        error.SessionChildReadOnly,
-        cloned.createExclusiveFile(alloc, .tool_results, "blocked.txt"),
     );
 }
 

@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FFX_BIN, runFx } from "../evals/eval-helpers";
 import {
   fakeGatewayFinalText,
   startFakeGateway,
@@ -68,27 +68,18 @@ class LineClient {
     );
   }
 
-  async readResponse(id: number, timeoutMs = TIMEOUT): Promise<any> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const message = await this.read(Math.max(1, deadline - Date.now()));
-      if (message.id === id) return message;
-    }
-    throw new Error(`timed out waiting for ACP response id=${id}`);
-  }
-
   kill(): void {
     this.proc.kill("SIGKILL");
   }
 }
 
 function startAcp(cwd: string, home: string, extraEnv: Record<string, string> = {}): LineClient {
-  return new LineClient(spawn(FX_BIN, ["acp"], {
+  return new LineClient(spawn(FFX_BIN, ["acp"], {
     cwd,
     env: {
       ...process.env,
       HOME: home,
-      AI_GATEWAY_API_KEY: "e2e-placeholder",
+      FFX_PROVIDER_API_KEY: "e2e-placeholder",
       VERCEL_OIDC_TOKEN: "",
       NO_COLOR: "1",
       ...extraEnv,
@@ -110,9 +101,9 @@ async function createSession(cwd: string, home: string): Promise<string> {
   const client = startAcp(cwd, home);
   try {
     client.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-    expect((await client.readResponse(1)).result).toBeDefined();
+    expect((await client.read()).result).toBeDefined();
     client.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
-    const response = await client.readResponse(2);
+    const response = await client.read();
     expect(response.result?.sessionId).toBeDefined();
     return response.result.sessionId;
   } finally {
@@ -121,7 +112,7 @@ async function createSession(cwd: string, home: string): Promise<string> {
 }
 
 function sessionIdsFromHome(home: string): string[] {
-  const sessionsRoot = join(home, ".fx", "sessions");
+  const sessionsRoot = join(home, ".ffx", "sessions");
   return readdirSync(sessionsRoot, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && entry.name !== "latest")
     .map((entry) => entry.name);
@@ -136,7 +127,7 @@ describe("session recovery", () => {
     test(
       `process death at ${boundary} leaves an uncommitted orphan`,
       async () => {
-        const root = mkdtempSync(join(tmpdir(), "fx-session-pre-authority-"));
+        const root = mkdtempSync(join(tmpdir(), "ffx-session-pre-authority-"));
         try {
           const home = join(root, "home");
           const workspace = join(root, "workspace");
@@ -146,11 +137,11 @@ describe("session recovery", () => {
           const workspaceRoot = realpathSync(workspace);
 
           const first = startAcp(workspaceRoot, home, {
-            FX_E2E_SESSION_BOUNDARY: boundary,
-            FX_E2E_SESSION_BOUNDARY_READY: ready,
+            FFX_E2E_SESSION_BOUNDARY: boundary,
+            FFX_E2E_SESSION_BOUNDARY_READY: ready,
           });
           first.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await first.readResponse(1)).result).toBeDefined();
+          expect((await first.read()).result).toBeDefined();
           first.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
           await waitForPath(ready);
           first.kill();
@@ -191,7 +182,7 @@ describe("session recovery", () => {
     test(
       `writable load confirms proposed authority after ${boundary}`,
       async () => {
-        const root = mkdtempSync(join(tmpdir(), "fx-session-post-authority-"));
+        const root = mkdtempSync(join(tmpdir(), "ffx-session-post-authority-"));
         try {
           const home = join(root, "home");
           const workspace = join(root, "workspace");
@@ -201,11 +192,11 @@ describe("session recovery", () => {
           const workspaceRoot = realpathSync(workspace);
 
           const first = startAcp(workspaceRoot, home, {
-            FX_E2E_SESSION_BOUNDARY: boundary,
-            FX_E2E_SESSION_BOUNDARY_READY: ready,
+            FFX_E2E_SESSION_BOUNDARY: boundary,
+            FFX_E2E_SESSION_BOUNDARY_READY: ready,
           });
           first.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await first.readResponse(1)).result).toBeDefined();
+          expect((await first.read()).result).toBeDefined();
           first.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
           await waitForPath(ready);
           first.kill();
@@ -221,9 +212,9 @@ describe("session recovery", () => {
 
           const resolver = startAcp(workspaceRoot, home);
           resolver.send({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await resolver.readResponse(3)).result).toBeDefined();
+          expect((await resolver.read()).result).toBeDefined();
           resolver.send({ jsonrpc: "2.0", id: 4, method: "session/load", params: { sessionId, mcpServers: [] } });
-          expect((await resolver.readResponse(4)).result).toBeDefined();
+          expect((await resolver.read()).result).toBeDefined();
           resolver.kill();
 
           const detail = await runFx(["session", "--id", sessionId, "--json"], {
@@ -241,7 +232,7 @@ describe("session recovery", () => {
   }
 
   test("doctor removes only a validated noncurrent watermark", async () => {
-    const root = mkdtempSync(join(tmpdir(), "fx-session-doctor-cleanup-"));
+    const root = mkdtempSync(join(tmpdir(), "ffx-session-doctor-cleanup-"));
     try {
       const home = join(root, "home");
       const workspace = join(root, "workspace");
@@ -249,7 +240,7 @@ describe("session recovery", () => {
       mkdirSync(workspace);
       const workspaceRoot = realpathSync(workspace);
       const sessionId = await createSession(workspaceRoot, home);
-      const sessionDir = join(home, ".fx", "sessions", sessionId);
+      const sessionDir = join(home, ".ffx", "sessions", sessionId);
       const currentName = readdirSync(sessionDir).find(
         (name) => name.startsWith("commit.") && name.endsWith(".json"),
       )!;
@@ -277,7 +268,7 @@ describe("session recovery", () => {
   });
 
   test("session recover copies a corrupt-watermark session without changing its source", async () => {
-    const root = mkdtempSync(join(tmpdir(), "fx-session-copy-recovery-"));
+    const root = mkdtempSync(join(tmpdir(), "ffx-session-copy-recovery-"));
     try {
       const home = join(root, "home");
       const workspace = join(root, "workspace");
@@ -288,25 +279,25 @@ describe("session recovery", () => {
 
       const writer = startAcp(workspaceRoot, home);
       writer.send({ jsonrpc: "2.0", id: 10, method: "initialize", params: { protocolVersion: 1 } });
-      expect((await writer.readResponse(10)).result).toBeDefined();
+      expect((await writer.read()).result).toBeDefined();
       writer.send({
         jsonrpc: "2.0",
         id: 11,
         method: "session/load",
         params: { sessionId, mcpServers: [] },
       });
-      expect((await writer.readResponse(11)).result).toBeDefined();
+      expect((await writer.read()).result).toBeDefined();
       writer.send({
         jsonrpc: "2.0",
         id: 12,
         method: "session/set_config_option",
-        params: { sessionId, configId: "model", value: "o4-mini" },
+        params: { configId: "model", value: "o4-mini" },
       });
-      expect((await writer.readResponse(12)).result).toBeDefined();
+      expect((await writer.read()).result).toBeDefined();
       writer.kill();
       await Bun.sleep(100);
 
-      const sessionDir = join(home, ".fx", "sessions", sessionId);
+      const sessionDir = join(home, ".ffx", "sessions", sessionId);
       const watermarkName = readdirSync(sessionDir).find(
         (name) => name.startsWith("commit.") && name.endsWith(".json"),
       )!;
@@ -319,7 +310,7 @@ describe("session recovery", () => {
       });
       expect(doctor.code).toBe(0);
       expect(doctor.stdout).toContain("commit_watermark_invalid");
-      expect(doctor.stdout).toContain(`fx session recover ${sessionId}`);
+      expect(doctor.stdout).toContain(`ffx session recover ${sessionId}`);
 
       const recovery = await runFx(
         ["session", "recover", sessionId, "--json"],
@@ -362,10 +353,10 @@ describe("session recovery", () => {
             cwd: workspaceRoot,
             env: {
               HOME: home,
-              AI_GATEWAY_API_KEY: "e2e-placeholder",
+              FFX_PROVIDER_API_KEY: "e2e-placeholder",
               VERCEL_OIDC_TOKEN: "",
-              FX_GATEWAY_BASE_URL: gateway.baseUrl,
-              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
             },
           },
         );
@@ -392,7 +383,7 @@ describe("session recovery", () => {
       expect(JSON.parse(sourceDetail.stdout)).toEqual(
         expect.objectContaining({
           code: "InvalidSessionFormat",
-          error: `session ${sessionId} is corrupt; run \`fx session recover ${sessionId}\``,
+          error: `session ${sessionId} is corrupt; run \`ffx session recover ${sessionId}\``,
         }),
       );
     } finally {
@@ -401,7 +392,7 @@ describe("session recovery", () => {
   });
 
   test("cross-workspace recovery preserves both resume-last pointers", async () => {
-    const root = mkdtempSync(join(tmpdir(), "fx-session-cross-workspace-recovery-"));
+    const root = mkdtempSync(join(tmpdir(), "ffx-session-cross-workspace-recovery-"));
     try {
       const home = join(root, "home");
       const workspaceA = join(root, "workspace-a");
@@ -418,7 +409,7 @@ describe("session recovery", () => {
       await Bun.sleep(10);
       const newestBId = await createSession(workspaceBRoot, home);
 
-      const sourceDir = join(home, ".fx", "sessions", sourceId);
+      const sourceDir = join(home, ".ffx", "sessions", sourceId);
       const watermarkName = readdirSync(sourceDir).find(
         (name) => name.startsWith("commit.") && name.endsWith(".json"),
       )!;
@@ -440,10 +431,10 @@ describe("session recovery", () => {
       ]);
       const resumeEnv = {
         HOME: home,
-        AI_GATEWAY_API_KEY: "e2e-placeholder",
+        FFX_PROVIDER_API_KEY: "e2e-placeholder",
         VERCEL_OIDC_TOKEN: "",
-        FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
       };
       try {
         const resumedA = await runFx(
@@ -470,12 +461,12 @@ describe("session recovery", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  }, TIMEOUT);
+  });
 
   test(
     "process death after authority intent leaves a fenced orphan for writable resolution",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-session-recovery-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-session-recovery-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -486,17 +477,17 @@ describe("session recovery", () => {
         const workspaceRoot = realpathSync(workspace);
 
         const first = startAcp(workspaceRoot, home, {
-          FX_E2E_SESSION_BOUNDARY: "after_authority_intent_sync",
-          FX_E2E_SESSION_BOUNDARY_READY: ready,
+          FFX_E2E_SESSION_BOUNDARY: "after_authority_intent_sync",
+          FFX_E2E_SESSION_BOUNDARY_READY: ready,
         });
         first.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-        expect((await first.readResponse(1)).result).toBeDefined();
+        expect((await first.read()).result).toBeDefined();
         first.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
         await waitForPath(ready);
         first.kill();
         await Bun.sleep(100);
 
-        const sessionsRoot = join(home, ".fx", "sessions");
+        const sessionsRoot = join(home, ".ffx", "sessions");
         const ids = sessionIdsFromHome(home);
         expect(ids).toHaveLength(1);
         const sessionId = ids[0]!;
@@ -527,12 +518,12 @@ describe("session recovery", () => {
         });
 
         const resolver = startAcp(workspaceRoot, home, {
-          FX_TRACE_LOG: resolverTrace,
+          FFX_TRACE_LOG: resolverTrace,
         });
         resolver.send({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: 1 } });
-        expect((await resolver.readResponse(3)).result).toBeDefined();
+        expect((await resolver.read()).result).toBeDefined();
         resolver.send({ jsonrpc: "2.0", id: 4, method: "session/load", params: { sessionId, mcpServers: [] } });
-        const loadResponse = await resolver.readResponse(4);
+        const loadResponse = await resolver.read();
         resolver.kill();
         expect(readFileSync(resolverTrace, "utf8")).toContain(
           "session operation=load outcome=failed error=SessionNotFound",
@@ -579,7 +570,7 @@ describe("session recovery", () => {
     test(
       `model commit recovers after process death at ${boundary}`,
       async () => {
-        const root = mkdtempSync(join(tmpdir(), "fx-session-commit-"));
+        const root = mkdtempSync(join(tmpdir(), "ffx-session-commit-"));
         try {
           const home = join(root, "home");
           const workspace = join(root, "workspace");
@@ -590,18 +581,18 @@ describe("session recovery", () => {
           const sessionId = await createSession(workspaceRoot, home);
 
           const writer = startAcp(workspaceRoot, home, {
-            FX_E2E_SESSION_BOUNDARY: boundary,
-            FX_E2E_SESSION_BOUNDARY_READY: ready,
+            FFX_E2E_SESSION_BOUNDARY: boundary,
+            FFX_E2E_SESSION_BOUNDARY_READY: ready,
           });
           writer.send({ jsonrpc: "2.0", id: 10, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await writer.readResponse(10)).result).toBeDefined();
+          expect((await writer.read()).result).toBeDefined();
           writer.send({ jsonrpc: "2.0", id: 11, method: "session/load", params: { sessionId, mcpServers: [] } });
-          expect((await writer.readResponse(11)).result).toBeDefined();
+          expect((await writer.read()).result).toBeDefined();
           writer.send({
             jsonrpc: "2.0",
             id: 12,
             method: "session/set_config_option",
-            params: { sessionId, configId: "model", value: "o4-mini" },
+            params: { configId: "model", value: "o4-mini" },
           });
           await waitForPath(ready);
           writer.kill();
@@ -609,7 +600,7 @@ describe("session recovery", () => {
 
           const intentPath = join(
             home,
-            ".fx",
+            ".ffx",
             "sessions",
             sessionId,
             "commit.pending.json",
@@ -624,9 +615,9 @@ describe("session recovery", () => {
 
           const resolver = startAcp(workspaceRoot, home);
           resolver.send({ jsonrpc: "2.0", id: 20, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await resolver.readResponse(20)).result).toBeDefined();
+          expect((await resolver.read()).result).toBeDefined();
           resolver.send({ jsonrpc: "2.0", id: 21, method: "session/load", params: { sessionId, mcpServers: [] } });
-          const loaded = await resolver.readResponse(21);
+          const loaded = await resolver.read();
           expect(loaded.result).toBeDefined();
           const loadedModel = loaded.result.configOptions.find(
             (option: { id: string; currentValue: string }) => option.id === "model",

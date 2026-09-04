@@ -8,10 +8,12 @@ const input_limit_rejection = @import("../input/input_limit_rejection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
 const question_freeform_layout = @import("../../ui/footer/question_freeform_layout.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
+const input_queue_runtime = @import("input_queue_runtime.zig");
 
 pub fn QuestionRuntime(comptime App: type) type {
     return struct {
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
+        const queue_rt = input_queue_runtime.Runtime(App);
 
         pub fn handleQuestionAction(app: *App, action: question_prompt.Action) !bool {
             return switch (try handleQuestionActionWithLimit(app, action, null)) {
@@ -61,8 +63,8 @@ pub fn QuestionRuntime(comptime App: type) type {
             const mcp_elicitation = isMcpElicitationPrompt(app);
             interrupt.traceInterruptRequested(app, "input_question");
             if (!route_recovery) {
-                if (comptime @hasDecl(@TypeOf(app.worker), "requestInteractiveCancel")) {
-                    app.worker.requestInteractiveCancel();
+                if (comptime @hasField(App, "queued_prompt_review")) {
+                    _ = queue_rt.requestCancelAndOpen(app);
                 } else {
                     app.worker.requestCancel();
                 }

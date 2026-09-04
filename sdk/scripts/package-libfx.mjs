@@ -22,9 +22,6 @@ const files = [
   ["sdk/browser.js", "browser.js"],
   ["sdk/node.js", "node.js"],
   ["sdk/fx-sdk.js", "fx-sdk.js"],
-  ["sdk/mcp.js", "mcp.js"],
-  ["sdk/skills.js", "skills.js"],
-  ["sdk/skills-node.js", "skills-node.js"],
   ["zig-out/bin/fx-core.wasm", "fx-core.wasm"],
   ["zig-out/bin/fx-term.wasm", "fx-term.wasm"],
 ];

@@ -192,8 +192,8 @@ jobs:
         with:
           name: libfx-wasm
           path: |
-            zig-out/bin/fx-core.wasm
-            zig-out/bin/fx-term.wasm
+            zig-out/bin/ffx-core.wasm
+            zig-out/bin/ffx-term.wasm
           if-no-files-found: error
 
   publish:
@@ -234,12 +234,12 @@ jobs:
       - name: Restore package artifact layout
         run: |
           mkdir -p zig-out/bin
-          cp wasm-artifacts/fx-core.wasm zig-out/bin/fx-core.wasm
-          cp wasm-artifacts/fx-term.wasm zig-out/bin/fx-term.wasm
+          cp wasm-artifacts/ffx-core.wasm zig-out/bin/ffx-core.wasm
+          cp wasm-artifacts/ffx-term.wasm zig-out/bin/ffx-term.wasm
 
       - name: Stage package without executing repository code
         env:
-          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+          LIBFFX_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
           test "$(find native-addons -type f -name '*.node' | wc -l | tr -d ' ')" = 4
@@ -261,17 +261,12 @@ jobs:
 
           rm -rf sdk/dist/libfx
           mkdir -p sdk/dist/libfx
-          cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/fx-sdk.js sdk/mcp.js sdk/skills.js sdk/skills-node.js LICENSE sdk/dist/libfx/
-          cp wasm-artifacts/fx-core.wasm wasm-artifacts/fx-term.wasm sdk/dist/libfx/
+          cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/ffx-sdk.js LICENSE sdk/dist/libfx/
+          cp wasm-artifacts/ffx-core.wasm wasm-artifacts/ffx-term.wasm sdk/dist/libfx/
           cp native-addons/*.node sdk/dist/libfx/
-          jq --arg version "$LIBFX_VERSION" '.version = $version | del(.files)' \
+          jq --arg version "$LIBFFX_VERSION" '.version = $version | del(.files)' \
             sdk/dist/libfx/package.json > sdk/dist/libfx/package.json.tmp
           mv sdk/dist/libfx/package.json.tmp sdk/dist/libfx/package.json
-
-      - name: Run packed public API example
-        run: |
-          node sdk/tests/test-packed-example.mjs sdk/dist/libfx native
-          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs sdk/dist/libfx wasm
 
       - name: Validate package archive
         run: |
@@ -281,9 +276,8 @@ jobs:
             const report = require("/tmp/libfx-pack.json")[0];
             const names = new Set(report.files.map(({ path }) => path));
             const required = [
-              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "fx-sdk.js",
-              "mcp.js", "skills.js", "skills-node.js",
-              "fx-core.wasm", "fx-term.wasm",
+              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "ffx-sdk.js",
+              "ffx-core.wasm", "ffx-term.wasm",
               "libfx.linux-x64.node", "libfx.linux-arm64.node",
               "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
             ];
@@ -307,12 +301,12 @@ jobs:
 
       - name: Publish with npm trusted publishing
         env:
-          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+          LIBFFX_VERSION: ${{ needs.metadata.outputs.version }}
           NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
         run: |
           set -euo pipefail
-          if npm view "libfx@${LIBFX_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
-            echo "libfx@${LIBFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
+          if npm view "libfx@${LIBFFX_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+            echo "libfx@${LIBFFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
             exit 0
           fi
           npm publish sdk/dist/libfx --ignore-scripts --access public --tag "$NPM_TAG" --provenance

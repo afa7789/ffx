@@ -60,11 +60,7 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
 
     const owned_pattern = try ctx.allocator.dupe(u8, pattern_value.string);
     errdefer ctx.allocator.free(owned_pattern);
-    const effective_path = if (path_string) |path|
-        if (path.len == 0) "." else path
-    else
-        ".";
-    const owned_path = try ctx.allocator.dupe(u8, effective_path);
+    const owned_path = try ctx.allocator.dupe(u8, path_string orelse ".");
     errdefer ctx.allocator.free(owned_path);
 
     const input = try ctx.allocator.create(Input);
@@ -443,7 +439,7 @@ fn noopInputDeinit(_: *anyopaque, _: Allocator) void {}
 const glob_files_dispatch_tool = tool_dispatch.Tool{
     .name = "glob_files",
     .description = "Glob files dispatch test fixture.",
-    .model_schema = .{
+    .gateway_schema = .{
         .name = "glob_files",
         .description = "Glob files dispatch test fixture.",
     },
@@ -612,7 +608,6 @@ test "glob_files decodes invalid argument shapes as failures" {
 
 test "glob_files decodes omitted path and valid input" {
     try expectDecodeInput("{\"pattern\":\"*.zig\"}", "*.zig", ".");
-    try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":\"\"}", "*.zig", ".");
     try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":\"src\"}", "*.zig", "src");
     try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":1}", "*.zig", ".");
 }
@@ -750,7 +745,7 @@ test "glob_files resolver error for missing path returns failure result" {
 test "glob_files permission denied directory returns structured recovery" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    const root = try std.fmt.allocPrint(alloc, "/tmp/fx-glob-files-access-{d}", .{io_mod.nanoTimestamp()});
+    const root = try std.fmt.allocPrint(alloc, "/tmp/ffx-glob-files-access-{d}", .{io_mod.nanoTimestamp()});
     defer alloc.free(root);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), root) catch {};
     try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), root);
@@ -991,7 +986,7 @@ test "glob_files allows external absolute path search roots" {
     const alloc = std.testing.allocator;
     // Keep the external root out of std.testing.tmpDir(), whose generated path
     // may contain ignored component names and invalidate this absolute-path case.
-    const root = try std.fmt.allocPrint(alloc, "/tmp/fx-glob-external-{d}", .{io_mod.nanoTimestamp()});
+    const root = try std.fmt.allocPrint(alloc, "/tmp/ffx-glob-external-{d}", .{io_mod.nanoTimestamp()});
     defer alloc.free(root);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), root) catch {};
     const workspace_dir = try std.fs.path.join(alloc, &.{ root, "workspace" });

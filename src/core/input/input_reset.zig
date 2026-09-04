@@ -41,7 +41,6 @@ pub const State = struct {
         self.picker.model_completion_window_start = 0;
         self.picker.resetFilePickerIndex();
         self.picker.clearModelPickerFlow();
-        self.picker.clearProviderPickerFlow();
         self.composer_history.resetNavigation(alloc);
         self.edit_history.reset(alloc);
     }

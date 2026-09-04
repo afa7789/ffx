@@ -10,7 +10,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT, providerVersionTestEnv } from "../evals/eval-helpers";
+import { FFX_BIN, REPO_ROOT } from "../evals/eval-helpers";
 
 let sessionCounter = 0;
 
@@ -24,23 +24,18 @@ const AUTH_ENV_KEYS = [
 ] as const;
 const DEFAULT_UNSET_ENV_KEYS = [
   ...AUTH_ENV_KEYS,
-  "FX_E2E_GATEWAY_CHAT_URL",
-  "FX_E2E_GATEWAY_MODELS_URL",
-  "FX_E2E_GATEWAY_CREDITS_URL",
-  "FX_E2E_UPGRADE_BASE_URL",
-  "FX_PERMISSION_MODE",
+  "FFX_E2E_GATEWAY_CHAT_URL",
+  "FFX_E2E_GATEWAY_MODELS_URL",
+  "FFX_E2E_GATEWAY_CREDITS_URL",
+  "FFX_E2E_UPGRADE_BASE_URL",
+  "FFX_PERMISSION_MODE",
 ] as const;
 const MIRRORED_ENV_KEYS = [
-  "FX_GATEWAY_BASE_URL",
-  "FX_GATEWAY_CHAT_URL",
-  "FX_MAX_AGENT_STEPS",
-  "FX_MODEL",
+  "FFX_GATEWAY_BASE_URL",
+  "FFX_GATEWAY_CHAT_URL",
+  "FFX_MAX_AGENT_STEPS",
+  "FFX_MODEL",
 ] as const;
-
-export function canonicalSubagentIdForStore(childId: string): string {
-  const match = /^(\d+)-(\d{6})-([0-9a-f]{16})$/.exec(childId);
-  return match ? `${match[1]}-${match[1]}${match[2]}-${match[3]}` : childId;
-}
 
 export function terminalFixtureShell(): string {
   for (const path of ["/bin/zsh", "/bin/bash"]) {
@@ -153,21 +148,6 @@ export function fakeGatewayToolCall(
   ]);
 }
 
-export function fakeShellRun(
-  id: string,
-  command: string,
-  options: Record<string, unknown> = {},
-) {
-  return fakeGatewayToolCall(id, "shell", {
-    request: {
-      yield_time_ms: 30_000,
-      ...options,
-      action: "run",
-      command,
-    },
-  });
-}
-
 export function fakeGatewayPermissionDecision(
   decision: "clear" | "caution" = "clear",
   toolCallId = "permission_decision_1",
@@ -178,6 +158,15 @@ export function fakeGatewayPermissionDecision(
     decision,
     rationale,
   });
+}
+
+export function classifierEvidenceFromRequest(body: string): string {
+  const parsed = JSON.parse(body) as any;
+  const instruction = parsed.prompt.at(-1);
+  if (instruction?.role !== "system" || typeof instruction.content !== "string") {
+    throw new Error("classifier instruction missing");
+  }
+  return instruction.content;
 }
 
 export function fakeGatewaySerializedToolCall(
@@ -445,9 +434,9 @@ export class TmuxSession {
     socketName?: string;
   }): Promise<TmuxSession> {
     const {
-      cmd = FX_BIN,
+      cmd = FFX_BIN,
       cwd = REPO_ROOT,
-      env: requestedEnv = {},
+      env = {},
       width = 120,
       height = 40,
       stderrPath,
@@ -457,7 +446,6 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
-    const env = providerVersionTestEnv(requestedEnv);
 
     if (
       minimumHistoryLines !== undefined &&
@@ -469,9 +457,9 @@ export class TmuxSession {
     }
 
     const sequence = ++sessionCounter;
-    const name = `fx-test-${process.pid}-${sequence}`;
+    const name = `ffx-test-${process.pid}-${sequence}`;
     const resolvedSocketName = socketName ?? (isolated
-      ? `fx-e2e-${process.pid}-${sequence}-${Date.now()}`
+      ? `ffx-e2e-${process.pid}-${sequence}-${Date.now()}`
       : undefined);
     const startGate = `${name}-start`;
     const exitStatusPath = join(tmpdir(), `${name}.exit-status`);
@@ -502,9 +490,9 @@ export class TmuxSession {
       value === undefined ? [] : [shellQuote(`${key}=${value}`)]
     );
     const defaultArgs = [
-      ["FX_DISABLE_KEYCHAIN", "1"],
-      ["FX_SKIP_ONBOARDING", "1"],
-      ["FX_SOUND", "0"],
+      ["FFX_DISABLE_KEYCHAIN", "1"],
+      ["FFX_SKIP_ONBOARDING", "1"],
+      ["FFX_SOUND", "0"],
     ].flatMap(([key, value]) =>
       Object.prototype.hasOwnProperty.call(env, key) ? [] : [shellQuote(`${key}=${value}`)]
     );
@@ -525,9 +513,9 @@ export class TmuxSession {
     );
     const processEnv = {
       ...process.env,
-      FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
-      FX_SOUND: process.env.FX_SOUND ?? "0",
+      FFX_DISABLE_KEYCHAIN: "1",
+      FFX_SKIP_ONBOARDING: "1",
+      FFX_SOUND: process.env.FFX_SOUND ?? "0",
     };
     for (const key of DEFAULT_UNSET_ENV_KEYS) delete processEnv[key];
 
@@ -859,7 +847,7 @@ export class TmuxSession {
   }
 
   /**
-   * Complete pane history including the ANSI sequences emitted by fx.
+   * Complete pane history including the ANSI sequences emitted by ffx.
    * Keep this separate from the viewport capture so transcript-order tests
    * inspect all committed output rather than only the visible rows.
    */
@@ -881,7 +869,7 @@ export class TmuxSession {
 
   /**
    * Current pane title, which is what a terminal renders as the tab label.
-   * fx sets it through OSC 2, so this reads back what the user would see.
+   * ffx sets it through OSC 2, so this reads back what the user would see.
    */
   async paneTitle(): Promise<string> {
     try {
@@ -899,7 +887,7 @@ export class TmuxSession {
   }
 
   /**
-   * Resize the tmux window. Delivers a real SIGWINCH to fx, exercising the
+   * Resize the tmux window. Delivers a real SIGWINCH to ffx, exercising the
    * resize pipeline end-to-end. Default post-resize sleep covers the 100 ms
    * debounce in src/main.zig.
    */

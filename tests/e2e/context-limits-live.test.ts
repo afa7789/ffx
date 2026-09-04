@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HAS_API_KEY, runFx } from "../evals/eval-helpers";
 
-const LIVE_ENABLED = process.env.FX_E2E_REAL_API === "1";
+const LIVE_ENABLED = process.env.FFX_E2E_REAL_API === "1";
 const TIMEOUT = 180_000;
 const MODEL = "openai/gpt-5";
 
@@ -12,7 +12,7 @@ describe.skipIf(!LIVE_ENABLED || !HAS_API_KEY)("live source context limits", () 
   test(
     "fresh binary sends a bounded real Gateway request and returns normally",
     async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-context-limits-live-")));
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-context-limits-live-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const skillDirectory = join(
@@ -22,10 +22,10 @@ describe.skipIf(!LIVE_ENABLED || !HAS_API_KEY)("live source context limits", () 
         "live-context-probe",
       );
       const tracePath = join(root, "trace.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(skillDirectory, { recursive: true });
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({
           model: MODEL,
           context_limits: { skill_description_bytes: 16 },
@@ -59,13 +59,13 @@ describe.skipIf(!LIVE_ENABLED || !HAS_API_KEY)("live source context limits", () 
             cwd: workspace,
             env: {
               HOME: home,
-              FX_MODEL: MODEL,
-              FX_AUTO_UPGRADE: "0",
-              FX_GATEWAY_BASE_URL: undefined,
-              FX_GATEWAY_CHAT_URL: undefined,
-              FX_E2E_GATEWAY_CHAT_URL: undefined,
-              FX_TRACE_LOG: tracePath,
-              FX_TRACE_SCOPES: "agent,gateway,stream",
+              FFX_MODEL: MODEL,
+              FFX_AUTO_UPGRADE: "0",
+              FFX_GATEWAY_BASE_URL: undefined,
+              FFX_GATEWAY_CHAT_URL: undefined,
+              FFX_E2E_GATEWAY_CHAT_URL: undefined,
+              FFX_TRACE_LOG: tracePath,
+              FFX_TRACE_SCOPES: "agent,gateway,stream",
             },
             timeoutMs: TIMEOUT,
           },

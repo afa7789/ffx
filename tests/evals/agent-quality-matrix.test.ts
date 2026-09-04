@@ -16,16 +16,16 @@ import {
 
 const INITIAL_OR_RUNNABLE_PROMPTS = [
   "Investigate how this repo changelog works in the GitHub repo.",
-  "Look for changes/last commits in fx.",
+  "Look for changes/last commits in ffx.",
   "Find where slash commands are defined.",
   "Find every use of command policy.",
   "Investigate how command policy is wired in this repo.",
   "What does the MCP feature do in this repo?",
   "Investigate how the current GitHub repo changelog works; do not ask me for my GitHub handle.",
-  "Read https://github.com/vercel-labs/fx/pull/57 comments, and if gh is missing or unauthenticated report the blocker.",
+  "Read https://github.com/vercel-labs/ffx/pull/57 comments, and if gh is missing or unauthenticated report the blocker.",
   "Remove either the logs directory or the session cache, whichever you think is safer.",
   "Prepare release notes, but first choose whether this should be a patch, minor, or major release.",
-  "Read https://github.com/vercel-labs/fx/pull/57 comments.",
+  "Read https://github.com/vercel-labs/ffx/pull/57 comments.",
   "A command failed, retry it.",
   "Continue.",
   "What are you doing right now?",
@@ -135,13 +135,13 @@ describe("agent quality baseline matrix", () => {
 
     const goodRecording: RecordedToolCall[] = [
       {
-        name: "shell",
+        name: "terminal",
         command_result: { command: "git log --oneline -5" },
       },
     ];
     const wrongCommand: RecordedToolCall[] = [
       {
-        name: "shell",
+        name: "terminal",
         command_result: { command: "gh pr list" },
       },
     ];
@@ -177,8 +177,10 @@ describe("agent quality baseline matrix", () => {
     const largeOutput = matrixRowById("large-output-retained");
 
     expect(slashCommand?.expectedFirstTool.tools).toEqual([
+      "list_files",
       "glob_files",
       "grep_files",
+      "semantic_search",
       "read_file",
     ]);
     expect(slashCommand?.targetResult).toContain(
@@ -200,14 +202,14 @@ describe("agent quality baseline matrix", () => {
     expect(commandPolicyProgress?.targetResult).toContain("exits 0");
     expect(firstToolMatchesExpectation(commandPolicyProgress!, { name: "read_file" })).toBe(true);
     expect(firstToolMatchesExpectation(commandPolicyProgress!, {
-      name: "shell",
+      name: "terminal",
       command_result: { command: "grep command_policy -R src" },
     })).toBe(false);
     expect(forbiddenToolsUsed(commandPolicyProgress!, [{ name: "web_search" }])).toEqual([
       "web_search",
     ]);
 
-    expect(mcpConcept?.expectedFirstTool.tools).toContain("glob_files");
+    expect(mcpConcept?.expectedFirstTool.tools).toContain("semantic_search");
     expect(mcpConcept?.targetResult).toContain("local inspection");
 
     expect(largeOutput?.failureCategory).toBe("large output");
@@ -253,36 +255,30 @@ describe("agent quality baseline matrix", () => {
     ).toEqual(["ask_user_question"]);
 
     expect(firstToolMatchesExpectation(ghBlockerRow!, {
-      name: "shell",
-      command_result: { command: "gh pr view 57 --repo vercel-labs/fx --comments" },
+      name: "terminal",
+      command_result: { command: "gh pr view 57 --repo vercel-labs/ffx --comments" },
     })).toBe(true);
     expect(firstToolMatchesExpectation(ghBlockerRow!, {
-      name: "shell",
+      name: "terminal",
       command_result: { command: "git status --short" },
     })).toBe(false);
     expect(ghBlockerRow?.targetResult).toContain("reports missing gh, auth, or permission failures directly");
     expect(ghBlockerRow?.forbiddenTools).toContain("ask_user_question");
 
     expect(firstToolMatchesExpectation(destructiveRow!, { name: "ask_user_question" })).toBe(true);
-    expect(firstToolMatchesExpectation(destructiveRow!, {
-      name: "shell",
-      command_result: { command: "rm -rf logs" },
-    })).toBe(false);
-    expect(forbiddenToolsUsed(destructiveRow!, [{
-      name: "shell",
-      command_result: { command: "rm -rf logs" },
-    }])).toEqual([
-      "shell",
+    expect(firstToolMatchesExpectation(destructiveRow!, { name: "delete_file" })).toBe(false);
+    expect(forbiddenToolsUsed(destructiveRow!, [{ name: "delete_file" }])).toEqual([
+      "delete_file",
     ]);
     expect(destructiveRow?.targetResult).toContain("precise multiple-choice question");
 
     expect(firstToolMatchesExpectation(releaseBumpRow!, { name: "read_file" })).toBe(true);
     expect(firstToolMatchesExpectation(releaseBumpRow!, {
-      name: "shell",
+      name: "terminal",
       command_result: { command: "git log --oneline -5" },
     })).toBe(true);
     expect(firstToolMatchesExpectation(releaseBumpRow!, {
-      name: "shell",
+      name: "terminal",
       command_result: { command: "gh release list" },
     })).toBe(false);
     expect(firstToolMatchesExpectation(releaseBumpRow!, { name: "ask_user_question" })).toBe(false);
@@ -301,7 +297,7 @@ describe("agent quality baseline matrix", () => {
     expect(headlessFailure.tool_calls).toEqual([]);
     expect(releaseBumpChoiceBlockerSurfaced(headlessFailure.output)).toBe(true);
     expect(releaseBumpChoiceBlockerSurfaced(
-      "fx ask: repeated identical tool call requires approval",
+      "ffx ask: repeated identical tool call requires approval",
     )).toBe(false);
   });
 
@@ -311,7 +307,7 @@ describe("agent quality baseline matrix", () => {
 
     expect(commandPolicyProgressSummarySurfaced(usefulSummary)).toBe(true);
     expect(commandPolicyProgressSummarySurfaced(
-      "fx ask: repeated identical tool call requires approval\nreason=tool-call-cycle",
+      "ffx ask: repeated identical tool call requires approval\nreason=tool-call-cycle",
     )).toBe(false);
   });
 
@@ -322,28 +318,28 @@ describe("agent quality baseline matrix", () => {
     expect(matrixTest?.modelBackedEval.required).toBe(true);
     expect(matrixTest?.deterministicCoverage.notes).toContain("does not require AI_GATEWAY_API_KEY");
     expect(firstToolMatchesExpectation(matrixTest!, {
-      name: "shell",
+      name: "terminal",
       command_result: { command: "bun test tests/evals/agent-quality-matrix.test.ts" },
     })).toBe(true);
     expect(firstToolMatchesExpectation(matrixTest!, {
-      name: "shell",
+      name: "terminal",
       command_result: { command: "bun test tests/evals" },
     })).toBe(false);
     expect(matrixTest?.forbiddenTools).toContain("ask_user_question");
 
     expect(firstToolMatchesExpectation(currentChanges!, {
-      name: "shell",
+      name: "terminal",
       command_result: { command: "git status --short" },
     })).toBe(true);
     expect(firstToolMatchesExpectation(currentChanges!, {
-      name: "shell",
+      name: "terminal",
       command_result: { command: "git diff" },
     })).toBe(false);
     expect(focusedVerificationSummarySurfaced(
       "Ran `bun test tests/evals/agent-quality-matrix.test.ts` (exit 0, pass). Remaining unverified: full Zig suite.",
     )).toBe(true);
     expect(focusedVerificationSummarySurfaced(
-      "fx ask: repeated identical tool call requires approval\nreason=tool-call-cycle",
+      "ffx ask: repeated identical tool call requires approval\nreason=tool-call-cycle",
     )).toBe(false);
     expect(focusedVerificationSummarySurfaced(
       "Agent stopped: detected repeating tool call cycle.",
@@ -378,8 +374,8 @@ describe("agent quality baseline matrix", () => {
     expect(localRepo?.forbiddenTools).toContain("web_search");
     expect(broadWeb?.expectedUserVisibleBehavior).toContain("linked sources");
     expect(firstToolMatchesExpectation(githubMetadata!, {
-      name: "shell",
-      command_result: { command: "gh pr view 57 --repo vercel-labs/fx --comments" },
+      name: "terminal",
+      command_result: { command: "gh pr view 57 --repo vercel-labs/ffx --comments" },
     })).toBe(true);
     expect(firstToolMatchesExpectation(githubMetadata!, { name: "web_fetch" })).toBe(false);
   });
@@ -387,11 +383,11 @@ describe("agent quality baseline matrix", () => {
   test("covers deferred MCP tool discovery", () => {
     const row = matrixRowById("mcp-deferred-tool-discovery");
 
-    expect(row?.expectedFirstTool.tools).toEqual(["capability_search"]);
-    expect(firstToolMatchesExpectation(row!, { name: "capability_search" })).toBe(true);
+    expect(row?.expectedFirstTool.tools).toEqual(["mcp_search_tools"]);
+    expect(firstToolMatchesExpectation(row!, { name: "mcp_search_tools" })).toBe(true);
     expect(firstToolMatchesExpectation(row!, { name: "mcp_select_tool" })).toBe(false);
     expect(forbiddenToolsUsed(row!, [
-      { name: "capability_search" },
+      { name: "mcp_search_tools" },
       { name: "web_search" },
       { name: "ask_user_question" },
     ])).toEqual(["web_search", "ask_user_question"]);

@@ -186,10 +186,6 @@ fn entryRetainedBytes(entry: TranscriptEntry) usize {
     };
 }
 
-pub fn entrySnapshotRetainedBytes(entry: TranscriptEntry) usize {
-    return @sizeOf(TranscriptEntry) +| entryRetainedBytes(entry);
-}
-
 fn dupeSkillTokenSpans(alloc: Allocator, skill_tokens: []const SkillTokenSpan) ![]SkillTokenSpan {
     if (skill_tokens.len == 0) return &.{};
     const copy = try alloc.alloc(SkillTokenSpan, skill_tokens.len);
@@ -442,10 +438,6 @@ fn pruneOrphanedCommandOutputBlocks(
     var changed = false;
     var i: usize = 0;
     while (i < self.command_output_blocks.items.len) {
-        if (self.command_output_blocks.items[i].live_entry_ids.items.len != 0) {
-            i += 1;
-            continue;
-        }
         if (self.command_output_display.open_command_block) |open| {
             if (open == i) {
                 i += 1;
@@ -970,9 +962,7 @@ pub fn resetVisualEpoch(self: anytype, alloc: Allocator, welcome: []const u8) !v
 
     for (self.entries.items) |entry| {
         if (entry != .raw_bytes or !entry.raw_bytes.lifecycle_pinned) continue;
-        replacement_entries.appendAssumeCapacity(
-            try cloneEntryForSnapshot(alloc, entry),
-        );
+        replacement_entries.appendAssumeCapacity(try cloneEntry(alloc, entry));
     }
 
     const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
@@ -1370,10 +1360,7 @@ pub fn flushRecordedCommandOutputSummaryAtomic(
 
     var shadow = try cloneRecordedMutationState(self, alloc);
     defer shadow.deinit(alloc);
-    const dirty_entry_id = command_output_runtime.commandOutputDirtyEntryIdForLifecycle(
-        &shadow,
-        lifecycle_id,
-    );
+    const dirty_entry_id = command_output_runtime.openCommandOutputDirtyEntryId(&shadow);
     const retention_changed = try command_output_runtime.flushCommandOutputSummaryUncommitted(
         &shadow,
         alloc,
@@ -1449,7 +1436,6 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
     new_bytes: []const u8,
     additional_tool_detail_capacity: usize,
     additional_command_output_capacity: usize,
-    turn_cancellation_line: ?[]const u8,
 ) !bool {
     return replacePinnedToolStatusAtomicInternal(
         self,
@@ -1461,7 +1447,6 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
         .{
             .tool_details = additional_tool_detail_capacity,
             .command_output_entries = additional_command_output_capacity,
-            .turn_cancellation_line = turn_cancellation_line,
         },
     );
 }
@@ -1469,12 +1454,9 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
 const LifecycleStatusReservations = struct {
     tool_details: usize = 0,
     command_output_entries: usize = 0,
-    turn_cancellation_line: ?[]const u8 = null,
 
     fn empty(self: LifecycleStatusReservations) bool {
-        return self.tool_details == 0 and
-            self.command_output_entries == 0 and
-            self.turn_cancellation_line == null;
+        return self.tool_details == 0 and self.command_output_entries == 0;
     }
 };
 
@@ -1509,11 +1491,7 @@ fn replacePinnedToolStatusAtomicInternal(
     var shadow = try cloneMutationState(self, alloc);
     defer shadow.deinit(alloc);
     try shadow.tool_details.ensureUnusedCapacity(alloc, reservations.tool_details);
-    try shadow.entries.ensureUnusedCapacity(
-        alloc,
-        reservations.command_output_entries +
-            @intFromBool(reservations.turn_cancellation_line != null),
-    );
+    try shadow.entries.ensureUnusedCapacity(alloc, reservations.command_output_entries);
     try shadow.command_output_blocks.ensureUnusedCapacity(
         alloc,
         reservations.command_output_entries,
@@ -1528,23 +1506,10 @@ fn replacePinnedToolStatusAtomicInternal(
         const entry = shadow.entries.orderedRemove(shadow_index);
         shadow.entries.appendAssumeCapacity(entry);
     }
-    var retention_anchor = entry_id;
-    if (reservations.turn_cancellation_line) |cancellation_line| {
-        const owned = try alloc.dupe(u8, cancellation_line);
-        var handed_off = false;
-        errdefer if (!handed_off) alloc.free(owned);
-        retention_anchor = try appendRawBytesEntryClassified(
-            &shadow,
-            alloc,
-            owned,
-            .turn_cancellation,
-        );
-        handed_off = true;
-    }
     const retention_changed = try enforceStructuredRetentionAndReport(
         &shadow,
         alloc,
-        retention_anchor,
+        entry_id,
     );
     try rebuildTranscriptCacheFromEntries(
         &shadow,
@@ -1570,7 +1535,6 @@ pub fn replacePinnedToolStatusesAtomic(
     alloc: Allocator,
     updates: []const LifecycleEntryUpdate,
     additional_tool_detail_capacity: usize,
-    turn_cancellation_line: ?[]const u8,
 ) !void {
     return replacePinnedToolStatusesAtomicWithRewriteMode(
         self,
@@ -1578,7 +1542,6 @@ pub fn replacePinnedToolStatusesAtomic(
         updates,
         .strict,
         additional_tool_detail_capacity,
-        turn_cancellation_line,
     );
 }
 
@@ -1587,7 +1550,6 @@ pub fn replacePinnedToolStatusesPreservingNormalBufferAnchorAtomic(
     alloc: Allocator,
     updates: []const LifecycleEntryUpdate,
     additional_tool_detail_capacity: usize,
-    turn_cancellation_line: ?[]const u8,
 ) !void {
     return replacePinnedToolStatusesAtomicWithRewriteMode(
         self,
@@ -1595,7 +1557,6 @@ pub fn replacePinnedToolStatusesPreservingNormalBufferAnchorAtomic(
         updates,
         .preserve_same_epoch,
         additional_tool_detail_capacity,
-        turn_cancellation_line,
     );
 }
 
@@ -1605,9 +1566,8 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
     updates: []const LifecycleEntryUpdate,
     rewrite_mode: TranscriptSourceRewriteMode,
     additional_tool_detail_capacity: usize,
-    turn_cancellation_line: ?[]const u8,
 ) !void {
-    if (updates.len == 0 and turn_cancellation_line == null) return;
+    if (updates.len == 0) return;
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
@@ -1615,10 +1575,6 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
     try shadow.tool_details.ensureUnusedCapacity(
         alloc,
         additional_tool_detail_capacity,
-    );
-    try shadow.entries.ensureUnusedCapacity(
-        alloc,
-        @intFromBool(turn_cancellation_line != null),
     );
     for (updates) |update| {
         const entry_index = rawEntryIndex(&shadow, update.entry_id) orelse
@@ -1631,23 +1587,10 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
         shadow.entries.items[entry_index].raw_bytes.bytes = replacement;
         shadow.entries.items[entry_index].raw_bytes.class = .tool_status;
     }
-    var turn_cancellation_entry_id: ?u32 = null;
-    if (turn_cancellation_line) |line| {
-        const owned = try alloc.dupe(u8, line);
-        var handed_off = false;
-        errdefer if (!handed_off) alloc.free(owned);
-        turn_cancellation_entry_id = try appendRawBytesEntryClassified(
-            &shadow,
-            alloc,
-            owned,
-            .turn_cancellation,
-        );
-        handed_off = true;
-    }
     const retention_changed = try enforceStructuredRetentionAndReport(
         &shadow,
         alloc,
-        turn_cancellation_entry_id,
+        null,
     );
     try rebuildTranscriptCacheFromEntries(
         &shadow,
@@ -1657,21 +1600,16 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
     shadow.recomputeCursorFromTranscript();
     requestTranscriptPaint(&shadow);
 
-    var dirty_entry_id: u32 = undefined;
-    if (updates.len > 0) {
-        var dirty_entry_index = rawEntryIndex(&shadow, updates[0].entry_id) orelse
-            return error.MissingLifecycleTranscriptEntry;
-        for (updates[1..]) |update| {
-            dirty_entry_index = @min(
-                dirty_entry_index,
-                rawEntryIndex(&shadow, update.entry_id) orelse
-                    return error.MissingLifecycleTranscriptEntry,
-            );
-        }
-        dirty_entry_id = shadow.entries.items[dirty_entry_index].id();
-    } else {
-        dirty_entry_id = turn_cancellation_entry_id.?;
+    var dirty_entry_index = rawEntryIndex(&shadow, updates[0].entry_id) orelse
+        return error.MissingLifecycleTranscriptEntry;
+    for (updates[1..]) |update| {
+        dirty_entry_index = @min(
+            dirty_entry_index,
+            rawEntryIndex(&shadow, update.entry_id) orelse
+                return error.MissingLifecycleTranscriptEntry,
+        );
     }
+    const dirty_entry_id = shadow.entries.items[dirty_entry_index].id();
     try commitAuthoritativeRecordedMutationStateFromEntry(
         self,
         &shadow,
@@ -1852,6 +1790,7 @@ fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
         .max_retained_transcript_bytes = self.max_retained_transcript_bytes,
         .command_output_display = self.command_output_display,
         .command_output_render = self.command_output_render,
+        .maxxing_mode = self.maxxing_mode,
         .full_transcript = self.full_transcript,
         .replaceable_last_line = self.replaceable_last_line,
         .replaceable_row = self.replaceable_row,
@@ -2024,12 +1963,12 @@ fn cloneEntries(
     }
     try result.ensureTotalCapacity(alloc, source.len);
     for (source) |entry| {
-        result.appendAssumeCapacity(try cloneEntryForSnapshot(alloc, entry));
+        result.appendAssumeCapacity(try cloneEntry(alloc, entry));
     }
     return result;
 }
 
-pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !TranscriptEntry {
+fn cloneEntry(alloc: Allocator, entry: TranscriptEntry) !TranscriptEntry {
     return switch (entry) {
         .raw_bytes => |raw| .{ .raw_bytes = .{
             .id = raw.id,
@@ -2105,12 +2044,12 @@ fn cloneToolDetails(
     const reserved_slot: usize = @intFromBool(source.capacity > source.items.len);
     try result.ensureTotalCapacityPrecise(alloc, source.items.len + reserved_slot);
     for (source.items) |detail| {
-        result.appendAssumeCapacity(try cloneToolDetailForSnapshot(alloc, detail));
+        result.appendAssumeCapacity(try cloneToolDetail(alloc, detail));
     }
     return result;
 }
 
-pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !ToolDetailRecord {
+fn cloneToolDetail(alloc: Allocator, source: ToolDetailRecord) !ToolDetailRecord {
     const tool_name = try alloc.dupe(u8, source.tool_name);
     errdefer alloc.free(tool_name);
     const arguments_json = if (source.arguments_json) |value|
@@ -2118,16 +2057,6 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
     else
         null;
     errdefer if (arguments_json) |value| alloc.free(value);
-    const command_display = if (source.command_display) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (command_display) |value| alloc.free(value);
-    const command_action_label = if (source.command_action_label) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (command_action_label) |value| alloc.free(value);
     const result = if (source.result) |value|
         try alloc.dupe(u8, value)
     else
@@ -2158,13 +2087,10 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
 
     return .{
         .entry_id = source.entry_id,
-        .created_at_ms = source.created_at_ms,
         .tool_name = tool_name,
         .captured_command = source.captured_command,
         .activity_kind = source.activity_kind,
         .arguments_json = arguments_json,
-        .command_display = command_display,
-        .command_action_label = command_action_label,
         .result = result,
         .result_handle = result_handle,
         .command_artifact_handle = command_artifact_handle,
@@ -2536,6 +2462,7 @@ pub fn writeUserPromptCard(
         user.images,
         shadow.layout.cols,
         skill_tokens,
+        .legacy,
     );
     defer alloc.free(card);
     try shadow.writeTranscriptBytes(alloc, metrics, card, true);
@@ -2968,7 +2895,6 @@ fn themeOwnsRawEntry(class: RawEntryClass) bool {
         .tool_status,
         .diff_block,
         .question_resolution,
-        .turn_cancellation,
         .subagent_status,
         => true,
         .command_output, .unknown_raw => false,

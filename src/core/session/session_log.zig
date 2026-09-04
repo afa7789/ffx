@@ -59,7 +59,6 @@ pub const Boundary = enum {
     before_recovery_prior_validation,
     after_recovery_latest_snapshot,
     before_recovery_latest_publication,
-    before_read_boundary_validation,
     latest_barrier_contended,
     latest_barrier_completed,
 };
@@ -459,23 +458,6 @@ pub const CommitLifecycle = struct {
         }
     }
 
-    fn prepareRequired(
-        self: *CommitLifecycle,
-        alloc: Allocator,
-        session_id: []const u8,
-        workspace_root: []const u8,
-        commit_lock_deadline_ms: u64,
-    ) !bool {
-        try self.prepare(
-            alloc,
-            session_id,
-            workspace_root,
-            workspace_root,
-            commit_lock_deadline_ms,
-        );
-        return false;
-    }
-
     fn prepareOpportunistic(
         self: *CommitLifecycle,
         alloc: Allocator,
@@ -708,12 +690,10 @@ pub const LoadedWritableSession = struct {
         failed_tail: FailedTailDisposition,
         options: Options,
     ) !CommitPosition {
-        var replacement = state;
-        replacement.subagent_child = self.state.subagent_child;
-        const usage_sidecar_bytes = if (replacement.usage) |usage|
+        const usage_sidecar_bytes = if (state.usage) |usage|
             encodeUsageSidecarBestEffort(
                 alloc,
-                replacement.id,
+                state.id,
                 usage,
             )
         else
@@ -723,7 +703,7 @@ pub const LoadedWritableSession = struct {
         const same_workspace = std.mem.eql(
             u8,
             self.state.workspace_root,
-            replacement.workspace_root,
+            state.workspace_root,
         );
         const may_defer_cache = same_workspace and switch (reason) {
             .compaction, .log_compaction => true,
@@ -732,13 +712,13 @@ pub const LoadedWritableSession = struct {
         const cache_deferred = if (may_defer_cache)
             try self.prepareCommitLifecycleOpportunistic(alloc, options)
         else blk: {
-            try self.prepareCommitLifecycle(alloc, replacement.workspace_root, options);
+            try self.prepareCommitLifecycle(alloc, state.workspace_root, options);
             break :blk false;
         };
         _ = commitStateReplacementImpl(
             self,
             alloc,
-            replacement,
+            state,
             reason,
             failed_tail,
             options,
@@ -1004,23 +984,6 @@ pub const LoadedWritableSession = struct {
     }
 };
 
-/// Preserves each call's exact error set while sharing one dynamic return ABI.
-pub inline fn failLoadedWritableSession(err: anytype) @TypeOf(err)!LoadedWritableSession {
-    return @errorCast(failLoadedWritableSessionDynamic(err));
-}
-
-noinline fn failLoadedWritableSessionDynamic(err: anyerror) anyerror!LoadedWritableSession {
-    return err;
-}
-
-test "large session errors preserve their exact error type and identity" {
-    const result = failLoadedWritableSession(error.NoSavedSessions);
-    try std.testing.expect(
-        @TypeOf(result) == error{NoSavedSessions}!LoadedWritableSession,
-    );
-    try std.testing.expectError(error.NoSavedSessions, result);
-}
-
 pub const Root = struct {
     sessions: ?io_mod.VerifiedDir,
     display_root: []u8,
@@ -1160,24 +1123,21 @@ pub const Root = struct {
         var lifecycle_value = lifecycle;
         errdefer if (lifecycle_value) |*value| value.deinit(alloc);
         if (self.mode != .writable or self.sessions == null) {
-            return failLoadedWritableSession(error.SessionStoreUnavailable);
+            return error.SessionStoreUnavailable;
         }
         try session_codec.validateState(initial_state);
         const sessions = &self.sessions.?;
-        if (try entryExists(sessions, initial_state.id)) {
-            return failLoadedWritableSession(error.SessionAlreadyExists);
-        }
+        if (try entryExists(sessions, initial_state.id)) return error.SessionAlreadyExists;
 
         sessions.dir.createDir(
             io_mod.getIo(),
             initial_state.id,
             private_dir_permissions,
         ) catch |err| switch (err) {
-            error.PathAlreadyExists => return failLoadedWritableSession(error.SessionAlreadyExists),
-            else => return failLoadedWritableSession(error.SessionStartFailed),
+            error.PathAlreadyExists => return error.SessionAlreadyExists,
+            else => return error.SessionStartFailed,
         };
-        io_mod.syncVerifiedDir(sessions.dir) catch
-            return failLoadedWritableSession(error.SessionStartFailed);
+        io_mod.syncVerifiedDir(sessions.dir) catch return error.SessionStartFailed;
 
         var session_dir = try openSessionDir(sessions, initial_state.id, .writable);
         options.test_controls.lock(.session);
@@ -1202,23 +1162,14 @@ pub const Root = struct {
         };
         var writable_owned = true;
         errdefer if (writable_owned) writable.deinit(alloc);
-        var cache_deferred = false;
         if (lifecycle_value) |*value| {
-            const preparation = if (initial_state.history.len == 0)
-                value.prepareOpportunistic(
-                    alloc,
-                    initial_state.id,
-                    initial_state.workspace_root,
-                    options.commit_lock_deadline_ms,
-                )
-            else
-                value.prepareRequired(
-                    alloc,
-                    initial_state.id,
-                    initial_state.workspace_root,
-                    options.commit_lock_deadline_ms,
-                );
-            cache_deferred = preparation catch |err| {
+            value.prepare(
+                alloc,
+                initial_state.id,
+                initial_state.workspace_root,
+                initial_state.workspace_root,
+                options.commit_lock_deadline_ms,
+            ) catch |err| {
                 writable.deinit(alloc);
                 writable_owned = false;
                 sessions.dir.deleteTree(io_mod.getIo(), initial_state.id) catch |cleanup_err| {
@@ -1247,38 +1198,11 @@ pub const Root = struct {
             options,
         );
         writable_owned = false;
-        var created_owned = true;
-        errdefer if (created_owned) created.deinit(alloc);
+        errdefer created.deinit(alloc);
         if (lifecycle_value) |value| {
             try created.installCommitLifecycle(value);
             lifecycle_value = null;
-            if (cache_deferred) {
-                created.writeDeferredCommitLifecycle(
-                    alloc,
-                    created.position,
-                ) catch |err| {
-                    created.deinit(alloc);
-                    created_owned = false;
-                    sessions.dir.deleteTree(io_mod.getIo(), initial_state.id) catch |cleanup_err| {
-                        debug_trace.logf(
-                            "session",
-                            "event=deferred_session_cleanup_failed err={s}",
-                            .{@errorName(cleanup_err)},
-                        );
-                        return cleanup_err;
-                    };
-                    io_mod.syncVerifiedDir(sessions.dir) catch |cleanup_err| {
-                        debug_trace.logf(
-                            "session",
-                            "event=deferred_session_cleanup_sync_failed err={s}",
-                            .{@errorName(cleanup_err)},
-                        );
-                        return cleanup_err;
-                    };
-                    return err;
-                };
-                created.state_replacement_pending = true;
-            } else if (!created.publishCommitLifecycle(alloc)) {
+            if (!created.publishCommitLifecycle(alloc)) {
                 created.state_replacement_pending = true;
             }
         }
@@ -1334,8 +1258,7 @@ pub const Root = struct {
             },
             else => return err,
         };
-        var lock_held = true;
-        defer if (lock_held) lock.release();
+        defer lock.release();
         try requireIntentAbsent(alloc, &session_dir, authority_intent_file);
         var marker = try loadAuthority(alloc, &session_dir, session_id);
         defer marker.deinit(alloc);
@@ -1343,24 +1266,17 @@ pub const Root = struct {
         var log_file = try openManagedFile(&session_dir, events_file, .read_only);
         errdefer log_file.close(io_mod.getIo());
         const generation = try session_replay.readFirstGeneration(alloc, log_file);
-        const position = try loadWatermarkPosition(
+        const position = try loadAndValidateWatermark(
             alloc,
             &session_dir,
             session_id,
             generation,
+            log_file,
         );
-        var usage_sidecar = try session_usage_sidecar.capture(
+        const usage_sidecar = try session_usage_sidecar.capture(
             alloc,
             &session_dir,
         );
-        errdefer usage_sidecar.deinit(alloc);
-        // The watermark and open handle preserve the committed prefix across
-        // later appends or a generation rename. Validate it without blocking writers.
-        lock.release();
-        lock_held = false;
-
-        try options.test_controls.boundary(.before_read_boundary_validation);
-        _ = try session_replay.scanCommitPosition(alloc, log_file, position);
         return .{
             .log_file = log_file,
             .position = position,
@@ -1393,30 +1309,6 @@ pub const Root = struct {
             );
         }
         return state;
-    }
-
-    /// Reads the immutable child-privacy bit from the first event without
-    /// replaying history or acquiring the commit lock. State replacement and
-    /// compaction preserve this bit for the lifetime of the session.
-    pub fn loadSubagentChildIdentity(
-        self: *const Root,
-        alloc: Allocator,
-        session_id: []const u8,
-    ) !bool {
-        var sessions = self.sessions orelse return error.SessionNotFound;
-        try session_layout.validateSessionId(session_id);
-        var session_dir = openSessionDir(
-            &sessions,
-            session_id,
-            .read_only,
-        ) catch |err| switch (err) {
-            error.FileNotFound => return error.SessionNotFound,
-            else => return err,
-        };
-        defer session_dir.close();
-        var log_file = try openManagedFile(&session_dir, events_file, .read_only);
-        defer log_file.close(io_mod.getIo());
-        return session_replay.readSubagentChildIdentity(alloc, log_file);
     }
 
     pub fn admitResumeView(
@@ -2262,7 +2154,6 @@ fn createNativeSession(
             .conversation_language = initial_state.conversation_language,
             .preferences = initial_state.preferences,
             .usage = initial_state.usage orelse synthesized_usage.?,
-            .subagent_child = initial_state.subagent_child,
         } },
     };
     const line = try session_event.encodeFrame(alloc, envelope);
@@ -2446,9 +2337,7 @@ fn openWritableSession(
     var event_log = try openManagedFile(&writable.dir, events_file, .read_write);
     defer event_log.close(io_mod.getIo());
     const length = try event_log.length(io_mod.getIo());
-    if (length < position.through_event_log_bytes) {
-        return failLoadedWritableSession(error.InvalidSessionFormat);
-    }
+    if (length < position.through_event_log_bytes) return error.InvalidSessionFormat;
     const replay_started_ns = io_mod.nanoTimestamp();
     var open_state = loadOpenState(
         alloc,
@@ -2458,7 +2347,7 @@ fn openWritableSession(
         event_log,
         position,
     ) catch |err| switch (err) {
-        error.OutOfMemory => return failLoadedWritableSession(error.SessionReplayResourceExhausted),
+        error.OutOfMemory => return error.SessionReplayResourceExhausted,
         else => return err,
     };
     errdefer open_state.state.deinit(alloc);
@@ -4255,7 +4144,6 @@ fn compactCanonicalLog(
             .conversation_language = loaded.state.conversation_language,
             .preferences = loaded.state.preferences,
             .usage = loaded.state.usage,
-            .subagent_child = loaded.state.subagent_child,
         } },
     };
     const first_line = try session_event.encodeFrame(alloc, session_started);
@@ -4424,7 +4312,6 @@ fn makeCleanupCandidatesForTest(
             .conversation_language = loaded.state.conversation_language,
             .preferences = loaded.state.preferences,
             .usage = loaded.state.usage,
-            .subagent_child = loaded.state.subagent_child,
         } },
     };
     const line = try session_event.encodeFrame(alloc, envelope);
@@ -4728,7 +4615,7 @@ test "root init rejects symlinked durable and sessions roots" {
         tmp.dir.symLink(
             io_mod.getIo(),
             "../outside",
-            "home/.fx",
+            "home/.ffx",
             .{ .is_directory = true },
         ) catch |err| switch (err) {
             error.AccessDenied => return error.SkipZigTest,
@@ -4746,12 +4633,12 @@ test "root init rejects symlinked durable and sessions roots" {
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
         try tmp.dir.createDirPath(io_mod.getIo(), "outside");
         tmp.dir.symLink(
             io_mod.getIo(),
             "../../outside",
-            "home/.fx/sessions",
+            "home/.ffx/sessions",
             .{ .is_directory = true },
         ) catch |err| switch (err) {
             error.AccessDenied => return error.SkipZigTest,
@@ -4770,8 +4657,8 @@ test "root init rejects symlinked durable and sessions roots" {
 fn testState(alloc: Allocator, id: []const u8, updated_at_ms: i64) !session_codec.DurableSessionState {
     return .{
         .id = try alloc.dupe(u8, id),
-        .origin_workspace_root = try alloc.dupe(u8, "/tmp/fx-plan-03"),
-        .workspace_root = try alloc.dupe(u8, "/tmp/fx-plan-03"),
+        .origin_workspace_root = try alloc.dupe(u8, "/tmp/ffx-plan-03"),
+        .workspace_root = try alloc.dupe(u8, "/tmp/ffx-plan-03"),
         .created_at_ms = 10,
         .updated_at_ms = updated_at_ms,
         .conversation_language = session.ConversationLanguage.literal("en"),
@@ -5186,163 +5073,6 @@ test "usage sidecar publication stays inside the canonical commit boundary" {
     defer read_only.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), read_only.usage.?.next_sequence);
     try std.testing.expectEqual(@as(usize, 0), read_only.usage.?.incidents.len);
-}
-
-test "torn exact settlement restores stale sidecar backlog over settled rollback" {
-    const Checkpoint = struct {
-        fn persist(_: *anyopaque, _: session_usage.Snapshot) !void {}
-    };
-    const RejectPublication = struct {
-        fn publish(_: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
-            if (event == .generation) return error.InjectedPublicationFailure;
-        }
-    };
-    const PublicationProbe = struct {
-        generations: usize = 0,
-
-        fn publish(raw: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            if (event == .generation) self.generations += 1;
-        }
-    };
-    const TearSidecar = struct {
-        dir: *io_mod.VerifiedDir,
-        torn: bool = false,
-        const stale_file = "usage-v2.stale-test";
-
-        fn boundary(raw: ?*anyopaque, point: Boundary) !void {
-            if (point != .before_usage_sidecar_write) return;
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            try self.dir.dir.rename(
-                session_usage_sidecar.sidecar_file,
-                self.dir.dir,
-                stale_file,
-                io_mod.getIo(),
-            );
-            try self.dir.dir.createDir(
-                io_mod.getIo(),
-                session_usage_sidecar.sidecar_file,
-                std.Io.File.Permissions.fromMode(0o700),
-            );
-            self.torn = true;
-        }
-
-        fn restore(self: *@This()) !void {
-            try self.dir.dir.deleteDir(
-                io_mod.getIo(),
-                session_usage_sidecar.sidecar_file,
-            );
-            try self.dir.dir.rename(
-                stale_file,
-                self.dir.dir,
-                session_usage_sidecar.sidecar_file,
-                io_mod.getIo(),
-            );
-        }
-    };
-
-    const alloc = std.testing.allocator;
-    var temp = try TempRoot.init(alloc);
-    defer temp.deinit(alloc);
-    var initial = try testState(alloc, "session-usage-torn-exact", 10);
-    defer initial.deinit(alloc);
-    {
-        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
-        defer loaded.deinit(alloc);
-        const completion: types.ModelCompletion = .{
-            .generation_id = "response-torn-log",
-            .billing = .{
-                .created_at_ms = 100,
-                .model = "codex/gpt-test",
-                .total_cost = 0,
-                .input_tokens = 17,
-                .output_tokens = 7,
-                .cache_read_tokens = 2,
-                .cache_write_tokens = 0,
-                .reasoning_tokens = 1,
-                .billable_web_search_calls = 0,
-            },
-        };
-
-        var checkpoint_context: u8 = 0;
-        var publication_context: u8 = 0;
-        var bridge = session_usage.Usage.initFresh();
-        defer bridge.deinit(alloc);
-        bridge.configureCheckpointSink(.{
-            .context = &checkpoint_context,
-            .allocator = alloc,
-            .persist = Checkpoint.persist,
-        });
-        bridge.configurePublicationSink(.{
-            .context = &publication_context,
-            .allocator = alloc,
-            .publish = RejectPublication.publish,
-        });
-        const bridge_observation = try session_usage.InvocationObservation.begin(&bridge);
-        try bridge_observation.complete(alloc, completion, .{ .exact = .codex });
-        var bridge_snapshot = try bridge.snapshot(alloc);
-        defer bridge_snapshot.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 1), bridge_snapshot.pending.len);
-        try std.testing.expectEqual(@as(usize, 1), bridge_snapshot.publication_backlog.len);
-        _ = try loaded.appendEvent(
-            alloc,
-            .{ .usage_checkpointed = .{ .usage = bridge_snapshot } },
-            20,
-            .retry_expected_tail,
-            .{},
-        );
-
-        var settled = session_usage.Usage.initFresh();
-        defer settled.deinit(alloc);
-        const settled_observation = try session_usage.InvocationObservation.begin(&settled);
-        try settled_observation.complete(alloc, completion, .{ .exact = .codex });
-        var settled_snapshot = try settled.snapshot(alloc);
-        defer settled_snapshot.deinit(alloc);
-        try std.testing.expectEqual(@as(u64, 17), settled_snapshot.input_tokens);
-        try std.testing.expectEqual(@as(usize, 0), settled_snapshot.pending.len);
-
-        var tear = TearSidecar{ .dir = &loaded.log.dir };
-        _ = try loaded.appendEvent(
-            alloc,
-            .{ .usage_checkpointed = .{ .usage = settled_snapshot } },
-            30,
-            .retry_expected_tail,
-            .{ .test_controls = .{
-                .context = &tear,
-                .boundary_fn = TearSidecar.boundary,
-            } },
-        );
-        try std.testing.expect(tear.torn);
-        try tear.restore();
-    }
-
-    var read_only = try temp.root.loadReadOnly(alloc, initial.id, .{});
-    defer read_only.deinit(alloc);
-    const recovered = read_only.usage.?;
-    try std.testing.expectEqual(@as(u64, 17), recovered.input_tokens);
-    try std.testing.expectEqual(@as(u64, 7), recovered.output_tokens);
-    try std.testing.expectEqual(@as(?u64, null), recovered.request_count);
-    try std.testing.expectEqual(@as(usize, 0), recovered.pending.len);
-    try std.testing.expectEqual(@as(usize, 1), recovered.publication_backlog.len);
-    try std.testing.expectEqual(@as(usize, 1), recovered.incidents.len);
-
-    var publication = PublicationProbe{};
-    var resumed = session_usage.Usage.initFresh();
-    defer resumed.deinit(alloc);
-    resumed.configurePublicationSink(.{
-        .context = &publication,
-        .allocator = alloc,
-        .publish = PublicationProbe.publish,
-    });
-    try resumed.restore(alloc, recovered, 1);
-    var final = try resumed.snapshot(alloc);
-    defer final.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), publication.generations);
-    try std.testing.expectEqual(@as(u64, 17), final.input_tokens);
-    try std.testing.expectEqual(@as(u64, 7), final.output_tokens);
-    try std.testing.expectEqual(@as(?u64, null), final.request_count);
-    try std.testing.expectEqual(@as(usize, 0), final.pending.len);
-    try std.testing.expectEqual(@as(usize, 0), final.publication_backlog.len);
 }
 
 test "indeterminate canonical usage retry repairs the rich sidecar" {
@@ -5804,36 +5534,6 @@ test "display projection waits for first prompt and preserves derived title" {
         "first prompt title should freeze after this",
         preserved_display.title,
     );
-}
-
-test "state replacement preserves subagent child identity" {
-    const alloc = std.testing.allocator;
-    var temp = try TempRoot.init(alloc);
-    defer temp.deinit(alloc);
-    var initial = try testState(alloc, "session-subagent-child", 10);
-    defer initial.deinit(alloc);
-    initial.subagent_child = true;
-
-    {
-        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
-        defer loaded.deinit(alloc);
-        var replacement = try loaded.state.dupe(alloc);
-        defer replacement.deinit(alloc);
-        replacement.updated_at_ms = 20;
-        replacement.subagent_child = false;
-        _ = try loaded.commitStateReplacement(
-            alloc,
-            replacement,
-            .recovery,
-            .retry_expected_tail,
-            .{},
-        );
-        try std.testing.expect(loaded.state.subagent_child);
-    }
-
-    var reloaded = try temp.root.loadReadOnly(alloc, initial.id, .{});
-    defer reloaded.deinit(alloc);
-    try std.testing.expect(reloaded.subagent_child);
 }
 
 fn historyEvent(state: session_codec.DurableSessionState) session_event.Event {
@@ -6956,10 +6656,17 @@ test "specialized history survives event replacement checkpoint and canonical co
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
-    const historical_template = session.HistoryTurn{ .assistant = .{
+    const record_id = session.StableBackgroundRecordId{
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    };
+    const background_template = session.HistoryTurn{ .background_command = .{
         .user = .{ .text = @constCast("run dev") },
-        .assistant = @constCast("The historical command is inert."),
+        .assistant = @constCast("The server is starting."),
         .execution = .{ .tool_steps = steps[0..] },
+        .log_path = @constCast("/tmp/server.log"),
+        .expect_url = true,
+        .background_record_id = record_id,
     } };
     const interrupted_template = session.HistoryTurn{ .interrupted = .{
         .user = .{ .text = @constCast("inspect") },
@@ -6972,7 +6679,7 @@ test "specialized history survives event replacement checkpoint and canonical co
     const append_history = try alloc.alloc(session.HistoryTurn, 1);
     var owns_append_history = true;
     errdefer if (owns_append_history) alloc.free(append_history);
-    append_history[0] = try session.dupeHistoryTurn(alloc, historical_template);
+    append_history[0] = try session.dupeHistoryTurn(alloc, background_template);
     var append_history_initialized = true;
     errdefer if (owns_append_history and append_history_initialized) {
         session.freeHistoryTurn(alloc, append_history[0]);
@@ -6990,8 +6697,8 @@ test "specialized history survives event replacement checkpoint and canonical co
         .{},
     );
     try std.testing.expectEqualStrings(
-        "The historical command is inert.",
-        loaded.state.history[0].assistant.assistant,
+        "The server is starting.",
+        loaded.state.history[0].background_command.assistant.?,
     );
 
     var replacement = try loaded.state.dupe(alloc);
@@ -7005,7 +6712,7 @@ test "specialized history survives event replacement checkpoint and canonical co
         }
         alloc.free(replacement_history);
     };
-    replacement_history[0] = try session.dupeHistoryTurn(alloc, historical_template);
+    replacement_history[0] = try session.dupeHistoryTurn(alloc, background_template);
     copied_replacement_turns += 1;
     replacement_history[1] = try session.dupeHistoryTurn(alloc, interrupted_template);
     copied_replacement_turns += 1;
@@ -7029,10 +6736,11 @@ test "specialized history survives event replacement checkpoint and canonical co
     var replayed = try temp.root.loadReadOnly(alloc, initial.id, .{});
     defer replayed.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), replayed.history.len);
-    const historical = replayed.history[0].assistant;
-    try std.testing.expectEqualStrings("The historical command is inert.", historical.assistant);
-    try std.testing.expectEqual(@as(usize, 1), historical.execution.tool_steps.len);
-    try std.testing.expectEqual(.failure, historical.execution.tool_steps[0].tool_results[0].status);
+    const background = replayed.history[0].background_command;
+    try std.testing.expectEqualStrings("The server is starting.", background.assistant.?);
+    try std.testing.expectEqual(@as(usize, 1), background.execution.tool_steps.len);
+    try std.testing.expectEqual(.failure, background.execution.tool_steps[0].tool_results[0].status);
+    try std.testing.expectEqualSlices(u8, &record_id, &background.background_record_id.?);
     const interrupted = replayed.history[1].interrupted;
     try std.testing.expectEqualStrings("I inspected the entry point.", interrupted.assistant.?);
     try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
@@ -7463,111 +7171,6 @@ test "lock ordering is session before commit and read boundary uses commit only"
     boundary.deinit();
     try std.testing.expectEqual(@as(usize, 1), read_trace.len);
     try std.testing.expectEqual(LockKind.commit, read_trace.items[0]);
-}
-
-test "read boundary validation does not block a concurrent append" {
-    const alloc = std.testing.allocator;
-    var temp = try TempRoot.init(alloc);
-    defer temp.deinit(alloc);
-    var initial = try testState(alloc, "read-boundary-concurrent-append", 10);
-    defer initial.deinit(alloc);
-    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
-    defer loaded.deinit(alloc);
-    const captured_position = loaded.position;
-
-    const AppendDuringValidation = struct {
-        loaded: *LoadedWritableSession,
-        alloc: Allocator,
-        attempted: bool = false,
-        failure: ?anyerror = null,
-
-        fn hit(raw: ?*anyopaque, point: Boundary) !void {
-            if (point != .before_read_boundary_validation) return;
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.attempted = true;
-            _ = self.loaded.appendEvent(
-                self.alloc,
-                .{ .preferences_changed = .{ .fast_mode = true } },
-                20,
-                .retry_expected_tail,
-                .{ .commit_lock_deadline_ms = 0 },
-            ) catch |err| {
-                self.failure = err;
-                return;
-            };
-        }
-    };
-    var append = AppendDuringValidation{
-        .loaded = &loaded,
-        .alloc = alloc,
-    };
-
-    var boundary = try temp.root.captureReadBoundary(
-        alloc,
-        initial.id,
-        .{ .test_controls = .{
-            .context = &append,
-            .boundary_fn = AppendDuringValidation.hit,
-        } },
-    );
-    defer boundary.deinit();
-
-    try std.testing.expect(append.attempted);
-    try std.testing.expectEqual(@as(?anyerror, null), append.failure);
-    try std.testing.expect(std.meta.eql(captured_position, boundary.position));
-    try std.testing.expect(loaded.state.preferences.fast_mode);
-    var captured = try session_replay.replayBoundary(
-        alloc,
-        boundary.log_file,
-        boundary.position,
-    );
-    defer captured.deinit(alloc);
-    try std.testing.expect(!captured.preferences.fast_mode);
-}
-
-test "read boundary validation still rejects a corrupt committed prefix" {
-    const alloc = std.testing.allocator;
-    var temp = try TempRoot.init(alloc);
-    defer temp.deinit(alloc);
-    var initial = try testState(alloc, "read-boundary-corrupt-prefix", 10);
-    defer initial.deinit(alloc);
-    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
-    defer loaded.deinit(alloc);
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var usage_snapshot = try usage.snapshot(alloc);
-    defer usage_snapshot.deinit(alloc);
-    _ = try loaded.appendEvent(
-        alloc,
-        .{ .usage_checkpointed = .{ .usage = usage_snapshot } },
-        20,
-        .retry_expected_tail,
-        .{},
-    );
-    const corrupt_frame_start = loaded.position.through_event_log_bytes;
-    _ = try loaded.appendEvent(
-        alloc,
-        .{ .preferences_changed = .{ .fast_mode = true } },
-        21,
-        .retry_expected_tail,
-        .{},
-    );
-
-    var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
-    defer log.close(io_mod.getIo());
-    try replaceFrameByteForTest(
-        alloc,
-        log,
-        corrupt_frame_start,
-        loaded.position.through_event_log_bytes,
-        "preferences_changed",
-        'X',
-    );
-
-    try std.testing.expectError(
-        error.InvalidSessionFormat,
-        temp.root.captureReadBoundary(alloc, initial.id, .{}),
-    );
 }
 
 test "writable resume can fail immediately at a contended commit boundary" {

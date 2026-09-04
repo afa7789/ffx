@@ -48,7 +48,6 @@ fn BootstrapDeps(comptime App: type) type {
             []const u8,
             types.ReasoningEffort,
             bool,
-            bool,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
         const StageRequestedResumeViewFn = *const fn (*App) app_session_runtime.ResumeViewStage;
@@ -84,6 +83,7 @@ pub fn Runtime(comptime App: type) type {
             default_model: []const u8,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
+            record_requested: bool,
             capability_providers: CapabilityProviders,
         ) !void {
             try bootstrapWithDeps(
@@ -92,6 +92,7 @@ pub fn Runtime(comptime App: type) type {
                 default_model,
                 default_agent_step_limit,
                 resize_handler,
+                record_requested,
                 defaultDeps(capability_providers),
             );
         }
@@ -143,7 +144,6 @@ pub fn Runtime(comptime App: type) type {
             selected_model: []const u8,
             effort: types.ReasoningEffort,
             fast_mode: bool,
-            fast_mode_model_bound: bool,
         ) !void {
             try app_session_runtime.Runtime(App).configureStartupPreferences(
                 app,
@@ -153,7 +153,6 @@ pub fn Runtime(comptime App: type) type {
                 selected_model,
                 effort,
                 fast_mode,
-                fast_mode_model_bound,
             );
         }
 
@@ -183,6 +182,7 @@ pub fn Runtime(comptime App: type) type {
             default_model: []const u8,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
+            record_requested: bool,
             deps: BootstrapDeps(App),
         ) !void {
             errdefer app.deinit();
@@ -201,12 +201,9 @@ pub fn Runtime(comptime App: type) type {
                     app.secretStore()
                 else
                     host.unavailable_secret_store,
-                .auth_mode = if (comptime @hasDecl(@TypeOf(app.auth), "authMode"))
-                    app.auth.authMode()
-                else
-                    .local,
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
+                .record_requested = record_requested,
             });
             defer startup.deinit(app.alloc);
 
@@ -221,24 +218,12 @@ pub fn Runtime(comptime App: type) type {
             }
             app.auth.recordStartupStatus(
                 startup.stored_key_status,
-                startup.fx_login_status,
                 startup.credential_onboarding_skipped,
             );
-            if (comptime @hasDecl(@TypeOf(app.auth), "refreshSourceInventory")) {
-                app.auth.refreshSourceInventory(app.alloc) catch |err| {
-                    debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
-                };
-            } else if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
-                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
-                    debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
-                };
-            }
-            const startup_auth_view = app.auth.view();
-            if (startup_auth_view.active_source == null and !startup_auth_view.onboarding_skipped) {
-                app.auth.openOnboardingPicker(app.alloc);
-            }
+            // Credential onboarding removed - user requested offline mode
+            _ = app.auth.view();
             if (comptime @hasField(App, "terminal_input_runtime") and @hasField(App, "terminal")) {
-                // Own theme protocol bytes even under FX_THEME; probing stays gated.
+                // Own theme protocol bytes even under FFX_THEME; probing stays gated.
                 app.terminal_input_runtime.terminal_theme_monitor.start();
                 if (startup.theme_monitor_enabled) {
                     app.terminal.enableThemeNotifications() catch |err| {
@@ -284,7 +269,6 @@ pub fn Runtime(comptime App: type) type {
                 active_model,
                 startup.effort,
                 startup.fast_mode,
-                startup.fast_mode_model_bound,
             );
             app.permission_engine.mode = startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
@@ -296,8 +280,9 @@ pub fn Runtime(comptime App: type) type {
             app.worker.agent_turn_settings.effort = startup.effort;
             app.context_enabled = startup.context_enabled;
             app.fast_mode = startup.fast_mode;
+            app.input_runtime.input_appearance = startup.input_appearance;
             app.input_runtime.slash_menu_categories = startup.slash_menu_categories;
-            app.shell.collapse_tool_calls = startup.collapse_tool_calls;
+            app.shell.maxxing_mode = startup.maxxing_mode;
             app.auto_upgrade_enabled = startup.auto_upgrade;
             app.upgrader.configure_channel(startup.update_channel);
             app.effort = startup.effort;
@@ -326,26 +311,20 @@ pub fn Runtime(comptime App: type) type {
                 deps.stage_requested_resume_view(app)
             else
                 app_session_runtime.ResumeViewStage.none;
-            const profile_mcp = try deps.load_mcp_runtime(
-                app.alloc,
-                app.workspace_root,
-                .{ .form = true, .url = true },
-            );
+            const profile_mcp = try deps.load_mcp_runtime(app.alloc, .{ .form = true, .url = true });
             if (comptime @hasDecl(App, "installInitialMcpRuntime")) {
                 app.installInitialMcpRuntime(profile_mcp);
             } else {
                 app.mcp_runtime = profile_mcp;
             }
 
-            var loaded = try deps.load_skills(
+            const loaded = try deps.load_skills(
                 std.heap.c_allocator,
                 app.workspace_root,
                 deps.skill_root_policy,
             );
-            errdefer loaded.deinit(std.heap.c_allocator);
             skill_runtime.traceDiagnostics("interactive_startup", loaded.diagnostics);
-            try app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
-            loaded = .{};
+            app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
 
             if (app.requested_resume == null) {
                 const welcome_message = try deps.welcome_message(app.alloc);
@@ -365,9 +344,6 @@ pub fn Runtime(comptime App: type) type {
                     },
                 );
                 try app.writeTranscriptClassified(welcome_message, true, .welcome);
-                if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
-                    try app.presentProjectMcpPrompt();
-                }
             }
             if (app.skills.diagnostics.len > 0) {
                 var notice_writer: std.Io.Writer.Allocating = .init(app.alloc);
@@ -388,19 +364,12 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasField(App, "auth")) {
                 const auth_view = app.auth.view();
-                const load_error: ?anyerror = if (startup.credential_load_failure) |failure|
-                    failure.err
-                else if (auth_view.stored_key_status == .unavailable or auth_view.fx_login_status == .unavailable)
-                    error.CredentialStorageUnavailable
-                else
-                    null;
-                if (auth_view.active_source == null and load_error != null) {
-                    const body = try auth_runtime.preparationFailureText(app.alloc, startup.provider, load_error.?);
-                    defer app.alloc.free(body);
+                if (auth_view.active_source == null and auth_view.stored_key_status == .unavailable) {
+                    debug_trace.logf("keychain", "interactive read skipped", .{});
                     try app.writeDomainNotice(.{
-                        .topic = "auth",
+                        .topic = "keychain",
                         .tone = .warning,
-                        .body = body,
+                        .body = "ffx could not access " ++ credentials.stored_key_backend_label ++ ". Continuing without an API key.",
                     }, true);
                 }
             }
@@ -410,14 +379,13 @@ pub fn Runtime(comptime App: type) type {
                 const recording_body = try std.fmt.allocPrint(
                     app.alloc,
                     "visual terminal capture: {s}\nvisible terminal content, including typed prompt text, is recorded",
-                    .{recording.active.path},
+                    .{recording.active},
                 );
                 defer app.alloc.free(recording_body);
                 try app.writeDomainNotice(.{
                     .topic = "recording",
                     .tone = .warning,
                     .body = recording_body,
-                    .visibility = if (recording.active.show_inline_notice) .compact_and_full else .full_only,
                 }, true);
             }
             {
@@ -504,7 +472,6 @@ const TestCapture = struct {
     runtime_model_len: usize = 0,
     configured_effort: types.ReasoningEffort = .auto,
     configured_fast_mode: bool = false,
-    configured_fast_mode_model_bound: bool = false,
     initialize_required: bool = false,
     load_skills_workspace: []const u8 = "",
     load_skills_workspace_root_count: usize = 0,
@@ -719,7 +686,7 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
         errdefer alloc.free(credential_team);
         state.credential = .{
             .token = credential_token,
-            .source = .ai_gateway_api_key,
+            .source = .env_var,
             .team_id = credential_team,
         };
     }
@@ -733,7 +700,7 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.permission_mode = .auto;
     state.context_enabled = false;
     state.fast_mode = true;
-    state.fast_mode_model_bound = true;
+    state.maxxing_mode = .minimal;
     state.auto_upgrade = false;
     state.update_channel = .dev;
     state.effort = types.ReasoningEffort.literal("high");
@@ -766,7 +733,7 @@ fn publishStagedResumeViewForTest(_: *TestApp, entry_id: u32) !void {
     active_capture.?.recordEvent("resume_view_publish");
 }
 
-fn loadMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn loadMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
     active_capture.?.recordEvent("load_mcp");
     return null;
 }
@@ -811,7 +778,6 @@ fn configureSessionPreferencesForTest(
     selected_model: []const u8,
     effort: types.ReasoningEffort,
     fast_mode: bool,
-    fast_mode_model_bound: bool,
 ) !void {
     const capture = active_capture.?;
     capture.configured_model_len = @min(
@@ -833,7 +799,6 @@ fn configureSessionPreferencesForTest(
     );
     capture.configured_effort = effort;
     capture.configured_fast_mode = fast_mode;
-    capture.configured_fast_mode_model_bound = fast_mode_model_bound;
 }
 
 fn beginFreshPersistedSessionForTest(app: *TestApp) !void {
@@ -875,6 +840,7 @@ fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
         "default-model",
         24,
         resizeHandlerForTest,
+        false,
         testDeps(),
     );
 }
@@ -923,7 +889,6 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
         capture.configured_effort,
     );
     try std.testing.expect(capture.configured_fast_mode);
-    try std.testing.expect(capture.configured_fast_mode_model_bound);
     try std.testing.expectEqual(
         update_target.Channel.dev,
         app.upgrader.channel(),
@@ -946,7 +911,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
 
     try std.testing.expectEqualStrings("/workspace", app.workspace_root);
     try std.testing.expectEqualStrings("api-key", app.auth.apiKey().?);
-    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, app.auth.credentialSource().?);
+    try std.testing.expectEqual(types.CredentialSource.env_var, app.auth.credentialSource().?);
     try std.testing.expectEqualStrings("team_123", app.auth.gatewayTeam().?);
     const auth_view = app.auth.view();
     try std.testing.expectEqual(credentials.StoredKeyReadStatus.not_found, auth_view.stored_key_status);
@@ -960,6 +925,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.worker.agent_turn_settings.effort);
     try std.testing.expect(!app.context_enabled);
     try std.testing.expect(app.fast_mode);
+    try std.testing.expectEqual(@import("../config/presentation_mode.zig").MaxxingMode.minimal, app.shell.maxxing_mode);
     try std.testing.expect(!app.auto_upgrade_enabled);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
     try std.testing.expect(app.workspace_identity.enabled);

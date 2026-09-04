@@ -48,19 +48,19 @@ jobs:
 
       - name: Package
         run: |
-          package_dir="$RUNNER_TEMP/fx-package-${{ matrix.name }}"
+          package_dir="$RUNNER_TEMP/ffx-package-${{ matrix.name }}"
           mkdir -p "$package_dir"
-          cp zig-out/bin/fx LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf fx-${{ matrix.name }}.tar.gz -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
-          sha256sum fx-${{ matrix.name }}.tar.gz > fx-${{ matrix.name }}.tar.gz.sha256
+          cp zig-out/bin/ffx LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf ffx-${{ matrix.name }}.tar.gz -C "$package_dir" ffx LICENSE THIRD_PARTY_NOTICES.md
+          sha256sum ffx-${{ matrix.name }}.tar.gz > ffx-${{ matrix.name }}.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fx-${{ matrix.name }}
+          name: ffx-${{ matrix.name }}
           path: |
-            fx-${{ matrix.name }}.tar.gz
-            fx-${{ matrix.name }}.tar.gz.sha256
+            ffx-${{ matrix.name }}.tar.gz
+            ffx-${{ matrix.name }}.tar.gz.sha256
 
   web:
     if: >-
@@ -84,20 +84,20 @@ jobs:
 
       - name: Package web artifacts
         run: |
-          cp sdk/fx-sdk.js fx-sdk.js
-          cp zig-out/bin/fx-term.wasm fx-term.wasm
-          sha256sum fx-sdk.js > fx-sdk.js.sha256
-          sha256sum fx-term.wasm > fx-term.wasm.sha256
+          cp sdk/ffx-sdk.js ffx-sdk.js
+          cp zig-out/bin/ffx-term.wasm ffx-term.wasm
+          sha256sum ffx-sdk.js > ffx-sdk.js.sha256
+          sha256sum ffx-term.wasm > ffx-term.wasm.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fx-web
+          name: ffx-web
           path: |
-            fx-sdk.js
-            fx-sdk.js.sha256
-            fx-term.wasm
-            fx-term.wasm.sha256
+            ffx-sdk.js
+            ffx-sdk.js.sha256
+            ffx-term.wasm
+            ffx-term.wasm.sha256
 
   publish:
     needs: [build, web]
@@ -105,7 +105,7 @@ jobs:
     env:
       RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
       BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
-      FX_WEB_DEPLOY_HOOK_URL: ${{ secrets.FX_WEB_DEPLOY_HOOK_URL }}
+      FFX_WEB_DEPLOY_HOOK_URL: ${{ secrets.FFX_WEB_DEPLOY_HOOK_URL }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -120,7 +120,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for FILE in fx-*.tar.gz fx-*.tar.gz.sha256; do
+          for FILE in ffx-*.tar.gz ffx-*.tar.gz.sha256; do
             [ -f "$FILE" ] || continue
             CONTENT_TYPE="application/octet-stream"
             [[ "$FILE" == *.sha256 ]] && CONTENT_TYPE="text/plain"
@@ -145,10 +145,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          sha256sum --check fx-sdk.js.sha256
-          sha256sum --check fx-term.wasm.sha256
+          sha256sum --check ffx-sdk.js.sha256
+          sha256sum --check ffx-term.wasm.sha256
 
-          for FILE in fx-sdk.js fx-sdk.js.sha256 fx-term.wasm fx-term.wasm.sha256; do
+          for FILE in ffx-sdk.js ffx-sdk.js.sha256 ffx-term.wasm ffx-term.wasm.sha256; do
             CONTENT_TYPE="application/octet-stream"
             [[ "$FILE" == *.js ]] && CONTENT_TYPE="text/javascript"
             [[ "$FILE" == *.wasm ]] && CONTENT_TYPE="application/wasm"
@@ -200,9 +200,9 @@ jobs:
           fi
           echo "updated=true" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy fx-web
-        if: steps.point-dev.outputs.updated == 'true' && env.FX_WEB_DEPLOY_HOOK_URL != ''
+      - name: Deploy ffx-web
+        if: steps.point-dev.outputs.updated == 'true' && env.FFX_WEB_DEPLOY_HOOK_URL != ''
         run: |
           curl --fail --silent --show-error \
             --retry 3 --retry-all-errors --max-time 30 \
-            -X POST "$FX_WEB_DEPLOY_HOOK_URL"
+            -X POST "$FFX_WEB_DEPLOY_HOOK_URL"

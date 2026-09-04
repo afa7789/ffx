@@ -2,7 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
-const auth_runtime = @import("../auth/auth_runtime.zig");
+const background_record_liveness = @import("../background/background_record_liveness.zig");
+const background_store = @import("../background/background_store.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
@@ -13,23 +14,26 @@ const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
+const native_keychain = @import("../hosts/native_keychain.zig");
+const builtin_providers = @import("../../builtins/providers.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
-const provider_set = @import("../gateway/provider_set.zig");
-const execution_process_provider = @import("../execution/process_provider.zig");
+const agent_stream_provider = @import("../agent/stream_provider.zig");
+const background_process_provider = @import(
+    "../execution/background_process_provider.zig",
+);
 const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
-const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
+const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const session_store = @import("../session/session_store.zig");
-const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
@@ -41,12 +45,7 @@ else
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
-const mcp_command_provider = @import("../mcp/command_provider.zig");
-const mcp_health = @import("../mcp/health.zig");
-const project_config = @import("../mcp/project_config.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
-const text_utils = @import("../shared/text_utils.zig");
-const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
@@ -68,10 +67,10 @@ pub const Command = union(enum) {
     setup: []const [:0]const u8,
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
-    mcp: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
     doctor: []const [:0]const u8,
+    background: []const [:0]const u8,
     teams: []const [:0]const u8,
     session: []const [:0]const u8,
     sessions: []const [:0]const u8,
@@ -91,15 +90,6 @@ const ResumeInvocation = struct {
 
 const resume_id_alias_prefix = "--resume-";
 pub const upgrade_relaunch_arg = "--upgrade-relaunch";
-
-pub const UpgradeRelaunch = struct {
-    previous_revision: ?[]u8 = null,
-
-    pub fn deinit(self: *UpgradeRelaunch, alloc: Allocator) void {
-        if (self.previous_revision) |revision| alloc.free(revision);
-        self.* = undefined;
-    }
-};
 
 // The one resume alias that asks which session to open. Every other spelling
 // names its target, so it resumes without a prompt.
@@ -138,12 +128,12 @@ pub const LaunchModifiers = struct {
 
 pub const InteractiveLaunch = struct {
     requested_resume: ?ResumeTarget = null,
-    upgrade_relaunch: ?UpgradeRelaunch = null,
+    upgrade_relaunch: bool = false,
+    record_requested: bool = false,
     modifiers: LaunchModifiers = .{},
 
     pub fn deinit(self: *InteractiveLaunch, alloc: Allocator) void {
         if (self.requested_resume) |*target| target.deinit(alloc);
-        if (self.upgrade_relaunch) |*relaunch| relaunch.deinit(alloc);
         self.modifiers.deinit(alloc);
         self.* = undefined;
     }
@@ -156,13 +146,31 @@ pub const RunResult = union(enum) {
     handled_exit: u8,
 };
 
-const version_usage = "usage: fx --version\n";
+pub const record_modifier_usage = "usage: ffx --record is only supported for interactive startup\n";
+const version_usage = "usage: ffx --version\n";
+
+pub fn recordRequested(args: []const [:0]const u8) error{RecordModifierRequiresInteractive}!bool {
+    var count: usize = 0;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--record")) count += 1;
+    }
+    if (count == 0) return false;
+    if (count != 1) return error.RecordModifierRequiresInteractive;
+    if (args.len == 1 and std.mem.eql(u8, args[0], "--record")) return true;
+    if (args.len >= 2 and
+        (std.mem.eql(u8, args[0], "resume") or std.mem.eql(u8, args[0], "--resume")) and
+        std.mem.eql(u8, args[args.len - 1], "--record")) return true;
+    if (args.len >= 3 and
+        std.mem.eql(u8, args[0], "session") and
+        std.mem.eql(u8, args[1], "resume") and
+        std.mem.eql(u8, args[args.len - 1], "--record")) return true;
+    return error.RecordModifierRequiresInteractive;
+}
 
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
     build_channel: update_target.Channel = .stable,
-    auth_mode: credentials.AuthMode = .local,
     command_catalog: CommandCatalog,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -170,8 +178,14 @@ pub const Config = struct {
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     gateway_provider: gateway_provider.Provider,
-    provider_set: provider_set.Set,
-    process_provider: execution_process_provider.Provider = execution_process_provider.unavailable_provider,
+    codex_agent_stream: ?agent_stream_provider.Provider = null,
+    codex_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    codex_model_catalog: ?model_catalog.Provider = null,
+    grok_agent_stream: ?agent_stream_provider.Provider = null,
+    grok_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    grok_model_catalog: ?model_catalog.Provider = null,
+    background_process_provider: background_process_provider.Provider =
+        background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
     secret_store: host.SecretStore,
     prompt_policy: prompt_policy.Policy,
@@ -188,24 +202,36 @@ pub const Config = struct {
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
-    inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
-        mcp_health.inspectLocalConfigUnavailable,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
-    add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
-        mcp_command_provider.addProfileServerUnavailable,
-    remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
-        mcp_command_provider.removeProfileServerUnavailable,
     acp_runner: acp_runner.Runner,
+    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
 
 const LocalSurfaceOptions = struct {
     format: output_contracts.OutputFormat = .text,
 };
 
-fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
-    if (rest.len == 0) return null;
+const LoginTarget = union(enum) {
+    codex,
+    grok,
+    /// Direct API-key provider: ffx reads the key from stdin, stores it, and
+    /// selects the provider.
+    direct: model_provider.ProviderId,
+};
+
+fn parseLoginProvider(rest: []const [:0]const u8) !LoginTarget {
     if (rest.len != 1) return error.InvalidLoginProviderArgs;
-    return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
+    if (std.ascii.eqlIgnoreCase(rest[0], "codex")) return .codex;
+    if (std.ascii.eqlIgnoreCase(rest[0], "grok")) return .grok;
+    if (model_provider.parse(rest[0])) |provider| {
+        switch (provider) {
+            .gateway, .codex, .grok => {},
+            else => return .{ .direct = provider },
+        }
+    }
+    return error.InvalidLoginProviderArgs;
 }
 
 fn selectCatalogModel(
@@ -242,6 +268,18 @@ const WorkspaceOptions = struct {
     action: ?workspace_commands.Action = null,
 };
 
+const PersistedRecordTarget = union(enum) {
+    last,
+    id: u64,
+};
+
+const PersistedRecordOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    target: ?PersistedRecordTarget = null,
+};
+
+// `ffx session` reads one saved session, so it names its target and never
+// reaches for the picker that `ResumeTarget` carries.
 const SessionDetailTarget = union(enum) {
     last,
     id: []u8,
@@ -303,11 +341,9 @@ const WorkflowOptions = struct {
 
 const WriteFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
+const LoadCatalogStartupStateFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupStatus;
-const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
-const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
-const LoadStartupStatusWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupStatus;
 const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
 const SelfExePathFn = *const fn (?*anyopaque, Allocator) anyerror![]u8;
@@ -322,11 +358,9 @@ const RunDeps = struct {
     write_stdout: WriteFn = writeRealStdout,
     write_stderr: WriteFn = writeRealStderr,
     load_startup_state: LoadStartupStateFn = app_lifecycle.loadStartupState,
+    load_catalog_startup_state: LoadCatalogStartupStateFn = app_lifecycle.loadCatalogStartupState,
     load_startup_state_without_credentials: LoadStartupStateWithoutCredentialsFn = app_lifecycle.loadStartupStateWithoutCredentials,
     load_startup_status: LoadStartupStatusFn = app_lifecycle.loadStartupStatus,
-    load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
-    load_catalog_startup_state_with_auth_mode: LoadCatalogStartupStateWithAuthModeFn = app_lifecycle.loadCatalogStartupStateWithAuthMode,
-    load_startup_status_with_auth_mode: LoadStartupStatusWithAuthModeFn = app_lifecycle.loadStartupStatusWithAuthMode,
     getenv: GetenvFn = getenvDefault,
     environ_map: EnvironMapFn = environMapDefault,
     self_exe_path: SelfExePathFn = selfExePathDefault,
@@ -406,26 +440,21 @@ fn parseGlobalLaunchArgs(
 /// Startup uses this same surface to select the full runtime configuration
 /// before the allocating parser runs.
 pub fn commandAfterGlobalLaunchArgs(args: []const [:0]const u8) ?[]const u8 {
-    const remaining = argsAfterGlobalLaunchArgs(args);
-    return if (remaining.len > 0) remaining[0] else null;
-}
-
-pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u8 {
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
             index += 1;
-            if (index >= args.len) return &.{};
+            if (index >= args.len) return null;
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
-            return args[index..];
+            return arg;
         }
         index += 1;
     }
-    return &.{};
+    return null;
 }
 
 pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Command {
@@ -450,7 +479,10 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .ask)) return .{ .ask = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .acp)) return .{ .acp = args[1..] };
         },
-        'b' => if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] },
+        'b' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .background)) return .{ .background = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] };
+        },
         'c' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] };
         },
@@ -465,7 +497,6 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .logout)) return .{ .logout = args[1..] };
         },
         'm' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .mcp)) return .{ .mcp = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .models)) return .{ .models = args[1..] };
         },
         'p' => {
@@ -534,6 +565,14 @@ pub fn parseInteractiveLaunch(
         return .{ .interactive = .{ .modifiers = global_args.takeModifiers() } };
     }
 
+    const record_requested = try recordRequested(effective_args);
+    if (record_requested and effective_args.len == 1) {
+        return .{ .interactive = .{
+            .record_requested = true,
+            .modifiers = global_args.takeModifiers(),
+        } };
+    }
+
     const command = parse(command_catalog, effective_args);
     if (topLevelHelpRequest(command_catalog, effective_args) != null) {
         return .{ .noninteractive = .{
@@ -544,35 +583,31 @@ pub fn parseInteractiveLaunch(
     }
     switch (command) {
         .interactive => return .{ .interactive = .{
+            .record_requested = record_requested,
             .modifiers = global_args.takeModifiers(),
         } },
         .resume_session => |invocation| {
-            const resume_args = invocation.args;
-            const has_upgrade_relaunch = !invocation.top_level_alias and
-                resume_args.len >= 2 and
+            const resume_args = if (record_requested)
+                invocation.args[0 .. invocation.args.len - 1]
+            else
+                invocation.args;
+            const upgrade_relaunch = !invocation.top_level_alias and
+                resume_args.len == 2 and
                 std.mem.eql(u8, resume_args[1], upgrade_relaunch_arg);
-            if (has_upgrade_relaunch and resume_args.len > 3) return error.InvalidResumeArgs;
-            var upgrade_relaunch: ?UpgradeRelaunch = null;
-            errdefer if (upgrade_relaunch) |*relaunch| relaunch.deinit(alloc);
-            if (has_upgrade_relaunch) {
-                const previous_revision = if (resume_args.len == 3) revision: {
-                    if (!update_target.isValidRevision(resume_args[2])) return error.InvalidResumeArgs;
-                    break :revision try alloc.dupe(u8, resume_args[2]);
-                } else null;
-                upgrade_relaunch = .{ .previous_revision = previous_revision };
-            }
-            const target_args = if (has_upgrade_relaunch) resume_args[0..1] else resume_args;
+            const target_args = if (upgrade_relaunch)
+                resume_args[0..1]
+            else
+                resume_args;
             const target = try parseResumeArgs(
                 alloc,
                 command_catalog,
                 target_args,
                 invocation.top_level_alias,
             );
-            const relaunch = upgrade_relaunch;
-            upgrade_relaunch = null;
             return .{ .interactive = .{
                 .requested_resume = target,
-                .upgrade_relaunch = relaunch,
+                .upgrade_relaunch = upgrade_relaunch,
+                .record_requested = record_requested,
                 .modifiers = global_args.takeModifiers(),
             } };
         },
@@ -584,8 +619,8 @@ pub fn parseInteractiveLaunch(
     }
 }
 
-/// Detects `fx <subcommand> --help` / `-h` and returns the subcommand kind so the
-/// caller can render command-specific help. Top-level `fx --help`/`fx help` are
+/// Detects `ffx <subcommand> --help` / `-h` and returns the subcommand kind so the
+/// caller can render command-specific help. Top-level `ffx --help`/`ffx help` are
 /// handled separately and intentionally excluded here.
 fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const u8) ?TopLevelKind {
     if (args.len < 2) return null;
@@ -612,6 +647,10 @@ fn runNoConfigIfRequestedWithDeps(
     command_catalog: CommandCatalog,
     deps: RunDeps,
 ) !bool {
+    _ = recordRequested(args) catch {
+        try writeStderr(deps, record_modifier_usage);
+        return true;
+    };
     if (args.len != 1 or !command_specs.matchesTopLevel(command_catalog, args[0], .help)) {
         return false;
     }
@@ -624,34 +663,6 @@ const ProviderActivationCaller = enum {
     provider_login,
 };
 
-const CliTeamValidationContext = struct {
-    alloc: Allocator,
-    cfg: *const Config,
-};
-
-fn validateCliTeamCredential(
-    raw: ?*anyopaque,
-    candidate: credentials.Credential,
-) std.mem.Allocator.Error!login_flow.TeamValidationResult {
-    const context: *CliTeamValidationContext = @ptrCast(@alignCast(raw.?));
-    const access = credentials.catalogAccessAt(candidate, io_mod.milliTimestamp());
-    if (access.authorizationCredential() == null) return .rejected;
-    const provider = context.cfg.provider_set.gateway.model_catalog orelse return .rejected;
-    const fetched = try provider.fetch(context.alloc, .{
-        .access = access,
-        .endpoint = context.cfg.models_path,
-        .view = .picker,
-    });
-    return switch (fetched) {
-        .failure => .rejected,
-        .catalog => |catalog_value| result: {
-            var catalog = catalog_value;
-            defer model_catalog.freeModelCatalog(context.alloc, &catalog);
-            break :result if (catalog.items.len > 0) .accepted else .rejected;
-        },
-    };
-}
-
 fn writeProviderActivationError(
     alloc: Allocator,
     deps: RunDeps,
@@ -661,15 +672,10 @@ fn writeProviderActivationError(
     const message = try std.fmt.allocPrint(
         alloc,
         "{s}: {s}\n",
-        .{ if (caller == .provider_login) "fx login" else "fx provider", detail },
+        .{ if (caller == .provider_login) "ffx login" else "ffx provider", detail },
     );
     defer alloc.free(message);
     try writeStderr(deps, message);
-}
-
-fn writeHostManagedAuthResult(deps: RunDeps) !void {
-    try writeStdout(deps, credentials.host_managed_auth_message);
-    try writeStdout(deps, "\n");
 }
 
 fn activateProviderSelection(
@@ -678,56 +684,6 @@ fn activateProviderSelection(
     deps: RunDeps,
     target: model_provider.ProviderId,
     caller: ProviderActivationCaller,
-    exact_source: ?credentials.Source,
-) !bool {
-    return activateProviderSelectionFallible(alloc, cfg, deps, target, caller, exact_source) catch |err| {
-        switch (err) {
-            error.CredentialStorageUnavailable,
-            error.CredentialTemporarilyUnavailable,
-            error.CredentialRefreshPersistenceUncertain,
-            error.CredentialAuthorityChanged,
-            => {},
-            else => return err,
-        }
-        const detail = try auth_runtime.preparationFailureText(alloc, target, err);
-        defer alloc.free(detail);
-        try writeProviderActivationError(alloc, deps, caller, detail);
-        return false;
-    };
-}
-
-fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
-    switch (provider) {
-        .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
-        .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
-        .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
-    }
-}
-
-fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_provider.ProviderId, caller: ProviderActivationCaller, err: anyerror) !void {
-    debug_trace.logf("auth", "provider sign-in failed provider={t} err={s}", .{ provider, @errorName(err) });
-    const failure = auth_runtime.classifyCredentialFailure(provider_catalog.find(provider).login_source, err);
-    if (failure.reason == .invalid_storage or failure.reason == .persistence_uncertain) {
-        const detail = try auth_runtime.preparationFailureText(alloc, provider, err);
-        defer alloc.free(detail);
-        try writeProviderActivationError(alloc, deps, caller, detail);
-        return;
-    }
-    try writeProviderActivationError(alloc, deps, caller, switch (err) {
-        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first",
-        error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
-        error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run fx login again",
-        else => "failed to sign in",
-    });
-}
-
-fn activateProviderSelectionFallible(
-    alloc: Allocator,
-    cfg: Config,
-    deps: RunDeps,
-    target: model_provider.ProviderId,
-    caller: ProviderActivationCaller,
-    exact_source: ?credentials.Source,
 ) !bool {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
@@ -738,52 +694,53 @@ fn activateProviderSelectionFallible(
     };
     defer settings.deinit(alloc);
 
-    const preferred_source = exact_source orelse settings.credential_source;
-    var prepared_credential = if (cfg.auth_mode == .host_managed)
-        null
-    else
-        try auth_runtime.prepareCredential(
-            alloc,
-            cfg.gateway_provider.oauth_transport,
-            cfg.secret_store,
-            target,
-            preferred_source,
-        );
-    defer if (prepared_credential) |*credential| credential.deinit(alloc);
+    var resolution = try credentials.resolveForProvider(
+        alloc,
+        cfg.secret_store,
+        model_provider.registryId(target),
+    );
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
 
     const already_selected = (settings.provider orelse .gateway) == target;
-    if (caller == .provider_command and already_selected and
-        (cfg.auth_mode == .host_managed or prepared_credential != null))
-    {
+    if (caller == .provider_command and already_selected and resolution.credential != null) {
         try writeStdout(deps, switch (target) {
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            else => "Provider is already selected.\n",
         });
         return true;
     }
 
     var performed_login: ?model_provider.ProviderId = null;
-    if (cfg.auth_mode == .local and prepared_credential == null and provider_catalog.find(target).subscription and caller == .provider_command) {
-        runProviderLogin(alloc, cfg, target) catch |err| {
-            try writeProviderLoginFailure(alloc, deps, target, caller, err);
+    if (resolution.credential == null and target == .codex and caller == .provider_command) {
+        chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
+            debug_trace.logf("auth", "provider selection Codex login failed err={s}", .{@errorName(err)});
+            try writeProviderActivationError(alloc, deps, caller, "Codex login failed");
             return false;
         };
-        performed_login = target;
-        prepared_credential = try auth_runtime.prepareCredential(
+        performed_login = .codex;
+        resolution = try credentials.resolveForProvider(
             alloc,
-            cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
-            target,
-            preferred_source,
+            @tagName(target),
+        );
+    }
+    if (resolution.credential == null and target == .grok and caller == .provider_command) {
+        grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
+            debug_trace.logf("auth", "provider selection Grok login failed err={s}", .{@errorName(err)});
+            try writeProviderActivationError(alloc, deps, caller, "Grok login failed");
+            return false;
+        };
+        performed_login = .grok;
+        resolution = try credentials.resolveForProvider(
+            alloc,
+            cfg.secret_store,
+            @tagName(target),
         );
     }
 
-    const credential = if (cfg.auth_mode == .host_managed)
-        null
-    else if (prepared_credential) |*value|
-        value
-    else {
+    const credential = if (resolution.credential) |*value| value else {
         try writeProviderActivationError(
             alloc,
             deps,
@@ -792,46 +749,30 @@ fn activateProviderSelectionFallible(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
+                else => "Provider credential is unavailable",
             },
         );
         return false;
     };
-    const catalog_provider = cfg.provider_set.select(target).model_catalog orelse {
-        try writeProviderActivationError(alloc, deps, caller, switch (target) {
-            .codex => "Codex model catalog is unavailable",
-            .grok => "Grok model catalog is unavailable",
-            .gateway => "Gateway model catalog is unavailable",
-        });
-        return false;
+    const catalog_provider = switch (target) {
+        .codex => cfg.codex_model_catalog orelse {
+            try writeProviderActivationError(alloc, deps, caller, "Codex model catalog is unavailable");
+            return false;
+        },
+        .grok => cfg.grok_model_catalog orelse {
+            try writeProviderActivationError(alloc, deps, caller, "Grok model catalog is unavailable");
+            return false;
+        },
+        .gateway => cfg.gateway_provider.model_catalog,
+        .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.modelCatalog(target),
     };
     const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
-        .access = if (cfg.auth_mode == .host_managed)
-            .host_managed
-        else
-            credentials.catalogAccessAt(
-                credential.?.*,
-                io_mod.milliTimestamp(),
-            ).withExplicitAuthority(),
+        .access = credentials.catalogAccessAt(credential.*),
         .endpoint = cfg.models_path,
         .view = .picker,
     });
     var loaded = switch (fetch_result) {
-        .loaded => |loaded| blk: {
-            if (loaded.provenance.access.level != .authenticated or
-                loaded.provenance.anonymous_fallback_used)
-            {
-                var rejected = loaded.catalog;
-                model_catalog.freeModelCatalog(alloc, &rejected);
-                try writeProviderActivationError(
-                    alloc,
-                    deps,
-                    caller,
-                    "target credential did not produce an authenticated model catalog",
-                );
-                return false;
-            }
-            break :blk loaded;
-        },
+        .loaded => |loaded| loaded,
         .failed => |failure| {
             debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
             const detail = try std.fmt.allocPrint(
@@ -845,15 +786,21 @@ fn activateProviderSelectionFallible(
         },
     };
     defer model_catalog.freeModelCatalog(alloc, &loaded.catalog);
-    const saved_model = settings.models.get(target);
+    const saved_model = switch (target) {
+        .gateway => settings.model,
+        .codex => settings.codex_model,
+        .grok => settings.grok_model,
+        .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => settings.model,
+    };
     const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
         try writeProviderActivationError(alloc, deps, caller, "target model catalog is empty");
         return false;
     };
-    var attempt = config_runtime.attemptUserPreferences(alloc, .{
-        .provider = target,
-        .model_preference = .{ .provider = target, .model = selected_model },
-        .credential_source = exact_source,
+    var attempt = config_runtime.attemptUserPreferences(alloc, switch (target) {
+        .gateway => .{ .provider = target, .model = selected_model },
+        .codex => .{ .provider = target, .codex_model = selected_model },
+        .grok => .{ .provider = target, .grok_model = selected_model },
+        .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => .{ .provider = target, .model = selected_model },
     });
     defer attempt.deinit(alloc);
     switch (attempt) {
@@ -867,20 +814,134 @@ fn activateProviderSelectionFallible(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        else => unreachable,
     };
-    if (caller == .provider_command) {
-        try writeStdout(deps, switch (target) {
-            .gateway => "Provider set to Gateway.\n",
-            .codex => "Provider set to Codex.\n",
-            .grok => "Provider set to Grok.\n",
-        });
+    return true;
+}
+
+fn readLoginApiKeyLine(alloc: Allocator) ![]u8 {
+    var read_buf: [4096]u8 = undefined;
+    var reader = std.Io.File.stdin().reader(io_mod.getIo(), &read_buf);
+    const line = reader.interface.takeDelimiter('\n') catch |err| return err;
+    return try alloc.dupe(u8, line orelse "");
+}
+
+/// Pasted keys arrive with terminal whitespace; trim before validation.
+fn normalizeEnteredKey(alloc: Allocator, raw: []const u8) ![]u8 {
+    return try alloc.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
+}
+
+/// Keychain first; when the keychain is unavailable or disabled, fall back to
+/// the `api_keys` map in `~/.ffx/settings.json`.
+fn storeDirectProviderApiKey(alloc: Allocator, target: model_provider.ProviderId, key: []const u8) !void {
+    if (!native_keychain.isAvailable() or native_keychain.isDisabled())
+        return persistApiKeyInSettings(alloc, model_provider.registryId(target), key);
+    native_keychain.saveApiKey(alloc, model_provider.registryId(target), key) catch |err| switch (err) {
+        error.UnsupportedPlatform => return persistApiKeyInSettings(alloc, model_provider.registryId(target), key),
+        else => return err,
+    };
+}
+
+fn persistApiKeyInSettings(alloc: Allocator, provider_id: []const u8, key: []const u8) !void {
+    var api_keys: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer api_keys.deinit(alloc);
+    try api_keys.put(alloc, provider_id, key);
+    _ = try config_runtime.setUserPreferences(alloc, .{ .api_keys = api_keys });
+}
+
+fn activateDirectProvider(alloc: Allocator, target: model_provider.ProviderId) !bool {
+    const entry = builtin_providers.byId(model_provider.registryId(target)) orelse return false;
+    var attempt = config_runtime.attemptUserPreferences(alloc, .{
+        .provider = target,
+        .model = entry.default_model,
+    });
+    defer attempt.deinit(alloc);
+    switch (attempt) {
+        .failure => |failure| {
+            debug_trace.logf("config", "direct provider selection persistence failed err={s}", .{@errorName(failure.err)});
+            return false;
+        },
+        .outcome => {},
     }
     return true;
 }
 
+fn runDirectProviderLogin(
+    alloc: Allocator,
+    deps: RunDeps,
+    target: model_provider.ProviderId,
+) !RunResult {
+    const entry = builtin_providers.byId(model_provider.registryId(target)) orelse {
+        try writeStderr(deps, "ffx login: unknown provider\n");
+        return .handled_failure;
+    };
+
+    const prompt = try std.fmt.allocPrint(alloc, "Paste your {s} API key: ", .{entry.display_name});
+    defer alloc.free(prompt);
+    try writeStderr(deps, prompt);
+
+    const raw = try readLoginApiKeyLine(alloc);
+    defer alloc.free(raw);
+    const key = try normalizeEnteredKey(alloc, raw);
+    defer alloc.free(key);
+    if (key.len == 0) {
+        try writeStderr(deps, "ffx login: no API key entered\n");
+        return .handled_failure;
+    }
+
+    storeDirectProviderApiKey(alloc, target, key) catch |err| {
+        debug_trace.logf("auth", "direct provider key store failed provider={s} err={s}", .{ @tagName(target), @errorName(err) });
+        try writeStderr(deps, "ffx login: failed to store the API key\n");
+        return .handled_failure;
+    };
+    if (!try activateDirectProvider(alloc, target)) {
+        try writeStderr(deps, "ffx login: failed to save the provider selection\n");
+        return .handled_failure;
+    }
+
+    const message = try std.fmt.allocPrint(alloc, "{s} configured.\n", .{entry.display_name});
+    defer alloc.free(message);
+    try writeStdout(deps, message);
+    return .handled_success;
+}
+
+fn removeDirectProviderApiKey(alloc: Allocator, target: model_provider.ProviderId) !void {
+    if (!native_keychain.isDisabled()) {
+        native_keychain.deleteApiKey(alloc, model_provider.registryId(target)) catch |err| switch (err) {
+            // The settings fallback owns the key where the keychain cannot exist.
+            error.UnsupportedPlatform => {},
+            else => return err,
+        };
+    }
+    _ = try config_runtime.setUserPreferences(alloc, .{ .clear_api_key = model_provider.registryId(target) });
+}
+
+fn runDirectProviderLogout(
+    alloc: Allocator,
+    deps: RunDeps,
+    target: model_provider.ProviderId,
+) !RunResult {
+    removeDirectProviderApiKey(alloc, target) catch |err| {
+        debug_trace.logf("auth", "direct provider key removal failed provider={s} err={s}", .{ @tagName(target), @errorName(err) });
+        try writeStderr(deps, "ffx logout: failed to remove the stored API key\n");
+        return .handled_failure;
+    };
+    const display_name = if (builtin_providers.byId(model_provider.registryId(target))) |entry|
+        entry.display_name
+    else
+        @tagName(target);
+    const message = try std.fmt.allocPrint(alloc, "Removed the {s} API key.\n", .{display_name});
+    defer alloc.free(message);
+    try writeStdout(deps, message);
+    return .handled_success;
+}
+
 fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
     const parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
+        if (err == error.RecordModifierRequiresInteractive) {
+            try writeStderr(deps, record_modifier_usage);
+            return .handled_failure;
+        }
         if (err == error.InvalidResumeArgs) {
             try writeTopLevelUsage(cfg.command_catalog, deps, .@"resume");
             return .handled_failure;
@@ -888,19 +949,16 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         var writer: std.Io.Writer.Allocating = .init(alloc);
         defer writer.deinit();
         if (globalLaunchErrorMessage(err)) |message| {
-            try writer.writer.print("fx: {s}\n", .{message});
+            try writer.writer.print("ffx: {s}\n", .{message});
         } else {
-            try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
+            try writer.writer.print("ffx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: ffx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
     switch (parsed_launch) {
-        .interactive => |launch| {
-            try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
-            return .{ .interactive = launch };
-        },
+        .interactive => |launch| return .{ .interactive = launch },
         .noninteractive => |value| {
             var noninteractive = value;
             defer noninteractive.deinit(alloc);
@@ -950,25 +1008,26 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .ask => |rest| {
-            try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
             const exit_code = try cli_ask.run(alloc, rest, workflowConfigWithLaunchModifiers(cfg, global_args.modifiers), cfg.context_registry, cfg.tool_set);
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--log-file <path>]\n");
+                try writeStderr(deps, "usage: ffx acp [--model <id>] [--log-file <path>]\n");
                 return .handled_failure;
             };
             try cfg.acp_runner.run(alloc, .{
-                .auth_mode = cfg.auth_mode,
                 .default_model = cfg.default_model,
                 .default_agent_step_limit = cfg.default_agent_step_limit,
                 .gateway_retry_count = cfg.gateway_retry_count,
                 .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
                 .gateway_models_path = cfg.models_path,
                 .gateway_provider = cfg.gateway_provider,
-                .provider_set = cfg.provider_set,
-                .process_provider = cfg.process_provider,
+                .codex_agent_stream = cfg.codex_agent_stream,
+                .codex_model_catalog = cfg.codex_model_catalog,
+                .grok_agent_stream = cfg.grok_agent_stream,
+                .grok_model_catalog = cfg.grok_model_catalog,
+                .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
                 .prompt_policy = cfg.prompt_policy,
                 .ignored_list_entries = cfg.ignored_list_entries,
@@ -981,6 +1040,9 @@ fn runNonInteractiveWithDeps(
                 .max_history_turns = cfg.max_history_turns,
                 .context_registry = cfg.context_registry,
                 .mode_registry = cfg.mode_registry,
+                .permission_reviewer_provider = cfg.permission_reviewer_provider,
+                .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
+                .grok_permission_reviewer_provider = cfg.grok_permission_reviewer_provider,
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
@@ -992,49 +1054,60 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
-            const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+            const login_provider = parseLoginProvider(rest) catch {
+                try writeStderr(deps, "usage: ffx login [codex|grok|minimax|openrouter|zhipu|deepseek|anthropic|openai|zai|alibaba-cloud|opencode-go]\n");
                 return .handled_failure;
             };
-            if (cfg.auth_mode == .host_managed) {
-                try writeHostManagedAuthResult(deps);
-                return .handled_success;
+            switch (login_provider) {
+                .codex => {
+                    chatgpt_oauth.runLogin(
+                        alloc,
+                        cfg.gateway_provider.oauth_transport,
+                        cfg.url_opener,
+                    ) catch |err| {
+                        const message = switch (err) {
+                            error.ChatGptLoginTimedOut => "ffx login: Codex authorization expired; run ffx login codex again\n",
+                            error.ChatGptAuthorizationFailed => "ffx login: Codex authorization denied\n",
+                            else => "ffx login: failed to sign in with Codex\n",
+                        };
+                        try writeStderr(deps, message);
+                        return .handled_failure;
+                    };
+                    if (!try activateProviderSelection(alloc, cfg, deps, .codex, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with Codex.\n");
+                },
+                .grok => {
+                    grok_oauth.runLogin(
+                        alloc,
+                        cfg.gateway_provider.oauth_transport,
+                        cfg.url_opener,
+                    ) catch |err| {
+                        debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
+                        try writeStderr(deps, "ffx login: failed to sign in with Grok\n");
+                        return .handled_failure;
+                    };
+                    if (!try activateProviderSelection(alloc, cfg, deps, .grok, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with Grok.\n");
+                },
+                .direct => |target| return runDirectProviderLogin(alloc, deps, target),
             }
-            // Preserve the original `fx login` behavior for scripts and users.
-            const login_provider = maybe_login_provider orelse .gateway;
-            runProviderLogin(alloc, cfg, login_provider) catch |err| {
-                try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
-                return .handled_failure;
-            };
-            if (!try activateProviderSelection(
-                alloc,
-                cfg,
-                deps,
-                login_provider,
-                .provider_login,
-                if (login_provider == .gateway) .fx_login else null,
-            )) return .handled_failure;
-            try writeStdout(deps, switch (login_provider) {
-                .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
-                .codex => "Signed in with Codex.\n",
-                .grok => "Signed in with Grok.\n",
-            });
             return .handled_success;
         },
         .logout => |rest| {
-            const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+            const login_provider = parseLoginProvider(rest) catch {
+                try writeStderr(deps, "usage: ffx logout [codex|grok|minimax|openrouter|zhipu|deepseek|anthropic|openai|zai|alibaba-cloud|opencode-go]\n");
                 return .handled_failure;
             };
-            if (cfg.auth_mode == .host_managed) {
-                try writeHostManagedAuthResult(deps);
-                return .handled_success;
+            if (login_provider == .direct) {
+                return runDirectProviderLogout(alloc, deps, login_provider.direct);
             }
-            // Preserve the original `fx logout` behavior for scripts and users.
-            const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                    try writeStderr(deps, "ffx logout: failed to durably remove saved Codex login\n");
                     return .handled_failure;
                 };
                 return switch (outcome) {
@@ -1047,18 +1120,18 @@ fn runNonInteractiveWithDeps(
                         break :result .handled_success;
                     },
                     .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                        try writeStderr(deps, "ffx logout: failed to durably remove saved Codex login\n");
                         break :result .handled_failure;
                     },
                 };
             }
             if (login_provider == .grok) {
                 const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                    try writeStderr(deps, "ffx logout: failed to durably remove saved Grok login\n");
                     return .handled_failure;
                 };
                 if (outcome.revocation_failed) {
-                    try writeStderr(deps, "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                    try writeStderr(deps, "ffx logout: local Grok session removed, but remote revocation could not be confirmed\n");
                 }
                 return switch (outcome.deletion) {
                     .deleted => result: {
@@ -1070,100 +1143,28 @@ fn runNonInteractiveWithDeps(
                         break :result .handled_success;
                     },
                     .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                        try writeStderr(deps, "ffx logout: failed to durably remove saved Grok login\n");
                         break :result .handled_failure;
                     },
                 };
             }
-            const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
-                error.SessionDeleteFailed => {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
-                    return .handled_failure;
-                },
-            };
-            if (!result.local_durability_failed) {
-                var preference = config_runtime.attemptUserPreferences(
-                    alloc,
-                    .{ .clear_credential_source = true },
-                );
-                defer preference.deinit(alloc);
-                switch (preference) {
-                    .outcome => {},
-                    .failure => |failure| {
-                        debug_trace.logf(
-                            "auth",
-                            "logout credential preference clear failed err={s}",
-                            .{@errorName(failure.err)},
-                        );
-                        try writeStderr(deps, "fx logout: signed out, but failed to clear the saved fx login selection\n");
-                        return .handled_failure;
-                    },
-                }
-            }
-            if (result.local_durability_failed) {
-                try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
-            } else {
-                try writeStdout(
-                    deps,
-                    if (result.session_deleted) "Signed out of fx.\n" else "No fx login session found.\n",
-                );
-            }
-            if (result.remote_revocation_failed) {
-                try writeStderr(deps, login_flow.remote_revocation_warning);
-                try writeStderr(deps, "\n");
-            }
-            return if (result.local_durability_failed) .handled_failure else .handled_success;
+            return .handled_success;
         },
         .teams => |rest| {
-            if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx teams\n");
-                return .handled_failure;
-            }
-            if (cfg.auth_mode == .host_managed) {
-                try writeHostManagedAuthResult(deps);
-                return .handled_success;
-            }
-            var validation_context = CliTeamValidationContext{ .alloc = alloc, .cfg = &cfg };
-            login_flow.runTeams(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                .{
-                    .context = &validation_context,
-                    .validate_fn = validateCliTeamCredential,
-                },
-            ) catch |err| {
-                const message = switch (err) {
-                    error.NoSession => "fx teams: run fx login first\n",
-                    error.SessionChanged => "fx teams: authentication changed; try again\n",
-                    error.TeamRequestFailed => "fx teams: failed to list Vercel teams\n",
-                    error.InvalidTeamSelection => "fx teams: no team selected\n",
-                    error.AccessDenied => "fx teams: authorization denied\n",
-                    error.TeamValidationFailed => "fx teams: selected team could not access AI Gateway\n",
-                    else => "fx teams: failed to switch team\n",
-                };
-                try writeStderr(deps, message);
-                return .handled_failure;
-            };
-            if (!try activateProviderSelection(
-                alloc,
-                cfg,
-                deps,
-                .gateway,
-                .provider_login,
-                .fx_login,
-            )) return .handled_failure;
-            return .handled_success;
+            _ = rest;
+            try writeStderr(deps, "ffx teams: Vercel team switching was removed\n");
+            return .handled_failure;
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: ffx provider <codex|grok|minimax|openrouter|zhipu|deepseek|anthropic|openai|zai|alibaba-cloud|opencode-go>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "ffx provider: unknown provider\n");
                 return .handled_failure;
             };
-            return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
+            return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
                 .handled_success
             else
                 .handled_failure;
@@ -1173,10 +1174,6 @@ fn runNonInteractiveWithDeps(
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
                 return .handled_failure;
             }
-            if (cfg.auth_mode == .host_managed) {
-                try writeHostManagedAuthResult(deps);
-                return .handled_success;
-            }
             return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
         },
         .status => |rest| {
@@ -1184,35 +1181,21 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .status, "status", err, rest);
                 return .handled_failure;
             };
-            var startup = if (cfg.auth_mode == .host_managed)
-                try deps.load_startup_status_with_auth_mode(
-                    alloc,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                    cfg.auth_mode,
-                )
-            else
-                try deps.load_startup_status(
-                    alloc,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                );
+            var startup = try deps.load_startup_status(
+                alloc,
+                cfg.secret_store,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
-            var mcp_inspection = try cfg.inspect_mcp_local_config(
-                alloc,
-                startup.workspace_root,
-            );
-            defer mcp_inspection.deinit(alloc);
+            const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
 
-            var snapshot = statusSnapshotFromStartupWithBuild(startup, .{
+            const snapshot = statusSnapshotFromStartupWithBuild(startup, .{
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
-            }, mcp_inspection.profile_diagnostic);
-            snapshot.mcp = localMcpView(&mcp_inspection);
+            }, mcp_config_diagnostic);
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1245,42 +1228,33 @@ fn runNonInteractiveWithDeps(
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
         },
-        .mcp => |rest| {
-            return runTopLevelMcp(alloc, rest, cfg, deps);
-        },
         .models => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .models, "models", err, rest);
                 return .handled_failure;
             };
 
-            var startup = if (cfg.auth_mode == .host_managed)
-                try deps.load_catalog_startup_state_with_auth_mode(
-                    alloc,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                    cfg.auth_mode,
-                )
-            else
-                try deps.load_startup_state(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                );
+            var startup = try deps.load_catalog_startup_state(
+                alloc,
+                cfg.secret_store,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             const catalog_access = startup.modelCatalogAccess();
-            const catalog_provider = cfg.provider_set.select(startup.provider).cli_model_catalog orelse {
-                try writeStderr(deps, switch (startup.provider) {
-                    .gateway => "fx models: Gateway model catalog is unavailable\n",
-                    .codex => "fx models: Codex model catalog is unavailable\n",
-                    .grok => "fx models: Grok model catalog is unavailable\n",
-                });
-                return .handled_failure;
+            const catalog_provider = switch (startup.provider) {
+                .codex => cfg.codex_cli_model_catalog orelse {
+                    try writeStderr(deps, "ffx models: Codex model catalog is unavailable\n");
+                    return .handled_failure;
+                },
+                .grok => cfg.grok_cli_model_catalog orelse {
+                    try writeStderr(deps, "ffx models: Grok model catalog is unavailable\n");
+                    return .handled_failure;
+                },
+                .gateway => cfg.gateway_provider.cli_model_catalog,
+                .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.cliModelCatalog(startup.provider),
             };
             const loaded = switch (catalog_provider.fetch(alloc, .{
                 .access = catalog_access,
@@ -1304,7 +1278,7 @@ fn runNonInteractiveWithDeps(
                             message,
                         );
                     } else {
-                        try writeStderr(deps, "fx models: ");
+                        try writeStderr(deps, "ffx models: ");
                         try writeStderr(deps, message);
                         try writeStderr(deps, "\n");
                     }
@@ -1330,30 +1304,89 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
-            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-            defer alloc.free(workspace_root);
-            var mcp_inspection = try cfg.inspect_mcp_local_config(
-                alloc,
-                workspace_root,
-            );
-            defer mcp_inspection.deinit(alloc);
+            const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
             var snapshot = try doctor_runtime.collect(
                 alloc,
                 cfg.secret_store,
                 cfg.default_model,
                 cfg.default_agent_step_limit,
-                mcp_inspection.profile_diagnostic,
+                mcp_config_diagnostic,
             );
             defer snapshot.deinit(alloc);
 
-            var output_snapshot = doctorSnapshotFromRuntime(snapshot);
-            output_snapshot.mcp = localMcpView(&mcp_inspection);
+            const output_snapshot = doctorSnapshotFromRuntime(snapshot);
             if (opts.format == .json) {
                 try writeDoctorJsonLine(alloc, deps, output_snapshot);
                 return .handled_success;
             }
 
             const text = try output_snapshot.render(alloc, opts.format);
+            defer alloc.free(text);
+            try writeFormattedOutput(deps, text, opts.format);
+            return .handled_success;
+        },
+        .background => |rest| {
+            const opts = parsePersistedRecordArgs(rest) catch |err| {
+                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .background, "background", err, rest);
+                return .handled_failure;
+            };
+
+            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+            defer alloc.free(workspace_root);
+
+            if (opts.target) |target| {
+                switch (target) {
+                    .id => |id| {
+                        var record = loadWorkspaceBackgroundRecord(
+                            alloc,
+                            cfg.background_process_provider,
+                            workspace_root,
+                            id,
+                        ) catch |err| {
+                            try writeLookupFailure(alloc, deps, "background", err, opts.format);
+                            return .handled_failure;
+                        };
+                        defer record.deinit(alloc);
+                        const text = try (output_contracts.BackgroundDetailSnapshot{ .record = record }).render(alloc, opts.format);
+                        defer alloc.free(text);
+                        try writeFormattedOutput(deps, text, opts.format);
+                        return .handled_success;
+                    },
+                    .last => {},
+                }
+            }
+
+            var records = loadWorkspaceBackgroundRecords(
+                alloc,
+                cfg.background_process_provider,
+                workspace_root,
+            ) catch |err| {
+                try writeLookupFailure(alloc, deps, "background", err, opts.format);
+                return .handled_failure;
+            };
+            defer {
+                for (records.items) |*entry| entry.deinit(alloc);
+                records.deinit(alloc);
+            }
+
+            if (opts.target) |target| {
+                switch (target) {
+                    .last => {
+                        const record = findBackgroundRecord(records.items, target) orelse {
+                            const err = if (records.items.len == 0) error.NoBackgroundRecords else error.BackgroundRecordNotFound;
+                            try writeLookupFailure(alloc, deps, "background", err, opts.format);
+                            return .handled_failure;
+                        };
+                        const text = try (output_contracts.BackgroundDetailSnapshot{ .record = record }).render(alloc, opts.format);
+                        defer alloc.free(text);
+                        try writeFormattedOutput(deps, text, opts.format);
+                        return .handled_success;
+                    },
+                    .id => unreachable,
+                }
+            }
+
+            const text = try (output_contracts.BackgroundListSnapshot{ .records = records.items }).render(alloc, opts.format);
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
@@ -1475,10 +1508,7 @@ fn runNonInteractiveWithDeps(
 
             switch (target) {
                 .last => {
-                    var summary = subagent_resume_admission.latestVisibleWorkspaceSummary(
-                        store,
-                        alloc,
-                    ) catch |err| {
+                    var summary = store.latestReadOnlyWorkspaceSummary(alloc) catch |err| {
                         try writeLookupFailure(alloc, deps, "session", err, opts.format);
                         return .handled_failure;
                     };
@@ -1492,8 +1522,7 @@ fn runNonInteractiveWithDeps(
                     return .handled_success;
                 },
                 .id => |id| {
-                    var detail = subagent_resume_admission.loadVisibleReadOnlyDetail(
-                        store,
+                    var detail = store.loadReadOnlyDetail(
                         alloc,
                         id,
                         .{},
@@ -1533,8 +1562,7 @@ fn runNonInteractiveWithDeps(
             };
             defer store.deinit(alloc);
 
-            var page = subagent_resume_admission.listVisiblePage(
-                store,
+            var page = store.listSessionPage(
                 alloc,
                 opts.scope,
                 opts.continuation,
@@ -1621,36 +1649,19 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .credits, "credits", err, rest);
                 return .handled_failure;
             };
-            var startup = if (cfg.auth_mode == .host_managed)
-                try deps.load_startup_state_with_auth_mode(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                    cfg.auth_mode,
-                )
-            else
-                try deps.load_startup_state(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                );
+            var startup = try deps.load_startup_state(
+                alloc,
+                cfg.gateway_provider.oauth_transport,
+                cfg.secret_store,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
-            const credits = cfg.provider_set.select(startup.provider).credits orelse
-                gateway_provider.unavailable_credits_provider;
-            var snapshot = credits.fetch(alloc, .{
+            var snapshot = cfg.gateway_provider.credits.fetch(alloc, .{
                 .credential = startup.apiKey(),
-                .credential_source = if (startup.auth_mode == .host_managed)
-                    .host_managed
-                else if (startup.credential) |credential|
-                    credential.source
-                else
-                    null,
+                .credential_source = if (startup.credential) |credential| credential.source else null,
                 .tenant = startup.gatewayTeam(),
             });
             defer snapshot.deinit(alloc);
@@ -1713,7 +1724,7 @@ fn runNonInteractiveWithDeps(
                 if (opts.format == .json) {
                     try writeJsonCommandFailure(alloc, deps, "upgrade", err, "failed to load update settings");
                 } else {
-                    try writeStderr(deps, "fx upgrade: failed to load update settings\n");
+                    try writeStderr(deps, "ffx upgrade: failed to load update settings\n");
                 }
                 return .handled_failure;
             };
@@ -1726,7 +1737,7 @@ fn runNonInteractiveWithDeps(
                     if (opts.format == .json) {
                         try writeJsonCommandFailure(alloc, deps, "upgrade", err, "failed to save update channel");
                     } else {
-                        try writeStderr(deps, "fx upgrade: failed to save update channel\n");
+                        try writeStderr(deps, "ffx upgrade: failed to save update channel\n");
                     }
                     return .handled_failure;
                 };
@@ -1746,7 +1757,7 @@ fn runNonInteractiveWithDeps(
                 .text => .text,
                 .json => .json,
             }) catch {
-                try writeStderr(deps, "fx upgrade: render failed\n");
+                try writeStderr(deps, "ffx upgrade: render failed\n");
                 return .handled_failure;
             };
             defer alloc.free(text);
@@ -1759,7 +1770,7 @@ fn runNonInteractiveWithDeps(
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
         .unknown => |command| {
-            try writeStderr(deps, "fx: unknown subcommand: ");
+            try writeStderr(deps, "ffx: unknown subcommand: ");
             try writeStderr(deps, command);
             try writeStderr(deps, "\n\n");
             try writeTopLevelHelp(alloc, cfg.command_catalog, deps, cfg.version, .stderr);
@@ -1804,7 +1815,7 @@ fn runGithubWorkflow(
     const prompt = switch (workflow) {
         .pull_request => github_workflows.buildPrompt(alloc, workflow, workflowLanguagePlaceholder(), opts.context) catch |err| switch (err) {
             error.NotGitRepository => {
-                try writeStderr(deps, "fx pr: requires running inside a git repository\n");
+                try writeStderr(deps, "ffx pr: requires running inside a git repository\n");
                 return .handled_failure;
             },
             else => return err,
@@ -1825,8 +1836,8 @@ fn runGithubWorkflow(
 
     const draft = github_publish.parseDraft(alloc, run_result.assistant_output) catch {
         try writeStderr(deps, switch (workflow) {
-            .pull_request => "fx pr: failed to parse drafted PR title/body\n",
-            .issue => "fx issue: failed to parse drafted issue title/body\n",
+            .pull_request => "ffx pr: failed to parse drafted PR title/body\n",
+            .issue => "ffx issue: failed to parse drafted issue title/body\n",
         });
         return .handled_failure;
     };
@@ -1839,8 +1850,8 @@ fn runGithubWorkflow(
     defer published.deinit(alloc);
     if (!published.ok) {
         try writeStderr(deps, switch (workflow) {
-            .pull_request => "fx pr: ",
-            .issue => "fx issue: ",
+            .pull_request => "ffx pr: ",
+            .issue => "ffx issue: ",
         });
         try writeStderr(deps, published.text);
         try writeStderr(deps, "\n");
@@ -1865,17 +1876,17 @@ fn runPasteSetup(
     deps: RunDeps,
 ) !bool {
     if (secret_store.isDisabled()) {
-        try writeStderr(deps, "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n");
+        try writeStderr(deps, "ffx setup: stored API keys are disabled by FFX_DISABLE_KEYCHAIN\n");
         return false;
     }
     if (!deps.setup_terminal_available(deps.setup_ctx)) {
-        try writeStderr(deps, "fx setup: an interactive terminal is required to paste an API key\n");
+        try writeStderr(deps, "ffx setup: an interactive terminal is required to paste an API key\n");
         return false;
     }
 
     try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
     const stored_interactively = secret_store.storeInteractive() catch {
-        try writeStderr(deps, "\nfx setup: API key was not saved\n");
+        try writeStderr(deps, "\nffx setup: API key was not saved\n");
         return false;
     };
     if (!stored_interactively) {
@@ -1885,13 +1896,13 @@ fn runPasteSetup(
             deps.write_stderr,
             deps.stderr_ctx,
         ) catch {
-            try writeStderr(deps, "\nfx setup: API key was not saved\n");
+            try writeStderr(deps, "\nffx setup: API key was not saved\n");
             return false;
         };
         defer secret.zeroAndFree(alloc, key);
         try writeStderr(deps, "\n");
         secret_store.store(alloc, key) catch {
-            try writeStderr(deps, "fx setup: API key was not saved\n");
+            try writeStderr(deps, "ffx setup: API key was not saved\n");
             return false;
         };
     }
@@ -2013,7 +2024,7 @@ fn writeConfigDiagnostics(
         var notice_writer: std.Io.Writer.Allocating = .init(alloc);
         defer notice_writer.deinit();
         try notice_writer.writer.print(
-            "fx: config {s}: {s}",
+            "ffx: config {s}: {s}",
             .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
         );
         try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
@@ -2101,12 +2112,8 @@ fn statusSnapshotFromStartupWithBuild(
         .build_channel = build.channel.label(),
         .build_revision = build.revision,
         .mcp_config_error = switch (mcp_config_diagnostic) {
-            .clear, .warning => null,
+            .clear => null,
             .failed => |err| @errorName(err),
-        },
-        .mcp_config_warning = switch (mcp_config_diagnostic) {
-            .warning => |warning| warning,
-            .clear, .failed => null,
         },
     };
 }
@@ -2167,442 +2174,9 @@ fn selfExePathDefault(_: ?*anyopaque, alloc: Allocator) ![]u8 {
 }
 
 fn writeTopLevelUsage(command_catalog: CommandCatalog, deps: RunDeps, kind: TopLevelKind) !void {
-    try writeStderr(deps, "usage: fx ");
+    try writeStderr(deps, "usage: ffx ");
     try writeStderr(deps, command_specs.topLevelUsage(command_catalog, kind));
     try writeStderr(deps, "\n");
-}
-
-const McpCommandRuntime = struct {
-    startup: app_lifecycle.StartupState,
-    runtime: ?*mcp_runtime.McpRuntime,
-
-    fn deinit(self: *McpCommandRuntime, alloc: Allocator) void {
-        if (self.runtime) |runtime| {
-            runtime.deinit();
-            alloc.destroy(runtime);
-        }
-        self.startup.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-fn localMcpView(
-    inspection: *const mcp_health.LocalConfigInspection,
-) output_contracts.McpLocalSnapshot {
-    return .{
-        .servers = inspection.snapshot.servers,
-        .configuration_issues = inspection.snapshot.configuration_issues,
-        .inspection_error = inspection.inspection_error,
-    };
-}
-
-fn loadMcpCommandRuntime(
-    alloc: Allocator,
-    cfg: Config,
-    deps: RunDeps,
-) !McpCommandRuntime {
-    var startup = try deps.load_startup_state_without_credentials(
-        alloc,
-        cfg.default_model,
-        cfg.default_agent_step_limit,
-    );
-    errdefer startup.deinit(alloc);
-    const runtime = try cfg.load_mcp_runtime(
-        alloc,
-        startup.workspace_root,
-        .{ .form = true, .url = true },
-    );
-    return .{ .startup = startup, .runtime = runtime };
-}
-
-fn runTopLevelMcp(
-    alloc: Allocator,
-    rest: []const [:0]const u8,
-    cfg: Config,
-    deps: RunDeps,
-) !RunResult {
-    if (rest.len == 0) {
-        try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-        return .handled_failure;
-    }
-    const operation = rest[0];
-    if (std.mem.eql(u8, operation, "add")) {
-        var tokens: std.ArrayList([]const u8) = .empty;
-        defer tokens.deinit(alloc);
-        try tokens.ensureTotalCapacity(alloc, rest.len - 1);
-        for (rest[1..]) |token| tokens.appendAssumeCapacity(token);
-        const intent = mcp_command_provider.parseAddIntent(tokens.items) catch |err| {
-            if (err == error.McpAddUsage) {
-                try writeMcpAddUsage(deps);
-            } else {
-                try writeMcpOperationFailure(alloc, deps, "add", err);
-            }
-            return .handled_failure;
-        };
-        var result = cfg.add_mcp_profile_server(alloc, intent) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "add", err);
-            return .handled_failure;
-        };
-        defer result.deinit(alloc);
-        if (result.warning) |warning| try writeMcpProfileWarning(alloc, deps, warning);
-        const name = switch (intent) {
-            .local => |local| local.name,
-            .http => |http| http.name,
-        };
-        try writeMcpProfileMutationSuccess(
-            alloc,
-            deps,
-            "Saved",
-            "to",
-            name,
-            result.profile_path,
-        );
-        return .handled_success;
-    }
-    if (std.mem.eql(u8, operation, "trust")) {
-        const action = parseTopLevelProjectMcpAction(rest[1..]) catch {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        };
-        const workspace_root = io_mod.realpathAlloc(alloc, ".") catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "trust", err);
-            return .handled_failure;
-        };
-        defer alloc.free(workspace_root);
-        var attempt = config_runtime.attemptProjectMcpMutation(
-            alloc,
-            workspace_root,
-            action,
-        );
-        defer attempt.deinit(alloc);
-        switch (attempt) {
-            .failure => |failure| {
-                try writeMcpOperationFailure(alloc, deps, "trust", failure.err);
-                return .handled_failure;
-            },
-            .outcome => {},
-        }
-        try writeMcpTrustSuccess(alloc, deps, workspace_root, action);
-        return .handled_success;
-    }
-    if (std.mem.eql(u8, operation, "path")) {
-        if (rest.len != 1) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        }
-        const home = deps.getenv(deps.env_ctx, "HOME") orelse {
-            try writeMcpOperationFailure(alloc, deps, "path", error.HomeNotSet);
-            return .handled_failure;
-        };
-        const path = try profile_paths.mcpConfigPath(alloc, home);
-        defer alloc.free(path);
-        var encoded_path = try text_utils.encodeTerminalSafe(alloc, path, 512);
-        defer encoded_path.deinit(alloc);
-        try writeStdout(deps, encoded_path.bytes);
-        try writeStdout(deps, "\n");
-        return .handled_success;
-    }
-    if (std.mem.eql(u8, operation, "remove")) {
-        if (rest.len != 2 or rest[1].len == 0) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        }
-        var result = cfg.remove_mcp_profile_server(alloc, rest[1]) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "remove", err);
-            return .handled_failure;
-        };
-        defer result.deinit(alloc);
-        if (result.warning) |warning| try writeMcpProfileWarning(alloc, deps, warning);
-        if (!result.removed) {
-            var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
-            defer encoded_name.deinit(alloc);
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
-            try out.writer.print(
-                "MCP server '{s}' was not found in the profile.\n",
-                .{encoded_name.bytes},
-            );
-            try writeStderr(deps, out.written());
-            return .handled_failure;
-        }
-        try writeMcpProfileMutationSuccess(
-            alloc,
-            deps,
-            "Removed",
-            "from",
-            rest[1],
-            result.profile_path,
-        );
-        return .handled_success;
-    }
-    if (std.mem.eql(u8, operation, "list")) {
-        const connect = rest.len == 2 and std.mem.eql(u8, rest[1], "--connect");
-        if (rest.len != 1 and !connect) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        }
-        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "list", err);
-            return .handled_failure;
-        };
-        defer loaded.deinit(alloc);
-        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
-        const listing = if (loaded.runtime) |runtime| listing: {
-            if (connect) {
-                runtime.connectAll(cfg.tool_set.registry);
-            } else {
-                try runtime.loadStoredCredentialsForHealthSnapshot();
-            }
-            break :listing try runtime.listServersAndTools(alloc);
-        } else try alloc.dupe(u8, "No MCP servers configured.\n");
-        defer alloc.free(listing);
-        try writeStdout(deps, listing);
-        return .handled_success;
-    }
-    if (std.mem.eql(u8, operation, "auth")) {
-        if (rest.len != 2 or rest[1].len == 0) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        }
-        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "auth", err);
-            return .handled_failure;
-        };
-        defer loaded.deinit(alloc);
-        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
-        const runtime = loaded.runtime orelse {
-            try writeMcpOperationFailure(alloc, deps, "auth", error.McpServerNotFound);
-            return .handled_failure;
-        };
-        var opener = cfg.url_opener;
-        var result = runtime.authenticateServer(
-            rest[1],
-            &opener,
-            openTopLevelMcpUrl,
-        ) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "auth", err);
-            return .handled_failure;
-        };
-        defer result.deinit();
-        switch (result) {
-            .authenticated => |authenticated| {
-                var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
-                defer encoded_name.deinit(alloc);
-                var out: std.Io.Writer.Allocating = .init(alloc);
-                defer out.deinit();
-                try out.writer.print("Authenticated MCP server '{s}'.", .{encoded_name.bytes});
-                if (authenticated.repaired_entries > 0) {
-                    try out.writer.print(
-                        " Removed {d} unreadable MCP credential {s}.",
-                        .{
-                            authenticated.repaired_entries,
-                            if (authenticated.repaired_entries == 1) "entry" else "entries",
-                        },
-                    );
-                }
-                try out.writer.writeByte('\n');
-                try writeStdout(deps, out.written());
-                return .handled_success;
-            },
-            .issuer_mismatch => {
-                try writeMcpOperationFailure(
-                    alloc,
-                    deps,
-                    "auth",
-                    error.McpAuthorizationIssuerMismatch,
-                );
-                return .handled_failure;
-            },
-        }
-    }
-    if (std.mem.eql(u8, operation, "logout")) {
-        if (rest.len != 2 or rest[1].len == 0) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-            return .handled_failure;
-        }
-        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "logout", err);
-            return .handled_failure;
-        };
-        defer loaded.deinit(alloc);
-        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
-        const runtime = loaded.runtime orelse {
-            try writeMcpOperationFailure(alloc, deps, "logout", error.McpServerNotFound);
-            return .handled_failure;
-        };
-        const result = runtime.logoutServer(rest[1]) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "logout", err);
-            return .handled_failure;
-        };
-        var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
-        defer encoded_name.deinit(alloc);
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        if (!result.removed) {
-            try out.writer.print(
-                "No stored MCP credentials found for '{s}'.\n",
-                .{encoded_name.bytes},
-            );
-        } else if (result.local_only) {
-            try out.writer.print(
-                "Logged out of MCP server '{s}' locally.\n",
-                .{encoded_name.bytes},
-            );
-        } else if (result.revocation_failed) {
-            try out.writer.print(
-                "Logged out of MCP server '{s}' locally; remote revocation failed.\n",
-                .{encoded_name.bytes},
-            );
-        } else {
-            try out.writer.print(
-                "Logged out of MCP server '{s}'.\n",
-                .{encoded_name.bytes},
-            );
-        }
-        try writeStdout(deps, out.written());
-        return .handled_success;
-    }
-
-    try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-    return .handled_failure;
-}
-
-fn parseTopLevelProjectMcpAction(
-    args: []const [:0]const u8,
-) error{InvalidProjectMcpTrustArgs}!project_config.ProjectMcpAction {
-    if (args.len == 1 and std.mem.eql(u8, args[0], "approve-all")) return .approve_all;
-    if (args.len == 1 and std.mem.eql(u8, args[0], "reset")) return .reset;
-    if (args.len != 2 or args[1].len == 0) return error.InvalidProjectMcpTrustArgs;
-    if (std.mem.eql(u8, args[0], "approve")) return .{ .approve = args[1] };
-    if (std.mem.eql(u8, args[0], "reject")) return .{ .reject = args[1] };
-    return error.InvalidProjectMcpTrustArgs;
-}
-
-fn writeMcpTrustSuccess(
-    alloc: Allocator,
-    deps: RunDeps,
-    workspace_root: []const u8,
-    action: project_config.ProjectMcpAction,
-) !void {
-    var encoded_root = try text_utils.encodeTerminalSafe(alloc, workspace_root, 512);
-    defer encoded_root.deinit(alloc);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    switch (action) {
-        .approve => |name| {
-            var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
-            defer encoded_name.deinit(alloc);
-            try out.writer.print(
-                "Approved project MCP server '{s}' for {s}.\n",
-                .{ encoded_name.bytes, encoded_root.bytes },
-            );
-        },
-        .reject => |name| {
-            var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
-            defer encoded_name.deinit(alloc);
-            try out.writer.print(
-                "Rejected project MCP server '{s}' for {s}.\n",
-                .{ encoded_name.bytes, encoded_root.bytes },
-            );
-        },
-        .approve_all => try out.writer.print(
-            "Approved all project MCP servers for {s}.\n",
-            .{encoded_root.bytes},
-        ),
-        .reset => try out.writer.print(
-            "Reset project MCP trust for {s}.\n",
-            .{encoded_root.bytes},
-        ),
-    }
-    try writeStdout(deps, out.written());
-}
-
-fn openTopLevelMcpUrl(
-    raw: ?*anyopaque,
-    alloc: Allocator,
-    url: []const u8,
-) anyerror!bool {
-    const opener: *const host.UrlOpener = @ptrCast(@alignCast(raw.?));
-    return opener.open(alloc, url);
-}
-
-fn writeMcpProfileMutationSuccess(
-    alloc: Allocator,
-    deps: RunDeps,
-    action: []const u8,
-    preposition: []const u8,
-    name: []const u8,
-    path: []const u8,
-) !void {
-    var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
-    defer encoded_name.deinit(alloc);
-    var encoded_path = try text_utils.encodeTerminalSafe(alloc, path, 512);
-    defer encoded_path.deinit(alloc);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.print(
-        "{s} MCP server '{s}' {s} {s}.\n",
-        .{ action, encoded_name.bytes, preposition, encoded_path.bytes },
-    );
-    try writeStdout(deps, out.written());
-}
-
-fn writeMcpAddUsage(deps: RunDeps) !void {
-    return writeStderr(
-        deps,
-        "usage: fx mcp add NAME COMMAND [ARGS...] | fx mcp add --transport http NAME URL\n",
-    );
-}
-
-fn writeMcpOperationFailure(
-    alloc: Allocator,
-    deps: RunDeps,
-    operation: []const u8,
-    err: anyerror,
-) !void {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.print(
-        "fx mcp {s} failed: {s}.\n",
-        .{ operation, @errorName(err) },
-    );
-    try writeStderr(deps, out.written());
-}
-
-fn writeMcpProfileWarningIfPresent(
-    alloc: Allocator,
-    cfg: Config,
-    deps: RunDeps,
-) !void {
-    const diagnostic = try cfg.inspect_mcp_profile_config(alloc);
-    const warning = switch (diagnostic) {
-        .warning => |value| value,
-        .clear, .failed => return,
-    };
-    try writeMcpProfileWarning(alloc, deps, warning);
-}
-
-fn writeMcpProfileWarning(
-    alloc: Allocator,
-    deps: RunDeps,
-    warning: mcp_contract.ProfileConfigWarning,
-) !void {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.print(
-        "fx: ~/.fx/mcp.json warning: {s}",
-        .{@tagName(warning.cause)},
-    );
-    if (warning.key()) |key| {
-        var encoded = try text_utils.encodeTerminalSafe(alloc, key, 128);
-        defer encoded.deinit(alloc);
-        try out.writer.print(" key={s}", .{encoded.bytes});
-    }
-    try out.writer.print(
-        " additional_matches={d}\n",
-        .{warning.additional_matches},
-    );
-    try writeStderr(deps, out.written());
 }
 
 fn writeUsageOrJsonError(
@@ -2637,7 +2211,7 @@ fn writeUsageCommandFailure(
             message,
         );
     }
-    try writeStderr(deps, "fx usage: ");
+    try writeStderr(deps, "ffx usage: ");
     try writeStderr(deps, message);
     try writeStderr(deps, "\n");
 }
@@ -2661,7 +2235,7 @@ fn writeWorkspaceCommandError(
 ) !void {
     if (!argsContainJson(args)) {
         if (output_contracts.workspaceErrorMessage(err)) |message| {
-            try writeStderr(deps, "fx workspace: ");
+            try writeStderr(deps, "ffx workspace: ");
             try writeStderr(deps, message);
             try writeStderr(deps, "\n");
             return;
@@ -2693,7 +2267,7 @@ fn writeWorkspaceIndeterminateError(
         .unconfirmed => "settings durability is uncertain; reloaded settings match neither the requested nor previous state",
     };
     if (!argsContainJson(args)) {
-        try writeStderr(deps, "fx workspace: ");
+        try writeStderr(deps, "ffx workspace: ");
         try writeStderr(deps, message);
         try writeStderr(deps, "\n");
         return;
@@ -2767,6 +2341,325 @@ fn loadLatestWorkspaceSessionSummary(
     return store.latestReadOnlyWorkspaceSummary(alloc);
 }
 
+fn loadWorkspaceBackgroundRecords(
+    alloc: Allocator,
+    process_provider: background_process_provider.Provider,
+    workspace_root: []const u8,
+) !std.ArrayList(background_store.Record) {
+    var session_store_value = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| switch (err) {
+        error.HomeNotSet => return .empty,
+        else => return err,
+    };
+    defer session_store_value.deinit(alloc);
+
+    var sessions = try session_store_value.listManagedChildCandidatesForWorkspace(alloc);
+    defer {
+        for (sessions.items) |*summary| summary.deinit(alloc);
+        sessions.deinit(alloc);
+    }
+
+    var sourced: std.ArrayList(SourcedBackgroundRecord) = .empty;
+    errdefer {
+        for (sourced.items) |*record| record.deinit(alloc);
+        sourced.deinit(alloc);
+    }
+
+    for (sessions.items) |summary| {
+        var capability = try session_store_value.openListedChildCapabilityReadOnly(
+            alloc,
+            summary.id,
+        );
+        defer capability.deinit();
+        var store = background_store.Store.initManaged(&capability);
+        defer store.deinit(alloc);
+
+        var session_records = try store.list(alloc);
+        defer {
+            for (session_records.items) |*record| record.deinit(alloc);
+            session_records.deinit(alloc);
+        }
+
+        for (session_records.items) |*record| {
+            if (!background_store.recordBelongsToWorkspace(record.*, workspace_root)) continue;
+            try background_record_liveness.refreshPersistedRecordLiveness(
+                alloc,
+                process_provider,
+                record,
+            );
+            try appendSourcedBackgroundRecord(
+                alloc,
+                &sourced,
+                summary.id,
+                record.*,
+            );
+        }
+    }
+
+    sortSourcedBackgroundRecords(sourced.items);
+
+    var records: std.ArrayList(background_store.Record) = .empty;
+    errdefer {
+        for (records.items) |*record| record.deinit(alloc);
+        records.deinit(alloc);
+    }
+    try records.ensureTotalCapacity(alloc, sourced.items.len);
+    for (sourced.items) |record| {
+        records.appendAssumeCapacity(try cloneBackgroundRecord(
+            alloc,
+            record.record,
+        ));
+    }
+    for (sourced.items) |*record| record.deinit(alloc);
+    sourced.deinit(alloc);
+    return records;
+}
+
+fn loadWorkspaceBackgroundRecord(
+    alloc: Allocator,
+    process_provider: background_process_provider.Provider,
+    workspace_root: []const u8,
+    id: u64,
+) !background_store.Record {
+    var session_store_value = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| switch (err) {
+        error.HomeNotSet => return error.NoBackgroundRecords,
+        else => return err,
+    };
+    defer session_store_value.deinit(alloc);
+
+    var sessions = try session_store_value.listManagedChildCandidatesForWorkspace(alloc);
+    defer {
+        for (sessions.items) |*summary| summary.deinit(alloc);
+        sessions.deinit(alloc);
+    }
+
+    var matched_workspace = false;
+    for (sessions.items) |summary| {
+        matched_workspace = true;
+
+        var capability = try session_store_value.openListedChildCapabilityReadOnly(
+            alloc,
+            summary.id,
+        );
+        defer capability.deinit();
+        var store = background_store.Store.initManaged(&capability);
+        defer store.deinit(alloc);
+
+        var record = store.load(alloc, id) catch |err| switch (err) {
+            error.BackgroundRecordNotFound => continue,
+            else => return err,
+        };
+        errdefer record.deinit(alloc);
+        if (!background_store.recordBelongsToWorkspace(record, workspace_root)) {
+            record.deinit(alloc);
+            continue;
+        }
+        try background_record_liveness.refreshPersistedRecordLiveness(
+            alloc,
+            process_provider,
+            &record,
+        );
+        return record;
+    }
+    return if (matched_workspace)
+        error.BackgroundRecordNotFound
+    else
+        error.NoBackgroundRecords;
+}
+
+const SourcedBackgroundRecord = struct {
+    source_session_id: []u8,
+    record: background_store.Record,
+
+    fn deinit(self: *SourcedBackgroundRecord, alloc: Allocator) void {
+        alloc.free(self.source_session_id);
+        self.record.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn appendSourcedBackgroundRecord(
+    alloc: Allocator,
+    records: *std.ArrayList(SourcedBackgroundRecord),
+    source_session_id: []const u8,
+    record: background_store.Record,
+) !void {
+    const owned_source_session_id = try alloc.dupe(u8, source_session_id);
+    errdefer alloc.free(owned_source_session_id);
+    var owned_record = try cloneBackgroundRecord(alloc, record);
+    errdefer owned_record.deinit(alloc);
+    try records.append(alloc, .{
+        .source_session_id = owned_source_session_id,
+        .record = owned_record,
+    });
+}
+
+fn sortSourcedBackgroundRecords(records: []SourcedBackgroundRecord) void {
+    var i: usize = 1;
+    while (i < records.len) : (i += 1) {
+        var j = i;
+        while (j > 0 and sourcedBackgroundRanksBefore(
+            records[j],
+            records[j - 1],
+        )) : (j -= 1) {
+            std.mem.swap(
+                SourcedBackgroundRecord,
+                &records[j - 1],
+                &records[j],
+            );
+        }
+    }
+}
+
+fn sourcedBackgroundRanksBefore(
+    left: SourcedBackgroundRecord,
+    right: SourcedBackgroundRecord,
+) bool {
+    if (left.record.updated_at_ms != right.record.updated_at_ms) {
+        return left.record.updated_at_ms > right.record.updated_at_ms;
+    }
+    const source_order = std.mem.order(
+        u8,
+        left.source_session_id,
+        right.source_session_id,
+    );
+    if (source_order != .eq) return source_order == .gt;
+    return if (left.record.background_record_id) |left_id| blk: {
+        if (right.record.background_record_id) |right_id| {
+            break :blk std.mem.order(u8, &left_id, &right_id) == .gt;
+        }
+        break :blk true;
+    } else false;
+}
+
+fn cloneBackgroundRecord(alloc: Allocator, record: background_store.Record) !background_store.Record {
+    const pid = try alloc.dupe(u8, record.pid);
+    errdefer alloc.free(pid);
+    const command = try alloc.dupe(u8, record.command);
+    errdefer alloc.free(command);
+    const cwd = try alloc.dupe(u8, record.cwd);
+    errdefer alloc.free(cwd);
+    const log_path = try alloc.dupe(u8, record.log_path);
+    errdefer alloc.free(log_path);
+
+    var process_token: ?[]u8 = null;
+    errdefer if (process_token) |token| alloc.free(token);
+    if (record.process_token) |token| {
+        process_token = try alloc.dupe(u8, token);
+    }
+
+    var log_storage: ?background_store.LogStorage = null;
+    errdefer if (log_storage) |*storage| storage.deinit(alloc);
+    if (record.log_storage) |storage| {
+        log_storage = switch (storage) {
+            .managed_session => |managed| .{ .managed_session = .{
+                .managed_log_name = try alloc.dupe(
+                    u8,
+                    managed.managed_log_name,
+                ),
+            } },
+            .external => |external| .{ .external = .{
+                .path = try alloc.dupe(u8, external.path),
+            } },
+        };
+    }
+
+    var server_url: ?[]u8 = null;
+    errdefer if (server_url) |url| alloc.free(url);
+    if (record.server_url) |url| {
+        server_url = try alloc.dupe(u8, url);
+    }
+
+    var diagnostic: ?[]u8 = null;
+    errdefer if (diagnostic) |value| alloc.free(value);
+    if (record.diagnostic) |value| {
+        diagnostic = try alloc.dupe(u8, value);
+    }
+
+    return .{
+        .id = record.id,
+        .background_record_id = record.background_record_id,
+        .process_token = process_token,
+        .pid = pid,
+        .command = command,
+        .cwd = cwd,
+        .log_path = log_path,
+        .log_storage = log_storage,
+        .expect_url = record.expect_url,
+        .server_url = server_url,
+        .started_at_ms = record.started_at_ms,
+        .updated_at_ms = record.updated_at_ms,
+        .exit_code = record.exit_code,
+        .state = record.state,
+        .diagnostic = diagnostic,
+    };
+}
+
+test "direct background ranking uses updated time source session and stable id" {
+    const low_stable = background_store.StableBackgroundRecordId{
+        0x00, 0, 0, 0, 0, 0, 0, 0,
+        0,    0, 0, 0, 0, 0, 0, 1,
+    };
+    const high_stable = background_store.StableBackgroundRecordId{
+        0xff, 0, 0, 0, 0, 0, 0, 0,
+        0,    0, 0, 0, 0, 0, 0, 2,
+    };
+    const base = background_store.Record{
+        .id = 7,
+        .pid = @constCast("1"),
+        .command = @constCast("cmd"),
+        .cwd = @constCast("/tmp"),
+        .log_path = @constCast("/tmp/log"),
+        .expect_url = false,
+        .started_at_ms = 1,
+        .updated_at_ms = 10,
+        .state = .running,
+    };
+
+    var older = base;
+    older.updated_at_ms = 9;
+    try std.testing.expect(sourcedBackgroundRanksBefore(
+        .{ .source_session_id = @constCast("a"), .record = base },
+        .{ .source_session_id = @constCast("z"), .record = older },
+    ));
+
+    try std.testing.expect(sourcedBackgroundRanksBefore(
+        .{ .source_session_id = @constCast("z"), .record = base },
+        .{ .source_session_id = @constCast("a"), .record = base },
+    ));
+
+    var low = base;
+    low.background_record_id = low_stable;
+    var high = base;
+    high.background_record_id = high_stable;
+    try std.testing.expect(sourcedBackgroundRanksBefore(
+        .{ .source_session_id = @constCast("same"), .record = high },
+        .{ .source_session_id = @constCast("same"), .record = low },
+    ));
+    try std.testing.expect(sourcedBackgroundRanksBefore(
+        .{ .source_session_id = @constCast("same"), .record = low },
+        .{ .source_session_id = @constCast("same"), .record = base },
+    ));
+}
+
+fn findBackgroundRecord(records: []const background_store.Record, target: PersistedRecordTarget) ?background_store.Record {
+    return switch (target) {
+        .last => if (records.len == 0) null else records[0],
+        .id => |id| blk: {
+            for (records) |record| {
+                if (record.id == id) break :blk record;
+            }
+            break :blk null;
+        },
+    };
+}
+
+fn loadBackgroundRecord(alloc: Allocator, store: background_store.Store, target: PersistedRecordTarget) !background_store.Record {
+    return switch (target) {
+        .last => store.loadLatest(alloc),
+        .id => |id| store.load(alloc, id),
+    };
+}
+
 fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {
     return switch (failure.category) {
         .authentication => "AuthenticationRejected",
@@ -2833,88 +2726,103 @@ fn writeLookupFailure(
     }
 
     switch (err) {
+        error.NoBackgroundRecords => {
+            try writeStderr(deps, "ffx ");
+            try writeStderr(deps, kind);
+            try writeStderr(deps, ": no persisted records for this workspace\n");
+        },
+        error.BackgroundRecordNotFound => {
+            try writeStderr(deps, "ffx ");
+            try writeStderr(deps, kind);
+            try writeStderr(deps, ": record not found\n");
+        },
+        error.InvalidBackgroundRecord, error.UnsupportedBackgroundSchema => {
+            try writeStderr(deps, "ffx ");
+            try writeStderr(deps, kind);
+            try writeStderr(deps, ": record is unreadable or from an unsupported version\n");
+        },
         error.NoSavedSessions => {
-            try writeStderr(deps, "fx session: no saved sessions for this workspace\n");
+            try writeStderr(deps, "ffx session: no saved sessions for this workspace\n");
         },
         error.NoReadableSessions => {
-            try writeStderr(deps, "fx session: saved sessions are unreadable; run `fx doctor` for recovery guidance\n");
+            try writeStderr(deps, "ffx session: saved sessions are unreadable; run `ffx doctor` for recovery guidance\n");
         },
         error.SessionNotFound => {
-            try writeStderr(deps, "fx session: record not found\n");
+            try writeStderr(deps, "ffx session: record not found\n");
         },
         error.InvalidSessionFormat => {
             try writeStderr(
                 deps,
-                "fx session: record is corrupt; run `fx doctor` for recovery guidance\n",
+                "ffx session: record is corrupt; run `ffx doctor` for recovery guidance\n",
             );
         },
         error.UnsupportedSessionSchema => {
             try writeStderr(
                 deps,
-                "fx session: record uses an unsupported session version\n",
+                "ffx session: record uses an unsupported session version\n",
             );
         },
         error.InvalidSessionId => {
-            try writeStderr(deps, "fx session: invalid session id\n");
+            try writeStderr(deps, "ffx session: invalid session id\n");
         },
         error.LegacySessionTooLarge => {
             try writeStderr(
                 deps,
-                "fx session: legacy session is too large for automatic loading; run `fx session migrate <id> --allow-large`\n",
+                "ffx session: legacy session is too large for automatic loading; run `ffx session migrate <id> --allow-large`\n",
             );
         },
         error.LegacySessionReadResourceExhausted => {
             try writeStderr(
                 deps,
-                "fx session: legacy session could not be loaded with available resources\n",
+                "ffx session: legacy session could not be loaded with available resources\n",
             );
         },
         error.LegacySessionMigrationResourceExhausted => {
             try writeStderr(
                 deps,
-                "fx session: migration did not complete because resources were exhausted; the original session remains authoritative\n",
+                "ffx session: migration did not complete because resources were exhausted; the original session remains authoritative\n",
             );
         },
         error.LegacySessionMigrationFailed, error.LegacySessionChanged => {
             try writeStderr(
                 deps,
-                "fx session: migration did not complete; the original session remains authoritative\n",
+                "ffx session: migration did not complete; the original session remains authoritative\n",
             );
         },
         error.LegacySessionMigrationIndeterminate => {
             try writeStderr(
                 deps,
-                "fx session: migration outcome is indeterminate and will be resolved by the next exact writable load\n",
+                "ffx session: migration outcome is indeterminate and will be resolved by the next exact writable load\n",
             );
         },
         error.SessionRecoveryNotNeeded => {
             try writeStderr(
                 deps,
-                "fx session: recovery was refused because the session has a valid commit boundary; resume it normally\n",
+                "ffx session: recovery was refused because the session has a valid commit boundary; resume it normally\n",
             );
         },
         error.SessionRecoveryRequiresCurrentSchema => {
             try writeStderr(
                 deps,
-                "fx session: recovery only applies to current schema-v3 sessions; migrate legacy sessions first\n",
+                "ffx session: recovery only applies to current schema-v3 sessions; migrate legacy sessions first\n",
             );
         },
         error.SessionRecoveryUnsupportedSchema => {
             try writeStderr(
                 deps,
-                "fx session: recovery is unavailable for this unsupported session version\n",
+                "ffx session: recovery is unavailable for this unsupported session version\n",
             );
         },
         error.SessionRecoveryBoundaryInvalid => {
             try writeStderr(
                 deps,
-                "fx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
+                "ffx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
             );
         },
         error.SessionRecoveryIndeterminate => {
             try writeStderr(
                 deps,
-                "fx session: the recovery copy could not be confirmed; the source was left unchanged\n",
+                "ffx session: the recovery copy could not be confirmed; the source was left unchanged\n",
             );
         },
         error.SessionAuthorityBoundaryUnavailable,
@@ -2922,19 +2830,19 @@ fn writeLookupFailure(
         => {
             try writeStderr(
                 deps,
-                "fx session: session authority is temporarily unavailable while an incomplete commit is resolved\n",
+                "ffx session: session authority is temporarily unavailable while an incomplete commit is resolved\n",
             );
         },
         error.SessionAuthorityIntentCleanupPending => {
             try writeStderr(
                 deps,
-                "fx session: session authority is confirmed but transition cleanup is still pending\n",
+                "ffx session: session authority is confirmed but transition cleanup is still pending\n",
             );
         },
         error.SessionBusy, error.SessionLockUnsupported => {
             try writeStderr(
                 deps,
-                "fx session: session is busy or the filesystem cannot provide the required lock\n",
+                "ffx session: session is busy or the filesystem cannot provide the required lock\n",
             );
         },
         error.SessionPathUnsafe,
@@ -2943,14 +2851,14 @@ fn writeLookupFailure(
         => {
             try writeStderr(
                 deps,
-                "fx session: durable session storage is unsafe or does not support required private permissions\n",
+                "ffx session: durable session storage is unsafe or does not support required private permissions\n",
             );
         },
         error.DurableLayoutFailed, error.SessionStoreUnavailable => {
-            try writeStderr(deps, "fx session: durable session store is unavailable\n");
+            try writeStderr(deps, "ffx session: durable session store is unavailable\n");
         },
         error.HomeNotSet => {
-            try writeStderr(deps, "fx ");
+            try writeStderr(deps, "ffx ");
             try writeStderr(deps, kind);
             try writeStderr(deps, ": HOME is not set\n");
         },
@@ -2968,7 +2876,7 @@ fn writeSessionDetailFailure(
     const message = switch (err) {
         error.InvalidSessionFormat => try std.fmt.allocPrint(
             alloc,
-            "session {s} is corrupt; run `fx session recover {s}`",
+            "session {s} is corrupt; run `ffx session recover {s}`",
             .{ session_id, session_id },
         ),
         error.UnsupportedSessionSchema => try std.fmt.allocPrint(
@@ -2994,7 +2902,7 @@ fn writeSessionDetailFailure(
             message,
         );
     }
-    try writeStderr(deps, "fx session: ");
+    try writeStderr(deps, "ffx session: ");
     try writeStderr(deps, message);
     try writeStderr(deps, "\n");
 }
@@ -3004,6 +2912,7 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.InvalidLocalSurfaceArgs,
         error.InvalidUsageArgs,
+        error.InvalidPersistedRecordArgs,
         error.InvalidSessionDetailArgs,
         error.InvalidSessionMigrationArgs,
         error.InvalidSessionRecoveryArgs,
@@ -3015,13 +2924,16 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
 
 fn lookupFailureMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
+        error.NoBackgroundRecords => "no persisted records for this workspace",
+        error.BackgroundRecordNotFound => "record not found",
+        error.InvalidBackgroundRecord, error.UnsupportedBackgroundSchema => "record is unreadable or from an unsupported version",
         error.NoSavedSessions => "no saved sessions for this workspace",
-        error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
+        error.NoReadableSessions => "saved sessions are unreadable; run `ffx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
-        error.InvalidSessionFormat => "record is corrupt; run `fx doctor` for recovery guidance",
+        error.InvalidSessionFormat => "record is corrupt; run `ffx doctor` for recovery guidance",
         error.UnsupportedSessionSchema => "record uses an unsupported session version",
         error.InvalidSessionId => "invalid session id",
-        error.LegacySessionTooLarge => "legacy session is too large for automatic loading; run `fx session migrate <id> --allow-large`",
+        error.LegacySessionTooLarge => "legacy session is too large for automatic loading; run `ffx session migrate <id> --allow-large`",
         error.LegacySessionReadResourceExhausted => "legacy session could not be loaded with available resources",
         error.LegacySessionMigrationResourceExhausted => "migration did not complete because resources were exhausted; the original session remains authoritative",
         error.LegacySessionMigrationFailed, error.LegacySessionChanged => "migration did not complete; the original session remains authoritative",
@@ -3058,7 +2970,7 @@ test "session detail failures separate corruption from unsupported schema" {
     );
     try std.testing.expectEqualStrings("", corrupt_text.stdout.written());
     try std.testing.expectEqualStrings(
-        "fx session: session broken-session is corrupt; run `fx session recover broken-session`\n",
+        "ffx session: session broken-session is corrupt; run `ffx session recover broken-session`\n",
         corrupt_text.stderr.written(),
     );
 
@@ -3076,7 +2988,7 @@ test "session detail failures separate corruption from unsupported schema" {
         std.mem.find(
             u8,
             corrupt_json.stdout.written(),
-            "\"error\":\"session broken-session is corrupt; run `fx session recover broken-session`\"",
+            "\"error\":\"session broken-session is corrupt; run `ffx session recover broken-session`\"",
         ) != null,
     );
     try std.testing.expect(
@@ -3098,7 +3010,7 @@ test "session detail failures separate corruption from unsupported schema" {
     );
     try std.testing.expectEqualStrings("", unsupported_text.stdout.written());
     try std.testing.expectEqualStrings(
-        "fx session: session future-session uses an unsupported session version\n",
+        "ffx session: session future-session uses an unsupported session version\n",
         unsupported_text.stderr.written(),
     );
 }
@@ -3115,7 +3027,7 @@ test "session recovery boundary failures keep stable text and json guidance" {
     );
     try std.testing.expectEqualStrings("", text_output.stdout.written());
     try std.testing.expectEqualStrings(
-        "fx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
+        "ffx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
         text_output.stderr.written(),
     );
 
@@ -3147,7 +3059,6 @@ test "session recovery boundary failures keep stable text and json guidance" {
 
 fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
     return .{
-        .auth_mode = cfg.auth_mode,
         .command_usage = command_specs.topLevelUsage(cfg.command_catalog, .ask),
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,
@@ -3155,8 +3066,11 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
         .gateway_models_path = cfg.models_path,
         .gateway_provider = cfg.gateway_provider,
-        .provider_set = cfg.provider_set,
-        .process_provider = cfg.process_provider,
+        .codex_agent_stream = cfg.codex_agent_stream,
+        .codex_model_catalog = cfg.codex_model_catalog,
+        .grok_agent_stream = cfg.grok_agent_stream,
+        .grok_model_catalog = cfg.grok_model_catalog,
+        .background_process_provider = cfg.background_process_provider,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,
         .skill_root_policy = cfg.skill_root_policy,
@@ -3170,6 +3084,9 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .max_history_turns = cfg.max_history_turns,
         .mode_registry = cfg.mode_registry,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .permission_reviewer_provider = cfg.permission_reviewer_provider,
+        .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
+        .grok_permission_reviewer_provider = cfg.grok_permission_reviewer_provider,
     };
 }
 
@@ -3194,7 +3111,7 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --add-dir and --no-additional-dirs are only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
+        "ffx: --add-dir and --no-additional-dirs are only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
     );
 }
 
@@ -3419,12 +3336,35 @@ fn parseWorkspaceArgs(args: []const [:0]const u8) !WorkspaceOptions {
     return error.InvalidWorkspaceArgs;
 }
 
-fn parseSessionDetailArgs(
-    alloc: Allocator,
-    args: []const [:0]const u8,
-) !SessionDetailOptions {
+fn parsePersistedRecordArgs(args: []const [:0]const u8) !PersistedRecordOptions {
+    var options = PersistedRecordOptions{};
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            options.format = .json;
+            continue;
+        }
+
+        if (options.target != null) return error.InvalidPersistedRecordArgs;
+
+        const trimmed = std.mem.trim(u8, arg, " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidPersistedRecordArgs;
+        if (std.mem.eql(u8, trimmed, "last")) {
+            options.target = .last;
+            continue;
+        }
+
+        options.target = .{
+            .id = std.fmt.parseUnsigned(u64, trimmed, 10) catch
+                return error.InvalidPersistedRecordArgs,
+        };
+    }
+    return options;
+}
+
+fn parseSessionDetailArgs(alloc: Allocator, args: []const [:0]const u8) !SessionDetailOptions {
     var options = SessionDetailOptions{};
     errdefer options.deinit(alloc);
+
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -3432,31 +3372,34 @@ fn parseSessionDetailArgs(
             options.format = .json;
             continue;
         }
+
         if (options.target != null) return error.InvalidSessionDetailArgs;
+
         const exact_id = std.mem.eql(u8, arg, "--id");
         if (exact_id) {
             i += 1;
             if (i >= args.len) return error.InvalidSessionDetailArgs;
         }
+
         const trimmed = std.mem.trim(u8, args[i], " \t\r\n");
         if (trimmed.len == 0) return error.InvalidSessionDetailArgs;
         if (!exact_id and std.mem.eql(u8, trimmed, "last")) {
             options.target = .last;
             continue;
         }
+
         options.target = .{ .id = try alloc.dupe(u8, trimmed) };
     }
+
     return options;
 }
 
-fn parseSessionMigrationArgs(
-    alloc: Allocator,
-    args: []const [:0]const u8,
-) !SessionMigrationOptions {
+fn parseSessionMigrationArgs(alloc: Allocator, args: []const [:0]const u8) !SessionMigrationOptions {
     var format: output_contracts.OutputFormat = .text;
     var allow_large = false;
     var session_id: ?[]u8 = null;
     errdefer if (session_id) |id| alloc.free(id);
+
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -3469,15 +3412,18 @@ fn parseSessionMigrationArgs(
             continue;
         }
         if (session_id != null) return error.InvalidSessionMigrationArgs;
+
         const exact_id = std.mem.eql(u8, arg, "--id");
         if (exact_id) {
             i += 1;
             if (i >= args.len) return error.InvalidSessionMigrationArgs;
         }
+
         const trimmed = std.mem.trim(u8, args[i], " \t\r\n");
         if (trimmed.len == 0) return error.InvalidSessionMigrationArgs;
         session_id = try alloc.dupe(u8, trimmed);
     }
+
     return .{
         .format = format,
         .session_id = session_id orelse return error.InvalidSessionMigrationArgs,
@@ -3638,16 +3584,12 @@ test "parse recognizes every top-level command and preserves unknown commands" {
         .models => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
         else => return error.TestExpectedEqual,
     }
-    switch (parse(command_catalog, &.{ @constCast("mcp"), @constCast("add"), @constCast("fixture"), @constCast("node") })) {
-        .mcp => |rest| try std.testing.expectEqual(@as(usize, 3), rest.len),
-        else => return error.TestExpectedEqual,
-    }
     switch (parse(command_catalog, &.{@constCast("doctor")})) {
         .doctor => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{@constCast("background")})) {
-        .unknown => |command| try std.testing.expectEqualStrings("background", command),
+        .background => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("session"), @constCast("last") })) {
@@ -3799,10 +3741,10 @@ test "parse acp args extracts known flags and rejects invalid arguments" {
         @constCast("--model"),
         @constCast("openai/gpt-4o"),
         @constCast("--log-file"),
-        @constCast("/tmp/fx.log"),
+        @constCast("/tmp/ffx.log"),
     });
     try std.testing.expectEqualStrings("openai/gpt-4o", opts.model.?);
-    try std.testing.expectEqualStrings("/tmp/fx.log", opts.log_file.?);
+    try std.testing.expectEqualStrings("/tmp/ffx.log", opts.log_file.?);
 
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--unknown")}));
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--model")}));
@@ -3850,7 +3792,7 @@ test "ACP command routes parsed options and launch config through the injected r
                     expected.context_registry.defaultProvider().id,
                 ) and
                 std.mem.eql(u8, cfg.mode_registry.default_mode_id, expected.mode_registry.default_mode_id) and
-                cfg.provider_set.gateway.permission_reviewer.?.review_fn == expected.provider_set.gateway.permission_reviewer.?.review_fn;
+                cfg.permission_reviewer_provider.?.review_fn == expected.permission_reviewer_provider.?.review_fn;
 
             const limit_matches = cfg.context_limit_overrides.len == 1 and
                 cfg.context_limit_overrides[0].name == .project_instructions_total_bytes and
@@ -3869,7 +3811,7 @@ test "ACP command routes parsed options and launch config through the injected r
     };
 
     var cfg = testConfig();
-    cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
+    cfg.permission_reviewer_provider = test_builtin_gateway.permission_reviewer.provider;
     var capture = Capture{ .expected = cfg };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(
@@ -3999,6 +3941,26 @@ test "parse session list args supports bounded canonical pagination" {
         error.InvalidLocalSurfaceArgs,
         parseSessionListArgs(&.{ @constCast("--cursor"), @constCast("v1:20:../unsafe") }),
     );
+}
+
+test "parse persisted record args supports empty last numeric id and json" {
+    const empty = try parsePersistedRecordArgs(&.{});
+    try std.testing.expectEqual(output_contracts.OutputFormat.text, empty.format);
+    try std.testing.expect(empty.target == null);
+
+    const latest = try parsePersistedRecordArgs(&.{ @constCast("last"), @constCast("--json") });
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, latest.format);
+    try std.testing.expectEqual(PersistedRecordTarget.last, latest.target.?);
+
+    const specific = try parsePersistedRecordArgs(&.{@constCast(" 7 ")});
+    switch (specific.target.?) {
+        .id => |value| try std.testing.expectEqual(@as(u64, 7), value),
+        else => return error.TestExpectedEqual,
+    }
+
+    try std.testing.expectError(error.InvalidPersistedRecordArgs, parsePersistedRecordArgs(&.{ @constCast("7"), @constCast("8") }));
+    try std.testing.expectError(error.InvalidPersistedRecordArgs, parsePersistedRecordArgs(&.{@constCast("abc")}));
+    try std.testing.expectError(error.InvalidPersistedRecordArgs, parsePersistedRecordArgs(&.{@constCast("   ")}));
 }
 
 test "parse session detail args owns string ids and frees through deinit" {
@@ -4201,55 +4163,6 @@ test "parse resume args treats last after id flag as exact id" {
     }
 }
 
-test "parseInteractiveLaunch accepts legacy and revision-bearing upgrade relaunches" {
-    const alloc = std.testing.allocator;
-    const command_catalog = testCommandCatalog();
-    const revision = "abcdef0123456789abcdef0123456789abcdef01";
-
-    const cases = [_]struct {
-        args: []const [:0]const u8,
-        expected_revision: ?[]const u8,
-    }{
-        .{
-            .args = &.{ @constCast("resume"), @constCast("session-123"), @constCast("--upgrade-relaunch") },
-            .expected_revision = null,
-        },
-        .{
-            .args = &.{ @constCast("resume"), @constCast("session-123"), @constCast("--upgrade-relaunch"), @constCast(revision) },
-            .expected_revision = revision,
-        },
-    };
-
-    for (cases) |case| {
-        const parsed = try parseInteractiveLaunch(alloc, case.args, command_catalog);
-        switch (parsed) {
-            .interactive => |value| {
-                var launch = value;
-                defer launch.deinit(alloc);
-                const relaunch = launch.upgrade_relaunch orelse return error.TestExpectedUpgradeRelaunch;
-                if (case.expected_revision) |expected| {
-                    try std.testing.expectEqualStrings(expected, relaunch.previous_revision.?);
-                } else try std.testing.expect(relaunch.previous_revision == null);
-            },
-            .noninteractive => |value| {
-                var noninteractive = value;
-                defer noninteractive.deinit(alloc);
-                return error.TestExpectedInteractiveLaunch;
-            },
-        }
-    }
-
-    try std.testing.expectError(
-        error.InvalidResumeArgs,
-        parseInteractiveLaunch(alloc, &.{
-            @constCast("resume"),
-            @constCast("session-123"),
-            @constCast("--upgrade-relaunch"),
-            @constCast("not-a-revision"),
-        }, command_catalog),
-    );
-}
-
 test "parseInteractiveLaunch shares native resume grammar" {
     const alloc = std.testing.allocator;
     const command_catalog = testCommandCatalog();
@@ -4335,133 +4248,6 @@ test "runIfRequested help writes top-level help" {
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
-test "top-level MCP add mutates through the focused provider without startup" {
-    const alloc = std.testing.allocator;
-    var capture = CaptureOutput.init(alloc);
-    defer capture.deinit();
-    var cfg = testConfig();
-    cfg.add_mcp_profile_server = captureMcpProfileAddForTest;
-    mcp_profile_add_calls_for_test = 0;
-    var deps = capture.deps();
-    deps.load_startup_state = failingStartupState;
-
-    const result = try runIfRequestedWithDeps(
-        alloc,
-        &.{
-            @constCast("mcp"),
-            @constCast("add"),
-            @constCast("fixture"),
-            @constCast("node"),
-            @constCast("server.js"),
-        },
-        cfg,
-        deps,
-    );
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_profile_add_calls_for_test);
-    try std.testing.expectEqualStrings(
-        "Saved MCP server 'fixture' to /tmp/test-home/.fx/mcp.json.\n",
-        capture.stdout.written(),
-    );
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-}
-
-test "top-level MCP list loads configuration without discovery and remove uses its provider" {
-    const alloc = std.testing.allocator;
-    {
-        var capture = CaptureOutput.init(alloc);
-        defer capture.deinit();
-        var cfg = testConfig();
-        cfg.load_mcp_runtime = configuredMcpRuntimeForTest;
-        var deps = capture.deps();
-        deps.load_startup_state_without_credentials = stubLoadStartupStateWithoutCredentials;
-
-        const result = try runIfRequestedWithDeps(
-            alloc,
-            &.{ @constCast("mcp"), @constCast("list") },
-            cfg,
-            deps,
-        );
-        try std.testing.expectEqual(RunResult.handled_success, result);
-        try std.testing.expect(std.mem.find(
-            u8,
-            capture.stdout.written(),
-            "fixture source=profile scope=profile",
-        ) != null);
-        try std.testing.expect(std.mem.find(
-            u8,
-            capture.stdout.written(),
-            "state=disconnected",
-        ) != null);
-        try std.testing.expectEqualStrings("", capture.stderr.written());
-    }
-
-    {
-        var capture = CaptureOutput.init(alloc);
-        defer capture.deinit();
-        var cfg = testConfig();
-        cfg.remove_mcp_profile_server = captureMcpProfileRemoveForTest;
-        mcp_profile_remove_calls_for_test = 0;
-
-        const result = try runIfRequestedWithDeps(
-            alloc,
-            &.{ @constCast("mcp"), @constCast("remove"), @constCast("fixture") },
-            cfg,
-            capture.deps(),
-        );
-        try std.testing.expectEqual(RunResult.handled_success, result);
-        try std.testing.expectEqual(@as(usize, 1), mcp_profile_remove_calls_for_test);
-        try std.testing.expectEqualStrings(
-            "Removed MCP server 'fixture' from /tmp/test-home/.fx/mcp.json.\n",
-            capture.stdout.written(),
-        );
-        try std.testing.expectEqualStrings("", capture.stderr.written());
-    }
-}
-
-test "top-level MCP trust persists project approval without interactive startup" {
-    const alloc = std.testing.allocator;
-    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    defer alloc.free(workspace_root);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var environ = std.process.Environ.Map.init(alloc);
-    defer environ.deinit();
-    try environ.put("HOME", home);
-    try environ.put("PATH", "");
-    const stable_environ = try stableCliTestEnviron();
-    io_mod.setEnvironMap(&environ);
-    defer io_mod.setEnvironMap(stable_environ);
-
-    var capture = CaptureOutput.init(alloc);
-    defer capture.deinit();
-    var deps = capture.deps();
-    deps.load_startup_state_without_credentials = failingStartupStateWithoutCredentials;
-
-    const result = try runIfRequestedWithDeps(
-        alloc,
-        &.{ @constCast("mcp"), @constCast("trust"), @constCast("approve"), @constCast("fixture") },
-        testConfig(),
-        deps,
-    );
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    const expected = try std.fmt.allocPrint(
-        alloc,
-        "Approved project MCP server 'fixture' for {s}.\n",
-        .{workspace_root},
-    );
-    defer alloc.free(expected);
-    try std.testing.expectEqualStrings(expected, capture.stdout.written());
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-
-    var choices = try config_runtime.loadProjectMcpChoices(alloc, workspace_root);
-    defer choices.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), choices.choices.approved.len);
-    try std.testing.expectEqualStrings("fixture", choices.choices.approved[0]);
-}
-
 test "workspace launch modifiers preserve supported command help" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
@@ -4474,7 +4260,7 @@ test "workspace launch modifiers preserve supported command help" {
         deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "fx ask\n\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "ffx ask\n\n"));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
@@ -4501,11 +4287,11 @@ test "global workspace launch option errors use user-facing copy" {
     }{
         .{
             .args = &.{@constCast("--add-dir")},
-            .expected = "fx: --add-dir requires a directory path\n",
+            .expected = "ffx: --add-dir requires a directory path\n",
         },
         .{
             .args = &.{ @constCast("--no-additional-dirs"), @constCast("--no-additional-dirs") },
-            .expected = "fx: --no-additional-dirs may only be specified once\n",
+            .expected = "ffx: --no-additional-dirs may only be specified once\n",
         },
     };
 
@@ -4552,7 +4338,7 @@ test "runIfRequested version flags reject extra args" {
         const result = try runIfRequestedWithDeps(std.testing.allocator, args, testConfig(), capture.deps());
         try std.testing.expectEqual(RunResult.handled_failure, result);
         try std.testing.expectEqualStrings("", capture.stdout.written());
-        try std.testing.expectEqualStrings("usage: fx --version\n", capture.stderr.written());
+        try std.testing.expectEqualStrings("usage: ffx --version\n", capture.stderr.written());
     }
 }
 
@@ -4616,7 +4402,7 @@ test "setup preserves the disabled secret-store failure" {
     try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
     try std.testing.expectEqualStrings(
-        "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
+        "ffx setup: stored API keys are disabled by FFX_DISABLE_KEYCHAIN\n",
         capture.stderr.written(),
     );
 }
@@ -4687,21 +4473,95 @@ test "workspace unknown directory errors keep stable json codes" {
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
-test "runIfRequested rejects removed record flag as unknown input" {
+test "runIfRequested rejects record modifier outside interactive startup" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
 
-    try std.testing.expectError(
-        error.UnknownCliCommand,
-        runIfRequestedWithDeps(
-            std.testing.allocator,
-            &.{@constCast("--record")},
-            testConfig(),
-            capture.deps(),
-        ),
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("help"), @constCast("--record") },
+        testConfig(),
+        capture.deps(),
     );
 
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "fx: unknown subcommand: --record") != null);
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings("usage: ffx --record is only supported for interactive startup\n", capture.stderr.written());
+}
+
+test "runIfRequested carries record intent through supported interactive launches" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const plain = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{@constCast("--record")},
+        testConfig(),
+        capture.deps(),
+    );
+    switch (plain) {
+        .interactive => |launch| {
+            try std.testing.expect(launch.record_requested);
+            try std.testing.expect(launch.requested_resume == null);
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+
+    const resumed = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("--resume"), @constCast("session-123"), @constCast("--record") },
+        testConfig(),
+        capture.deps(),
+    );
+    switch (resumed) {
+        .interactive => |launch_value| {
+            var launch = launch_value;
+            defer launch.deinit(std.testing.allocator);
+            try std.testing.expect(launch.record_requested);
+            switch (launch.requested_resume.?) {
+                .id => |id| try std.testing.expectEqualStrings("session-123", id),
+                .pick, .last => return error.TestExpectedResumeId,
+            }
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+
+    const grouped = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("session"), @constCast("resume"), @constCast("session-123"), @constCast("--record") },
+        testConfig(),
+        capture.deps(),
+    );
+    switch (grouped) {
+        .interactive => |launch_value| {
+            var launch = launch_value;
+            defer launch.deinit(std.testing.allocator);
+            try std.testing.expect(launch.record_requested);
+            switch (launch.requested_resume.?) {
+                .id => |id| try std.testing.expectEqualStrings("session-123", id),
+                .pick, .last => return error.TestExpectedResumeId,
+            }
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+}
+
+test "runIfRequested rejects record modifier before noninteractive handlers" {
+    const cases = [_][]const [:0]const u8{
+        &.{ @constCast("ask"), @constCast("--record"), @constCast("hello") },
+        &.{ @constCast("acp"), @constCast("--record") },
+        &.{ @constCast("pr"), @constCast("--record") },
+        &.{ @constCast("issue"), @constCast("--record") },
+        &.{ @constCast("--version"), @constCast("--record") },
+        &.{ @constCast("-v"), @constCast("--record") },
+    };
+    for (cases) |args| {
+        var capture = CaptureOutput.init(std.testing.allocator);
+        defer capture.deinit();
+
+        const result = try runIfRequestedWithDeps(std.testing.allocator, args, testConfig(), capture.deps());
+        try std.testing.expectEqual(RunResult.handled_failure, result);
+        try std.testing.expectEqualStrings(record_modifier_usage, capture.stderr.written());
+    }
 }
 
 test "runNoConfigIfRequested handles help without config" {
@@ -4784,7 +4644,7 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
         usage_capture.deps(),
     );
     try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqualStrings("usage: fx start\n", usage_capture.stderr.written());
+    try std.testing.expectEqualStrings("usage: ffx start\n", usage_capture.stderr.written());
 }
 
 test "workflow config does not carry placeholder gateway tools" {
@@ -4812,7 +4672,7 @@ test "runIfRequested invalid local flags write usage" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--wat") }, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expectEqualStrings("usage: fx status [--json]\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("usage: ffx status [--json]\n", capture.stderr.written());
 }
 
 test "runIfRequested invalid json local flags write json error" {
@@ -4965,7 +4825,7 @@ test "runIfRequested rejects malformed resume aliases with canonical usage" {
         );
         try std.testing.expectEqual(RunResult.handled_failure, result);
         try std.testing.expectEqualStrings(
-            "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
+            "usage: ffx session resume [last|<id>] [--record] | session resume --id <id> [--record] | --resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>\n",
             capture.stderr.written(),
         );
     }
@@ -4996,7 +4856,7 @@ test "runIfRequested invalid resume writes usage" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("resume"), @constCast("a"), @constCast("b") }, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
+        "usage: ffx session resume [last|<id>] [--record] | session resume --id <id> [--record] | --resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>\n",
         capture.stderr.written(),
     );
 }
@@ -5009,7 +4869,7 @@ test "runIfRequested unknown command writes header and help" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("wat")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "ffx: unknown subcommand: wat\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested bare version subcommand remains unknown" {
@@ -5020,7 +4880,7 @@ test "runIfRequested bare version subcommand remains unknown" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("version")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "ffx: unknown subcommand: version\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested model fetch failure is handled" {
@@ -5028,15 +4888,16 @@ test "runIfRequested model fetch failure is handled" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
-    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+    cfg.gateway_provider.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_startup_state = stubLoadStartupState;
+    deps.load_startup_state = failingStartupState;
+    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "fx models: could not list models: Unavailable\n",
+        "ffx models: could not list models: Unavailable\n",
         capture.stderr.written(),
     );
 }
@@ -5046,10 +4907,10 @@ test "runIfRequested model fetch failure preserves json output" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
-    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+    cfg.gateway_provider.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_startup_state = stubLoadStartupState;
+    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
@@ -5070,15 +4931,15 @@ test "runIfRequested model provider cancellation is handled" {
     defer capture.deinit();
     var probe = ModelFetchProbe{ .outcome = .cancelled };
     var cfg = testConfig();
-    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+    cfg.gateway_provider.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_startup_state = stubLoadStartupState;
+    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "fx models: could not list models: the request was cancelled\n",
+        "ffx models: could not list models: the request was cancelled\n",
         capture.stderr.written(),
     );
 }
@@ -5088,10 +4949,10 @@ test "runIfRequested models passes startup team to fetch seam" {
     defer capture.deinit();
     var probe = ModelFetchProbe{};
     var cfg = testConfig();
-    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+    cfg.gateway_provider.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_startup_state = stubLoadStartupState;
+    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("models"), @constCast("--json") }, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
@@ -5107,7 +4968,7 @@ test "runIfRequested credits renders through the configured provider" {
     defer capture.deinit();
     var probe = CreditsProviderProbe{ .outcome = .success };
     var cfg = testConfig();
-    cfg.provider_set.gateway.credits = probe.provider();
+    cfg.gateway_provider.credits = probe.provider();
 
     var deps = capture.deps();
     deps.load_startup_state = stubLoadStartupState;
@@ -5127,7 +4988,7 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
     defer text_capture.deinit();
     var text_probe = CreditsProviderProbe{ .outcome = .failure };
     var text_cfg = testConfig();
-    text_cfg.provider_set.gateway.credits = text_probe.provider();
+    text_cfg.gateway_provider.credits = text_probe.provider();
     var text_deps = text_capture.deps();
     text_deps.load_startup_state = stubLoadStartupState;
 
@@ -5148,7 +5009,7 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
     defer json_capture.deinit();
     var json_probe = CreditsProviderProbe{ .outcome = .failure };
     var json_cfg = testConfig();
-    json_cfg.provider_set.gateway.credits = json_probe.provider();
+    json_cfg.gateway_provider.credits = json_probe.provider();
     var json_deps = json_capture.deps();
     json_deps.load_startup_state = stubLoadStartupState;
 
@@ -5176,13 +5037,13 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to a model provider. Run ffx login, or ffx setup to use an API key, or set FFX_PROVIDER_API_KEY + FFX_PROVIDER_BASE_URL, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"sandbox\":\"none\",\"workspace\":\"/tmp/ffx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
 }
 
-test "status and doctor inspect MCP configuration once per command" {
+test "status and doctor inspect the supplied MCP profile diagnostic once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5197,9 +5058,11 @@ test "status and doctor inspect MCP configuration once per command" {
     io_mod.setEnvironMap(&environ);
     defer io_mod.setEnvironMap(stable_environ);
 
-    mcp_local_inspection_calls_for_test = 0;
+    mcp_config_inspection_calls_for_test = 0;
+    mcp_runtime_load_calls_for_test = 0;
     var cfg = testConfig();
-    cfg.inspect_mcp_local_config = failingMcpLocalInspectionForTest;
+    cfg.inspect_mcp_profile_config = failingMcpConfigInspectionForTest;
+    cfg.load_mcp_runtime = countingMcpRuntimeForTest;
 
     var status_capture = CaptureOutput.init(alloc);
     defer status_capture.deinit();
@@ -5212,14 +5075,15 @@ test "status and doctor inspect MCP configuration once per command" {
         status_deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, status_result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 0), mcp_runtime_load_calls_for_test);
     try std.testing.expect(std.mem.find(
         u8,
         status_capture.stdout.written(),
         "\"mcp_config_error\":\"McpConfigInvalidJson\"",
     ) != null);
 
-    mcp_local_inspection_calls_for_test = 0;
+    mcp_config_inspection_calls_for_test = 0;
     var doctor_capture = CaptureOutput.init(alloc);
     defer doctor_capture.deinit();
     const doctor_result = try runIfRequestedWithDeps(
@@ -5229,7 +5093,8 @@ test "status and doctor inspect MCP configuration once per command" {
         doctor_capture.deps(),
     );
     try std.testing.expectEqual(RunResult.handled_success, doctor_result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 0), mcp_runtime_load_calls_for_test);
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(
@@ -5241,7 +5106,7 @@ test "status and doctor inspect MCP configuration once per command" {
     try std.testing.expect(std.mem.find(
         u8,
         doctor_capture.stdout.written(),
-        "\"detail\":\"failed to load ~/.fx/mcp.json: McpConfigInvalidJson\"",
+        "\"detail\":\"failed to load ~/.ffx/mcp.json: McpConfigInvalidJson\"",
     ) != null);
 }
 
@@ -5251,7 +5116,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
 
     var tiny_buf: [8]u8 = undefined;
     const startup = app_lifecycle.StartupStatus{
-        .workspace_root = @constCast("/tmp/fx"),
+        .workspace_root = @constCast("/tmp/ffx"),
         .selected_model = "test-model",
         .permission_mode = .ask,
         .agent_step_limit = 42,
@@ -5265,7 +5130,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to a model provider. Run ffx login, or ffx setup to use an API key, or set FFX_PROVIDER_API_KEY + FFX_PROVIDER_BASE_URL, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/ffx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
 }
@@ -5279,9 +5144,9 @@ test "writeRenderedJsonLine renders doctor json through output contract" {
         .{ .name = "gh", .status = .warn, .detail = "GitHub CLI not found in PATH" },
     };
     const snapshot = doctor_runtime.Snapshot{
-        .workspace_root = @constCast("/tmp/fx"),
+        .workspace_root = @constCast("/tmp/ffx"),
         .model = "test-model",
-        .auth = .{ .active_source = .ai_gateway_api_key },
+        .auth = .{ .active_source = .env_var },
         .permission_mode = .auto,
         .agent_step_limit = 42,
         .checks = checks[0..],
@@ -5296,7 +5161,7 @@ test "writeRenderedJsonLine renders doctor json through output contract" {
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"test-model\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"auto\",\"agent_step_limit\":42,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}\n",
+        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/ffx\",\"model\":\"test-model\",\"auth\":\"Environment variable\",\"auth_refreshable\":false,\"permission_mode\":\"auto\",\"agent_step_limit\":42,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}\n",
         capture.stdout.written(),
     );
 }
@@ -5418,7 +5283,7 @@ const test_surface_context_registry = context_contract.Registry{ .default_provid
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn noMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -5428,69 +5293,22 @@ fn clearMcpConfigInspectionForTest(
     return .clear;
 }
 
-var mcp_local_inspection_calls_for_test: usize = 0;
-var mcp_profile_add_calls_for_test: usize = 0;
-var mcp_profile_remove_calls_for_test: usize = 0;
+var mcp_config_inspection_calls_for_test: usize = 0;
+var mcp_runtime_load_calls_for_test: usize = 0;
 
-fn captureMcpProfileAddForTest(
-    alloc: Allocator,
-    intent: mcp_command_provider.AddIntent,
-) anyerror!mcp_command_provider.ProfileAddResult {
-    mcp_profile_add_calls_for_test += 1;
-    switch (intent) {
-        .local => |local| {
-            try std.testing.expectEqualStrings("fixture", local.name);
-            try std.testing.expectEqualStrings("node", local.command);
-            try std.testing.expectEqualSlices([]const u8, &.{"server.js"}, local.args);
-        },
-        .http => return error.TestUnexpectedResult,
-    }
-    return .{
-        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
-    };
+fn failingMcpConfigInspectionForTest(
+    _: Allocator,
+) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
+    mcp_config_inspection_calls_for_test += 1;
+    return .{ .failed = error.McpConfigInvalidJson };
 }
 
-fn captureMcpProfileRemoveForTest(
-    alloc: Allocator,
-    name: []const u8,
-) anyerror!mcp_command_provider.ProfileRemoveResult {
-    mcp_profile_remove_calls_for_test += 1;
-    try std.testing.expectEqualStrings("fixture", name);
-    return .{
-        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
-        .removed = true,
-    };
-}
-
-fn configuredMcpRuntimeForTest(
-    alloc: Allocator,
-    workspace_root: []const u8,
+fn countingMcpRuntimeForTest(
+    _: Allocator,
     _: @import("../mcp/elicitation.zig").Capabilities,
 ) !?*mcp_runtime.McpRuntime {
-    try std.testing.expectEqualStrings("/tmp/fx", workspace_root);
-    const runtime = try alloc.create(mcp_runtime.McpRuntime);
-    errdefer alloc.destroy(runtime);
-    runtime.* = mcp_runtime.McpRuntime.init(alloc);
-    errdefer runtime.deinit();
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "fixture"),
-        .command = try alloc.dupe(u8, "node"),
-    });
-    return runtime;
-}
-
-fn failingMcpLocalInspectionForTest(
-    alloc: Allocator,
-    workspace_root: []const u8,
-) error{OutOfMemory}!mcp_health.LocalConfigInspection {
-    mcp_local_inspection_calls_for_test += 1;
-    var result = try mcp_health.inspectLocalConfigUnavailable(
-        alloc,
-        workspace_root,
-    );
-    result.profile_diagnostic = .{ .failed = error.McpConfigInvalidJson };
-    result.inspection_error = "McpConfigInvalidJson";
-    return result;
+    mcp_runtime_load_calls_for_test += 1;
+    return null;
 }
 
 var stable_cli_test_environ: ?*std.process.Environ.Map = null;
@@ -5519,7 +5337,6 @@ fn testConfig() Config {
         .gateway_retry_count = 1,
         .gateway_chat_url = "https://example.test/chat",
         .gateway_provider = test_builtin_gateway.provider,
-        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .url_opener = host.unavailable_url_opener,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "system" },
@@ -5554,35 +5371,23 @@ fn stubLoadStartupState(
 ) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
-    state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
+    state.workspace_root = try alloc.dupe(u8, "/tmp/ffx");
     state.selected_model = try alloc.dupe(u8, default_model);
     state.credential = .{
         .token = try alloc.dupe(u8, "test-key"),
-        .source = .ai_gateway_api_key,
+        .source = .env_var,
     };
     state.credential.?.team_id = try alloc.dupe(u8, "team_123");
     return state;
 }
 
-fn stubLoadStartupStateWithoutCredentials(
+fn stubLoadCatalogStartupState(
     alloc: Allocator,
-    _: []const u8,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
     default_agent_step_limit: usize,
 ) !app_lifecycle.StartupState {
-    var state = app_lifecycle.StartupState{
-        .agent_step_limit = default_agent_step_limit,
-    };
-    errdefer state.deinit(alloc);
-    state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
-    return state;
-}
-
-fn failingStartupStateWithoutCredentials(
-    _: Allocator,
-    _: []const u8,
-    _: usize,
-) !app_lifecycle.StartupState {
-    return error.StartupShouldNotRun;
+    return stubLoadStartupState(alloc, oauth_transport.unavailable_provider, secret_store, default_model, default_agent_step_limit);
 }
 
 fn stubLoadStartupStatus(
@@ -5591,7 +5396,7 @@ fn stubLoadStartupStatus(
     default_model: []const u8,
     default_agent_step_limit: usize,
 ) !app_lifecycle.StartupStatus {
-    const workspace_root = try alloc.dupe(u8, "/tmp/fx");
+    const workspace_root = try alloc.dupe(u8, "/tmp/ffx");
     errdefer alloc.free(workspace_root);
     const selected_model = try alloc.dupe(u8, default_model);
     errdefer alloc.free(selected_model);
@@ -5651,7 +5456,7 @@ const ModelFetchProbe = struct {
         self.called = true;
         if (!std.mem.eql(u8, input.access.authorizationCredential() orelse "", "test-key") or
             !std.mem.eql(u8, input.access.teamContext() orelse "", "team_123") or
-            input.access.credentialSource() != .ai_gateway_api_key or
+            input.access.credentialSource() != .env_var or
             !std.mem.eql(u8, input.endpoint, "/v1/models") or
             input.cancel_flag != null)
         {
@@ -5738,4 +5543,86 @@ const CreditsProviderProbe = struct {
 
 fn ownedCreditsErrorSnapshot(alloc: Allocator, message: []const u8) output_contracts.CreditsSnapshot {
     return .{ .err_message = alloc.dupe(u8, message) catch null };
+}
+
+test "parseLoginProvider accepts oauth and direct providers" {
+    try std.testing.expectEqual(LoginTarget.codex, try parseLoginProvider(&.{@as([:0]const u8, "codex")}));
+    try std.testing.expectEqual(LoginTarget.grok, try parseLoginProvider(&.{@as([:0]const u8, "GROK")}));
+    try std.testing.expectEqual(
+        @as(LoginTarget, .{ .direct = .deepseek }),
+        try parseLoginProvider(&.{@as([:0]const u8, "deepseek")}),
+    );
+    try std.testing.expectEqual(
+        @as(LoginTarget, .{ .direct = .openai }),
+        try parseLoginProvider(&.{@as([:0]const u8, "OpenAI")}),
+    );
+    try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginProvider(&.{@as([:0]const u8, "gateway")}));
+    try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginProvider(&.{@as([:0]const u8, "unknown")}));
+    try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginProvider(&.{}));
+}
+
+test "normalizeEnteredKey trims pasted whitespace and keeps interior text" {
+    const alloc = std.testing.allocator;
+    const trimmed = try normalizeEnteredKey(alloc, "  sk-test-123 \t\r\n");
+    defer alloc.free(trimmed);
+    try std.testing.expectEqualStrings("sk-test-123", trimmed);
+    try std.testing.expectEqual(@as(usize, 0), (try normalizeEnteredKey(alloc, "   ")).len);
+}
+
+fn directProviderTestEnviron(tmp: *std.testing.TmpDir) !struct {
+    home: []u8,
+    environ: std.process.Environ.Map,
+} {
+    const alloc = std.testing.allocator;
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    errdefer alloc.free(home);
+    var environ = std.process.Environ.Map.init(alloc);
+    errdefer environ.deinit();
+    try environ.put("HOME", home);
+    // Keep the test off the real macOS Keychain.
+    try environ.put("FFX_DISABLE_KEYCHAIN", "1");
+    return .{ .home = home, .environ = environ };
+}
+
+test "direct provider login stores the key in settings and activates the provider" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = (try directProviderTestEnviron(&tmp));
+    defer fixture.environ.deinit();
+    defer alloc.free(fixture.home);
+    const stable_environ = try stableCliTestEnviron();
+    io_mod.setEnvironMap(&fixture.environ);
+    defer io_mod.setEnvironMap(stable_environ);
+
+    try storeDirectProviderApiKey(alloc, .deepseek, "sk-test-123");
+    try std.testing.expect(try activateDirectProvider(alloc, .deepseek));
+
+    var settings = try config_runtime.loadMergedSettings(alloc, fixture.home);
+    defer settings.deinit(alloc);
+    try std.testing.expectEqualStrings("sk-test-123", settings.apiKey("deepseek").?);
+    try std.testing.expectEqual(model_provider.ProviderId.deepseek, settings.provider.?);
+    try std.testing.expectEqualStrings(
+        builtin_providers.byId("deepseek").?.default_model,
+        settings.model.?,
+    );
+}
+
+test "direct provider logout removes the stored settings key" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = (try directProviderTestEnviron(&tmp));
+    defer fixture.environ.deinit();
+    defer alloc.free(fixture.home);
+    const stable_environ = try stableCliTestEnviron();
+    io_mod.setEnvironMap(&fixture.environ);
+    defer io_mod.setEnvironMap(stable_environ);
+
+    try persistApiKeyInSettings(alloc, "deepseek", "sk-test-123");
+    try removeDirectProviderApiKey(alloc, .deepseek);
+
+    var settings = try config_runtime.loadMergedSettings(alloc, fixture.home);
+    defer settings.deinit(alloc);
+    try std.testing.expect(settings.apiKey("deepseek") == null);
 }

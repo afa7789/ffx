@@ -82,15 +82,15 @@ for (const call of toolCalls) {
   permission[`mcp_conformance_${call.name}`] = "allow";
 }
 
-const fxBin = resolve(import.meta.dirname, "../../../zig-out/bin/fx");
-const root = mkdtempSync(join(tmpdir(), "fx-mcp-conformance-client-"));
+const fxBin = resolve(import.meta.dirname, "../../../zig-out/bin/ffx");
+const root = mkdtempSync(join(tmpdir(), "ffx-mcp-conformance-client-"));
 const home = join(root, "home");
 const workspace = join(root, "workspace");
-mkdirSync(join(home, ".fx", "skills"), { recursive: true, mode: 0o700 });
+mkdirSync(join(home, ".ffx", "skills"), { recursive: true, mode: 0o700 });
 mkdirSync(workspace, { recursive: true });
 
 writeFileSync(
-  join(home, ".fx", "mcp.json"),
+  join(home, ".ffx", "mcp.json"),
   JSON.stringify({
     mcp: {
       conformance: {
@@ -104,7 +104,7 @@ writeFileSync(
             ? { client_id: scenarioContext.client_id }
             : {}),
           ...(scenarioContext.client_secret
-            ? { client_secret_env: "FX_MCP_CONFORMANCE_CLIENT_SECRET" }
+            ? { client_secret_env: "FFX_MCP_CONFORMANCE_CLIENT_SECRET" }
             : {}),
         },
       },
@@ -112,7 +112,7 @@ writeFileSync(
   }),
 );
 writeFileSync(
-  join(home, ".fx", "settings.json"),
+  join(home, ".ffx", "settings.json"),
   JSON.stringify({
     permission_mode: "auto",
     permission,
@@ -131,7 +131,7 @@ const gatewaySteps = toolCalls.flatMap((call, index) => {
 if (toolCalls.length === 0) {
   gatewaySteps.push(fakeGatewayToolCall(
     "search_conformance_server",
-    "capability_search",
+    "mcp_search_tools",
     { query: "conformance" },
   ));
 }
@@ -153,22 +153,22 @@ try {
       env: {
         ...process.env,
         HOME: home,
-        AI_GATEWAY_API_KEY: "mcp-conformance-placeholder",
+        FFX_PROVIDER_API_KEY: "mcp-conformance-placeholder",
         VERCEL_OIDC_TOKEN: "",
-        FX_AUTO_UPGRADE: "0",
-        FX_DISABLE_KEYCHAIN: "1",
-        FX_E2E_MCP_AUTH_AUTOMATE: "1",
+        FFX_AUTO_UPGRADE: "0",
+        FFX_DISABLE_KEYCHAIN: "1",
+        FFX_E2E_MCP_AUTH_AUTOMATE: "1",
         ...(scenarioContext.client_secret
           ? {
-              FX_MCP_CONFORMANCE_CLIENT_SECRET:
+              FFX_MCP_CONFORMANCE_CLIENT_SECRET:
                 scenarioContext.client_secret,
             }
           : {}),
-        FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_MODEL: FAKE_GATEWAY_MODEL,
-        FX_SKIP_ONBOARDING: "1",
-        FX_SOUND: "0",
+        FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FFX_MODEL: FAKE_GATEWAY_MODEL,
+        FFX_SKIP_ONBOARDING: "1",
+        FFX_SOUND: "0",
         NO_COLOR: "1",
       },
       stdout: "pipe",

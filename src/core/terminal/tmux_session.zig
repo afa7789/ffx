@@ -4,15 +4,15 @@ const contracts = @import("contracts.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const process_identity = @import("../execution/process_identity.zig");
-const process_provider_mod = @import(
-    "../execution/process_provider.zig",
+const process_supervisor = @import("../background/process_supervisor.zig");
+const background_process_provider = @import(
+    "../execution/background_process_provider.zig",
 );
 
 const Allocator = std.mem.Allocator;
 
-pub const launcher_mode = "--fx-internal-terminal-tmux-launcher";
-pub const capture_mode = "--fx-internal-terminal-tmux-capture";
+pub const launcher_mode = "--ffx-internal-terminal-tmux-launcher";
+pub const capture_mode = "--ffx-internal-terminal-tmux-capture";
 
 const namespace_option = "@fx_terminal_namespace";
 const namespace_value = "1";
@@ -46,7 +46,7 @@ const PeerDeadline = struct {
 
     fn init(default_ms: i64) PeerDeadline {
         const duration_ms = if (io_mod.getenv(
-            "FX_TERMINAL_TEST_TMUX_DEADLINE_MS",
+            "FFX_TERMINAL_TEST_TMUX_DEADLINE_MS",
         )) |text|
             @min(
                 std.fmt.parseInt(i64, text, 10) catch default_ms,
@@ -161,7 +161,7 @@ pub const Paths = struct {
         }
         const session_name = try std.fmt.allocPrint(
             alloc,
-            "fx-{s}",
+            "ffx-{s}",
             .{backend_identity},
         );
         errdefer alloc.free(session_name);
@@ -203,13 +203,13 @@ pub const Paths = struct {
         errdefer alloc.free(command);
         const marker_socket = try std.fmt.allocPrint(
             alloc,
-            "/tmp/fx-tmux-marker-{s}.sock",
+            "/tmp/ffx-tmux-marker-{s}.sock",
             .{backend_identity},
         );
         errdefer alloc.free(marker_socket);
         const capture_socket = try std.fmt.allocPrint(
             alloc,
-            "/tmp/fx-tmux-capture-{s}.sock",
+            "/tmp/ffx-tmux-capture-{s}.sock",
             .{backend_identity},
         );
         errdefer alloc.free(capture_socket);
@@ -286,7 +286,7 @@ const ShellIdentityWire = struct {
 
 pub const ShellIdentity = struct {
     pid: std.posix.pid_t,
-    process_token: process_identity.ProcessInstanceToken,
+    process_token: process_supervisor.ProcessInstanceToken,
 };
 
 const Pane = struct {
@@ -351,7 +351,7 @@ pub const Backend = struct {
 
     pub fn start(
         alloc: Allocator,
-        process_provider: process_provider_mod.Provider,
+        process_provider: background_process_provider.Provider,
         durable_root: []const u8,
         transport_root: []const u8,
         backend_identity: []const u8,
@@ -471,7 +471,7 @@ pub const Backend = struct {
 
     pub fn recover(
         alloc: Allocator,
-        process_provider: process_provider_mod.Provider,
+        process_provider: background_process_provider.Provider,
         durable_root: []const u8,
         transport_root: []const u8,
         backend_identity: []const u8,
@@ -668,7 +668,7 @@ pub const Backend = struct {
     pub fn write(self: *Backend, bytes: []const u8, paste: bool) !void {
         const buffer_name = try std.fmt.allocPrint(
             self.alloc,
-            "fx-{s}",
+            "ffx-{s}",
             .{self.backend_identity},
         );
         defer self.alloc.free(buffer_name);
@@ -707,7 +707,7 @@ pub const Backend = struct {
 
     pub fn cleanupChecked(
         self: *Backend,
-        process_provider: process_provider_mod.Provider,
+        process_provider: background_process_provider.Provider,
     ) !void {
         try cleanupOwnedNamespaceWithEvidence(
             self.alloc,
@@ -811,7 +811,7 @@ fn writeTmuxBuffer(
 
 pub fn cleanupOwnedNamespace(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     durable_root: []const u8,
     transport_root: []const u8,
     backend_identity: []const u8,
@@ -830,7 +830,7 @@ pub fn cleanupOwnedNamespace(
 
 pub fn cleanupOwnedNamespaceChecked(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     durable_root: []const u8,
     transport_root: []const u8,
     backend_identity: []const u8,
@@ -870,7 +870,7 @@ pub fn cleanupOwnedNamespaceChecked(
 
 fn cleanupOwnedNamespaceWithEvidence(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     paths: *const Paths,
     backend_identity: []const u8,
     evidence: OwnerEvidence,
@@ -888,7 +888,7 @@ fn cleanupOwnedNamespaceWithEvidence(
             logCleanupFailure(backend_identity, "pane", err);
             return err;
         };
-        if (io_mod.getenv("FX_TERMINAL_TEST_FAIL_TMUX_CLOSE_CLEANUP") != null) {
+        if (io_mod.getenv("FFX_TERMINAL_TEST_FAIL_TMUX_CLOSE_CLEANUP") != null) {
             return error.InjectedTmuxCloseCleanupFailure;
         }
         runTmuxNoOutput(alloc, paths.socket, &.{
@@ -966,7 +966,7 @@ pub fn isCaptureModeRaw(raw_args: []const [*:0]const u8) bool {
 
 pub fn runLauncher(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     raw_args: []const [*:0]const u8,
 ) !void {
     if (comptime !supported()) return error.TerminalHostUnsupported;
@@ -1147,7 +1147,7 @@ pub fn runCapture(raw_args: []const [*:0]const u8) !void {
     {
         return error.InvalidTmuxCapture;
     }
-    const test_failure = io_mod.getenv("FX_TERMINAL_TEST_TMUX_CAPTURE_FAILURE");
+    const test_failure = io_mod.getenv("FFX_TERMINAL_TEST_TMUX_CAPTURE_FAILURE");
     if (test_failure) |failure| {
         if (std.mem.eql(u8, failure, "child-exit")) return;
         if (std.mem.eql(u8, failure, "no-peer")) {
@@ -1194,7 +1194,7 @@ fn waitForCaptureStop() !void {
 
 const LauncherControl = struct {
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     server: *std.Io.net.Server,
     config: LauncherConfig,
     child_pid: std.posix.pid_t,
@@ -1409,7 +1409,7 @@ const OwnedPaneState = union(enum) {
 
 fn validateOwnedPane(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     paths: *const Paths,
     evidence: OwnerEvidence,
 ) !OwnedPaneState {
@@ -1434,7 +1434,7 @@ fn validateOwnedPane(
         .process_identity => {},
     }
     if (!pane.dead) {
-        const token = process_identity.ProcessInstanceToken.parse(
+        const token = process_supervisor.ProcessInstanceToken.parse(
             identity.process_token,
         ) catch return error.TmuxRecoveryReplaced;
         switch (process_provider.matchToken(alloc, pane.pane_pid, token)) {
@@ -1761,11 +1761,11 @@ fn requireSessionAbsent(alloc: Allocator, paths: *const Paths) !void {
 
 fn requireSavedPaneProcessAbsent(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     evidence: OwnerEvidence,
 ) !void {
     const identity = evidence.processIdentity();
-    const token = process_identity.ProcessInstanceToken.parse(
+    const token = process_supervisor.ProcessInstanceToken.parse(
         identity.process_token,
     ) catch return error.TmuxRecoveryReplaced;
     switch (process_provider.matchToken(alloc, identity.pid, token)) {
@@ -1777,7 +1777,7 @@ fn requireSavedPaneProcessAbsent(
 
 fn requireOwnedNamespaceAbsent(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     paths: *const Paths,
     evidence: OwnerEvidence,
 ) !void {
@@ -1787,7 +1787,7 @@ fn requireOwnedNamespaceAbsent(
 
 fn waitForOwnedNamespaceAbsent(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     paths: *const Paths,
     evidence: OwnerEvidence,
 ) !void {
@@ -1949,7 +1949,7 @@ fn writeLifecycle(path: []const u8, kind: LifecycleKind, value: u32) !void {
 
 fn writeShellIdentity(
     alloc: Allocator,
-    process_provider: process_provider_mod.Provider,
+    process_provider: background_process_provider.Provider,
     path: []const u8,
     pid: std.posix.pid_t,
 ) !void {
@@ -1985,7 +1985,7 @@ fn loadShellIdentity(alloc: Allocator, path: []const u8) !ShellIdentity {
     if (pid <= 0) return error.MalformedTmuxShellIdentity;
     return .{
         .pid = pid,
-        .process_token = process_identity.ProcessInstanceToken.parse(
+        .process_token = process_supervisor.ProcessInstanceToken.parse(
             parsed.value.process_token,
         ) catch return error.MalformedTmuxShellIdentity,
     };
@@ -2255,7 +2255,7 @@ fn receiveBeforeDeadline(
 }
 
 fn assignForegroundProcessGroup(fd: c_int, pgrp: std.posix.pid_t) bool {
-    if (io_mod.getenv("FX_TERMINAL_TEST_TMUX_TCSETPGRP_FAILURE") != null) {
+    if (io_mod.getenv("FFX_TERMINAL_TEST_TMUX_TCSETPGRP_FAILURE") != null) {
         return false;
     }
     return tcsetpgrp(fd, pgrp) == 0;
@@ -2323,7 +2323,7 @@ fn waitLauncherChild(child: *std.process.Child) !std.process.Child.Term {
 
 fn requestChildTermination(child_pid: std.posix.pid_t) void {
     const group_kill_succeeded =
-        io_mod.getenv("FX_TERMINAL_TEST_TMUX_GROUP_KILL_FAILURE") == null and
+        io_mod.getenv("FFX_TERMINAL_TEST_TMUX_GROUP_KILL_FAILURE") == null and
         std.c.kill(-child_pid, std.c.SIG.KILL) == 0;
     if (group_kill_succeeded) return;
 
@@ -2429,7 +2429,7 @@ test "tmux peer deadline bounds accept receive partial frames and cancellation" 
     const alloc = std.testing.allocator;
     const socket_path = try std.fmt.allocPrint(
         alloc,
-        "/tmp/fx-peer-deadline-{d}.sock",
+        "/tmp/ffx-peer-deadline-{d}.sock",
         .{std.c.getpid()},
     );
     defer alloc.free(socket_path);
@@ -2500,7 +2500,7 @@ test "tmux peer deadline bounds accept receive partial frames and cancellation" 
 test "checked tmux cleanup requires saved process absence without a socket" {
     const alloc = std.testing.allocator;
     const MatchStub = struct {
-        result: process_identity.TokenMatch,
+        result: process_supervisor.TokenMatch,
         matches_before_result: usize = 0,
         match_calls: usize = 0,
 
@@ -2508,8 +2508,8 @@ test "checked tmux cleanup requires saved process absence without a socket" {
             raw: ?*anyopaque,
             _: Allocator,
             _: []const u8,
-            _: process_identity.ProcessInstanceToken,
-        ) process_identity.TokenMatch {
+            _: process_supervisor.ProcessInstanceToken,
+        ) process_supervisor.TokenMatch {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.match_calls += 1;
             if (self.matches_before_result > 0) {
@@ -2548,7 +2548,7 @@ test "checked tmux cleanup requires saved process absence without a socket" {
     try writePrivateFile(paths.config, "owner evidence", true);
 
     var stub = MatchStub{ .result = .matched };
-    var provider = process_provider_mod.unavailable_provider;
+    var provider = background_process_provider.unavailable_provider;
     provider.context = &stub;
     provider.match_token_fn = MatchStub.match;
     try std.testing.expectError(
@@ -2690,8 +2690,8 @@ test "tmux backend identity and shell quoting remain deterministic" {
 
 test "tmux paths keep artifacts durable and place only the server socket in transport" {
     const alloc = std.testing.allocator;
-    const durable_root = "/profiles/example/.fx/terminal-host";
-    const transport_root = "/tmp/fx-terminal-501-profile";
+    const durable_root = "/profiles/example/.ffx/terminal-host";
+    const transport_root = "/tmp/ffx-terminal-501-profile";
     const identity = "0123456789abcdef0123456789abcdef";
     var paths = try Paths.init(
         alloc,
@@ -2702,7 +2702,7 @@ test "tmux paths keep artifacts durable and place only the server socket in tran
     defer paths.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "/tmp/fx-terminal-501-profile/tmux.sock",
+        "/tmp/ffx-terminal-501-profile/tmux.sock",
         paths.socket,
     );
     for ([_][]const u8{

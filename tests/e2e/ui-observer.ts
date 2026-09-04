@@ -2,7 +2,7 @@
  * Deterministic UI observer runner.
  *
  * This is an inspection tool, not a golden test suite. It launches the
- * freshly built fx binary in tmux, arms one observer checkpoint, releases one
+ * freshly built ffx binary in tmux, arms one observer checkpoint, releases one
  * fixture transition, and saves terminal plus replay artifacts for review.
  */
 import { execFileSync } from "node:child_process";
@@ -18,11 +18,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FFX_BIN } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
-  fakeShellRun,
   fakeGatewayToolCall,
   startFakeGateway,
   TmuxSession,
@@ -147,13 +146,13 @@ function isScenarioName(value: string | undefined): value is ScenarioName {
 }
 
 function createFixtureRoot(autoPermissions = false) {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ui-observer-fixture-")));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-ui-observer-fixture-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({
       sandbox: "none",
       permission_mode: autoPermissions ? "auto" : "ask",
@@ -164,12 +163,12 @@ function createFixtureRoot(autoPermissions = false) {
 }
 
 function createArtifactDir(keep: boolean): string {
-  const configured = process.env.FX_UI_OBSERVER_ARTIFACT_DIR;
+  const configured = process.env.FFX_UI_OBSERVER_ARTIFACT_DIR;
   if (configured) {
     mkdirSync(configured, { recursive: true });
     return realpathSync(configured);
   }
-  const root = mkdtempSync(join(tmpdir(), "fx-ui-observer-"));
+  const root = mkdtempSync(join(tmpdir(), "ffx-ui-observer-"));
   if (keep) return realpathSync(root);
   return root;
 }
@@ -181,14 +180,14 @@ function gatewayEnv(
 ) {
   return {
     HOME: fixture.home,
-    AI_GATEWAY_API_KEY: "ui-observer-local",
+    FFX_PROVIDER_API_KEY: "ui-observer-local",
     VERCEL_OIDC_TOKEN: undefined,
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: FAKE_GATEWAY_MODEL,
-    FX_AUTO_UPGRADE: "0",
-    FX_UI_OBSERVE_DIR: artifactDir,
-    FX_RECORD: join(artifactDir, "session.fxtp"),
+    FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_MODEL: FAKE_GATEWAY_MODEL,
+    FFX_AUTO_UPGRADE: "0",
+    FFX_UI_OBSERVE_DIR: artifactDir,
+    FFX_RECORD: join(artifactDir, "session.fxtp"),
     NO_COLOR: "1",
   };
 }
@@ -280,7 +279,7 @@ async function captureArtifacts(
   const marker = `ui-observer:${scenario}:${context.checkpoint}:frame:${sequence}`;
   const tapePath = join(context.artifactDir, "session.fxtp");
   const replayDir = join(context.artifactDir, "replay");
-  execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", replayDir], {
+  execFileSync(FFX_BIN, ["replay", tapePath, "--frames-dir", replayDir], {
     cwd: context.artifactDir,
     stdio: "pipe",
   });
@@ -460,11 +459,11 @@ async function setupScenario(
       gateway = startFakeGateway([
         async () => {
           await gate.promise;
-          return fakeShellRun(
-            "observer_thinking_running",
-            "sleep 5 # this command is intentionally verbose so the running status must end with an omission marker at the terminal boundary",
-            { timeout_ms: 600_000 },
-          );
+          return fakeGatewayToolCall("observer_thinking_running", "terminal", {
+            action: "exec",
+            timeout_ms: 600_000,
+            command: "sleep 5 # this command is intentionally verbose so the running status must end with an omission marker at the terminal boundary",
+          });
         },
         async () => {
           await finish.promise;
@@ -486,11 +485,11 @@ async function setupScenario(
       gateway = startFakeGateway([
         async () => {
           await gate.promise;
-          return fakeShellRun(
-            "observer_thinking_final",
-            "printf OBSERVER_THINKING_TOOL_FINAL # this command is intentionally verbose so the completed status must wrap and truncate at the terminal boundary",
-            { timeout_ms: 600_000 },
-          );
+          return fakeGatewayToolCall("observer_thinking_final", "terminal", {
+            action: "exec",
+            timeout_ms: 600_000,
+            command: "printf OBSERVER_THINKING_TOOL_FINAL # this command is intentionally verbose so the completed status must wrap and truncate at the terminal boundary",
+          });
         },
         () => fakeGatewayFinalText("OBSERVER_THINKING_FINAL_RESPONSE"),
       ]);
@@ -512,11 +511,11 @@ async function setupScenario(
       gateway = startFakeGateway([
         async () => {
           await gate.promise;
-          return fakeShellRun(
-            "observer_thinking_failed",
-            "sh -c 'printf OBSERVER_THINKING_TOOL_FAILED >&2; exit 17' # this command is intentionally verbose so the failed status must wrap and truncate at the terminal boundary",
-            { timeout_ms: 600_000 },
-          );
+          return fakeGatewayToolCall("observer_thinking_failed", "terminal", {
+            action: "exec",
+            timeout_ms: 600_000,
+            command: "sh -c 'printf OBSERVER_THINKING_TOOL_FAILED >&2; exit 17' # this command is intentionally verbose so the failed status must wrap and truncate at the terminal boundary",
+          });
         },
         () => fakeGatewayFinalText("OBSERVER_THINKING_FAILED_RESPONSE"),
       ]);
@@ -601,7 +600,7 @@ async function setupScenario(
   }
 
   const session = await TmuxSession.create({
-    cmd: FX_BIN,
+    cmd: FFX_BIN,
     cwd: fixture.workspace,
     env: gatewayEnv(fixture, gateway, artifactDir),
     width: size.width,
@@ -666,8 +665,8 @@ async function run() {
   }
   if (!args.scenario) throw new Error("--scenario is required");
   if (!tmuxAvailable()) throw new Error("tmux is required");
-  if (!existsSync(FX_BIN)) {
-    throw new Error(`fresh fx binary is missing: ${FX_BIN}\nRun: zig build`);
+  if (!existsSync(FFX_BIN)) {
+    throw new Error(`fresh ffx binary is missing: ${FFX_BIN}\nRun: zig build`);
   }
 
   const fixture = createFixtureRoot(
@@ -677,7 +676,7 @@ async function run() {
   );
   const artifactDir = createArtifactDir(args.keep);
   let context: ScenarioContext | null = null;
-  const preserveArtifacts = args.keep || process.env.FX_UI_OBSERVER_ARTIFACT_DIR !== undefined;
+  const preserveArtifacts = args.keep || process.env.FFX_UI_OBSERVER_ARTIFACT_DIR !== undefined;
   try {
     context = await setupScenario(args.scenario, fixture, artifactDir, args.size);
     await waitFor(() => frameRecords(artifactDir).length > 0, "initial observer frame");

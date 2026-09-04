@@ -16,8 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
-import { findFooterBlocks } from "./tui-render-assertions";
+import { FFX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -39,24 +38,8 @@ const UPGRADE_TIMEOUT = TIMEOUT * 2;
 const SESSION_PICKER_META_RE = /\bturns?\b/;
 const SELECTED_COMPLETION_SGR = "\x1b[1m\x1b[38;5;255m";
 
-function fakeShellRun(
-  callId: string,
-  command: string,
-  options: Record<string, unknown> = {},
-): Response {
-  return fakeGatewayToolCall(callId, "shell", {
-    request: {
-      action: "run",
-      command,
-      yield_time_ms: 30_000,
-      timeout_ms: 600_000,
-      ...options,
-    },
-  });
-}
-
 function sessionIdFromHome(home: string): string {
-  const sessions = join(home, ".fx", "sessions");
+  const sessions = join(home, ".ffx", "sessions");
   const ids = readdirSync(sessions, { withFileTypes: true })
     .filter((entry) => entry.name !== "latest" && entry.isDirectory())
     .map((entry) => entry.name);
@@ -71,13 +54,10 @@ function shellQuote(value: string): string {
 function startUpgradeServer(
   root: string,
   argvLogPath: string,
-  options: {
-    revision?: string;
-  } = {},
 ): { baseUrl: string; stop: () => void } {
   const artifactDir = join(root, "release-artifact");
-  const wrapperPath = join(artifactDir, "fx");
-  const archivePath = join(root, "fx.tar.gz");
+  const wrapperPath = join(artifactDir, "ffx");
+  const archivePath = join(root, "ffx.tar.gz");
   mkdirSync(artifactDir);
   const script = `#!/bin/sh
 {
@@ -87,34 +67,25 @@ function startUpgradeServer(
   done
   printf '\\n'
 } >> ${shellQuote(argvLogPath)}
-exec ${shellQuote(FX_BIN)} "$@"
+exec ${shellQuote(FFX_BIN)} "$@"
 `;
   writeFileSync(wrapperPath, script);
   chmodSync(wrapperPath, 0o755);
-  const tar = Bun.spawnSync(["tar", "-czf", archivePath, "-C", artifactDir, "fx"]);
+  const tar = Bun.spawnSync(["tar", "-czf", archivePath, "-C", artifactDir, "ffx"]);
   if (tar.exitCode !== 0) throw new Error(tar.stderr.toString());
 
   const archive = readFileSync(archivePath);
   const checksum = createHash("sha256").update(archive).digest("hex");
   const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
-  const revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
-  const stableArchiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
-  const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
+  const archiveRoute = `/v9.9.9/ffx-${platform}.tar.gz`;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
       if (path === "/latest.txt") return new Response("v9.9.9\n");
-      if (path === "/dev.json") {
-        return Response.json({ version: "9.9.9", commit: revision });
-      }
-      if (path === stableArchiveRoute || path === devArchiveRoute) {
-        return new Response(archive);
-      }
-      if (path === `${stableArchiveRoute}.sha256` || path === `${devArchiveRoute}.sha256`) {
-        return new Response(`${checksum}\n`);
-      }
+      if (path === archiveRoute) return new Response(archive);
+      if (path === `${archiveRoute}.sha256`) return new Response(`${checksum}\n`);
       return new Response("not found", { status: 404 });
     },
   });
@@ -130,12 +101,12 @@ function gatewayEnv(
 ) {
   return {
     HOME: home,
-    AI_GATEWAY_API_KEY: "fake-tui-resume-key",
+    FFX_PROVIDER_API_KEY: "fake-tui-resume-key",
     VERCEL_OIDC_TOKEN: undefined,
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: FAKE_GATEWAY_MODEL,
-    FX_AUTO_UPGRADE: "0",
+    FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_MODEL: FAKE_GATEWAY_MODEL,
+    FFX_AUTO_UPGRADE: "0",
     NO_COLOR: "1",
   };
 }
@@ -275,7 +246,7 @@ async function waitForPersistedSessionMarker(
   marker: string,
   timeout = TIMEOUT,
 ): Promise<void> {
-  const sessionsDir = join(home, ".fx", "sessions");
+  const sessionsDir = join(home, ".ffx", "sessions");
   await waitForCondition(() => {
     if (!existsSync(sessionsDir)) return false;
     return readdirSync(sessionsDir, { withFileTypes: true })
@@ -293,7 +264,7 @@ async function waitForCommittedSessionMarker(
   marker: string,
   timeout = TIMEOUT,
 ): Promise<void> {
-  const sessionsDir = join(home, ".fx", "sessions");
+  const sessionsDir = join(home, ".ffx", "sessions");
   await waitForCondition(() => {
     if (!existsSync(sessionsDir)) return false;
     return readdirSync(sessionsDir, { withFileTypes: true })
@@ -324,8 +295,7 @@ async function waitForSessionPicker(session: TmuxSession): Promise<string> {
   return session.waitForPane(
     (pane) => {
       const plain = stripAnsi(pane);
-      return plain.includes("Sessions") &&
-        (plain.includes("[Current workspace]") || plain.includes("[All workspaces]"));
+      return plain.includes("Sessions") && SESSION_PICKER_META_RE.test(plain);
     },
     TIMEOUT,
   );
@@ -723,10 +693,10 @@ function expectRenderedMarkdown(
 }
 
 function expectInferredTypeScriptCodeBlock(scrollback: string): void {
-  expect(scrollback).toContain("─ ts ─");
+  expect(scrollback).toContain("┌ ts");
   expect(scrollback).toContain("inferredHook = await");
   expect(scrollback).toContain("{ cleanup: true } as");
-  expect(scrollback).toContain("nupSignal)");
+  expect(scrollback).toContain("pSignal);");
 }
 
 function expectInferredTypeScriptColors(scrollback: string): void {
@@ -735,9 +705,9 @@ function expectInferredTypeScriptColors(scrollback: string): void {
 }
 
 function expectExpandedCodeProfiles(scrollback: string): void {
-  expect(scrollback).toContain("─ json ─");
+  expect(scrollback).toContain("┌ json");
   expect(scrollback).toContain('"json_ready"');
-  expect(scrollback).toContain("─ python ─");
+  expect(scrollback).toContain("┌ python");
   expect(scrollback).toContain("def render_ready");
 }
 
@@ -753,7 +723,7 @@ function expectNoRawToolReplay(scrollback: string): void {
 
 function normalizeVolatileStatusRows(grid: string[]): string[] {
   return grid.map((line) =>
-    /^• (?:Thinking|Generating|Running)(?: \(\d+s\))?$/.test(line) ||
+    /^• Thinking(?: \(\d+s\))?$/.test(line) ||
       /^• Streaming \([^)]*\)$/.test(line) ||
       isVolatileTokenStatusRow(line)
       ? "<status>"
@@ -768,73 +738,9 @@ test("volatile status rows normalize before stable-grid comparison", () => {
 });
 
 test.skipIf(!tmuxAvailable())(
-  "saved fx ask metadata appears after interactive Ctrl-O resume",
-  async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-metadata-resume-")));
-    const home = join(root, "home");
-    const workspace = join(root, "workspace");
-    const stderrPath = join(root, "stderr.log");
-    mkdirSync(join(home, ".fx"), { recursive: true });
-    mkdirSync(workspace);
-    writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
-    );
-    writeFileSync(stderrPath, "");
-
-    const prompt = "Persist this fx ask metadata.";
-    const answer = "FX_ASK_METADATA_COMPLETE";
-    const askGateway = startFakeGateway([fakeGatewayFinalText(answer)]);
-    let active: TmuxSession | null = null;
-    try {
-      const ask = await runFx(["ask", "--json", "--auto", prompt], {
-        cwd: realpathSync(workspace),
-        env: gatewayEnv(home, askGateway),
-        timeoutMs: TIMEOUT,
-      });
-      expect(ask.code).toBe(0);
-      expect(ask.stderr).toBe("");
-      expect(JSON.parse(ask.stdout).session_id).toBeTruthy();
-
-      const resumeGateway = startFakeGateway([]);
-      try {
-        active = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-last`,
-          cwd: realpathSync(workspace),
-          env: gatewayEnv(home, resumeGateway),
-          stderrPath,
-          width: 100,
-          height: 32,
-        });
-        await active.waitForComposer(TIMEOUT);
-        await active.waitForText(answer, TIMEOUT);
-        await active.sendKeys("C-o");
-        const full = await active.waitForPane(
-          (pane) =>
-            pane.includes("Full detail · ctrl o close") &&
-            pane.includes("UTC · Usage") &&
-            /\(↑\d+ ↓5\)/.test(pane),
-          TIMEOUT,
-        );
-        expect(full).toContain(prompt);
-        expect(full).toContain(answer);
-        expect(readFileSync(stderrPath, "utf8")).toBe("");
-      } finally {
-        if (active) await active.kill();
-        resumeGateway.stop();
-      }
-    } finally {
-      askGateway.stop();
-      rmSync(root, { recursive: true, force: true });
-    }
-  },
-  TIMEOUT * 2,
-);
-
-test.skipIf(!tmuxAvailable())(
   "session resume command group opens last and explicit session ids",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-resume-command-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-session-resume-command-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const seedStderrPath = join(root, "seed-stderr.log");
@@ -853,7 +759,7 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, seedGateway),
         stderrPath: seedStderrPath,
@@ -871,11 +777,11 @@ test.skipIf(!tmuxAvailable())(
       const sessionId = sessionIdFromHome(home);
       const cases = [
         {
-          command: `${FX_BIN} session resume --id ${sessionId}`,
+          command: `${FFX_BIN} session resume --id ${sessionId}`,
           stderrPath: exactStderrPath,
         },
         {
-          command: `${FX_BIN} session resume last`,
+          command: `${FFX_BIN} session resume last`,
           stderrPath: lastStderrPath,
         },
       ];
@@ -931,9 +837,9 @@ function expectAltExitToPreserveNormalViewport(tapePath: string): void {
 }
 
 test.skipIf(!tmuxAvailable())(
-  "approved-shell command output normalizes controls in Ctrl-O and resume views",
+  "approved-shell command output normalizes controls in compact, Ctrl-O, and resume views",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-output-terminal-safety-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-command-output-terminal-safety-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -947,11 +853,11 @@ test.skipIf(!tmuxAvailable())(
     const trailingMarker = "BOUNDARY_TRAILING";
     const literalClose = "LITERAL_CLOSE_</stdout>";
     const doneMarker = "CONTROL_OUTPUT_DONE";
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
     writeFileSync(resumedStderrPath, "");
@@ -976,21 +882,24 @@ printf '${trailingMarker}   '
     chmodSync(scriptPath, 0o755);
 
     const gateway = startFakeGateway([
-      fakeShellRun("terminal-safety-command", "./command-output-controls.sh"),
+      fakeGatewayToolCall("terminal-safety-command", "terminal", {
+        action: "exec",
+        command: "./command-output-controls.sh",
+      }),
       fakeGatewayFinalText(doneMarker),
     ]);
     let active: TmuxSession | null = null;
     let resumedGateway: ReturnType<typeof startFakeGateway> | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: {
           ...gatewayEnv(home, gateway),
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,core,tool,render,transcript,command_output,session",
+          FFX_RECORD: tapePath,
+          FFX_RECORD_INPUT: "1",
+          FFX_TRACE_LOG: tracePath,
+          FFX_TRACE_SCOPES: "agent,core,tool,render,transcript,command_output,session",
         },
         stderrPath,
         width: 72,
@@ -999,20 +908,19 @@ printf '${trailingMarker}   '
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
       const compact = await waitForScrollback(active, doneMarker);
-      expect(compact).toContain("● 1 tool call · 1 command");
-      expect(compact).toContain("└ Ran ./command-output-controls.sh");
-      expect(compact).not.toContain(`│ ${ansiMarker}`);
-      expect(compact).not.toContain(`│ ${crMarker}`);
-      expect(compact).not.toContain("│ TAB");
-      expect(compact).not.toContain("│ NUL:\\x00:END");
-      expect(compact).not.toContain("│ INVALID:\\xff:END");
+      expect(compact).toContain(`│ ${ansiMarker}`);
+      expect(compact).toContain(`│ ${crMarker}`);
+      expect(compact).toContain("│ TAB");
+      expect(compact).toContain("STOP");
+      expect(compact).toContain("│ NUL:\\x00:END");
+      expect(compact).toContain("│ INVALID:\\xff:END");
       expect(compact).not.toContain("CR_STAGE_01");
       expect(compact).not.toContain("\\x0d");
       expect(compact).not.toContain("\\x1b[31m");
       expect(compact).not.toContain("BOUNDARY_LEADING");
       expect(compact).not.toContain(splitMarker);
       expect(compact).not.toContain(trailingMarker);
-      expect(compact).not.toContain("lines more (ctrl o to view)");
+      expect(compact).toContain("│ … 5 lines more (ctrl o to view)");
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
       expect(readFileSync(tracePath, "utf8")).toContain("route=approved_shell");
 
@@ -1022,8 +930,8 @@ printf '${trailingMarker}   '
       );
       const compactGrid = await active.capturePaneGrid();
       await active.resizeWindow(48, 24);
-      const narrow = await active.waitForText(doneMarker, TIMEOUT);
-      expect(narrow).not.toContain(`│ ${ansiMarker}`);
+      const narrow = await active.waitForText("│ … 5 lines more (ctrl o to view)", TIMEOUT);
+      expect(narrow).toContain(`│ ${ansiMarker}`);
       expect(narrow).not.toContain(trailingMarker);
       await active.resizeWindow(72, 24);
       await active.waitForText(doneMarker, TIMEOUT);
@@ -1034,14 +942,17 @@ printf '${trailingMarker}   '
       );
 
       const tape = readFileSync(tapePath);
-      expect(tape.includes(Buffer.from(`│ ${ansiMarker}`))).toBe(false);
+      expect(tape.includes(Buffer.from(`│ ${ansiMarker}`))).toBe(true);
       expect(tape.includes(Buffer.from(`\x1b[31m${ansiMarker}`))).toBe(false);
       expect(tape.includes(Buffer.from(`NUL:\x00:END`))).toBe(false);
       expect(tape.includes(Buffer.from([0x49, 0x4e, 0x56, 0x41, 0x4c, 0x49, 0x44, 0x3a, 0xff])))
         .toBe(false);
 
       await active.sendKeys("C-o");
-      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+      await active.waitForText("┃ Review · ←/→ switch · ctrl o close", TIMEOUT);
+      expect(await active.capturePane()).not.toContain(trailingMarker);
+      await active.sendKeys("Right");
+      await active.waitForText("┃ Full detail · ←/→ switch · ctrl o close", TIMEOUT);
       await active.sendHexBytes(
         Array.from({ length: 80 }, () => ["1b", "5b", "36", "7e"]).flat(),
       );
@@ -1057,18 +968,13 @@ printf '${trailingMarker}   '
       const fullHead = await active.capturePane();
       expect(fullHead).toContain(ansiMarker);
       expect(fullHead).toContain(crMarker);
+      expect(fullHead).toContain("NUL:\\x00:END");
+      expect(fullHead).toContain("INVALID:\\xff:END");
       expect(fullHead).not.toContain("CR_STAGE_01");
       expect(fullHead).not.toContain("\\x1b[31m");
       await active.sendHexBytes(["1b", "5b", "3c", "36", "35", "3b", "31", "3b", "31", "4d"]);
-      const invalidViewport = await active.waitForPane(
-        (pane) => pane !== fullHead && pane.includes("INVALID:\\xff:END"),
-        TIMEOUT,
-      );
-      expect(invalidViewport).toContain("NUL:\\x00:END");
-      expect(invalidViewport).not.toContain("\\x1b[31m");
-      await active.sendHexBytes(["1b", "5b", "3c", "36", "35", "3b", "31", "3b", "31", "4d"]);
       const boundaryViewport = await active.waitForPane(
-        (pane) => pane !== invalidViewport && pane.includes("BOUNDARY_LEADING"),
+        (pane) => pane !== fullHead && pane.includes("BOUNDARY_LEADING"),
         TIMEOUT,
       );
       expect(boundaryViewport).toContain("BOUNDARY_LEADING");
@@ -1094,16 +1000,19 @@ printf '${trailingMarker}   '
 
       resumedGateway = startFakeGateway([]);
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FFX_BIN} --resume-last`,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, resumedGateway),
         stderrPath: resumedStderrPath,
         width: 72,
         height: 24,
       });
-      await active.waitForText(doneMarker, TIMEOUT);
+      await active.waitForText("│ … 5 lines more (ctrl o to view)", TIMEOUT);
       await active.sendKeys("C-o");
-      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+      await active.waitForText("┃ Review · ←/→ switch · ctrl o close", TIMEOUT);
+      expect(await active.capturePane()).not.toContain(trailingMarker);
+      await active.sendKeys("Right");
+      await active.waitForText("┃ Full detail · ←/→ switch · ctrl o close", TIMEOUT);
       await active.sendHexBytes(
         Array.from({ length: 80 }, () => ["1b", "5b", "36", "7e"]).flat(),
       );
@@ -1142,45 +1051,47 @@ printf '${trailingMarker}   '
 );
 
 test.skipIf(!tmuxAvailable())(
-  "Ctrl-O opens full retained command output and restores grouped compact output",
+  "Ctrl-O opens retained command output in the alternate buffer and restores compact inline output",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
     const tapePath = join(root, "ctrl-o.fxtape");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
-    const tailMarker = "FULL_CTRL_O_LINE_0100";
+    const tailMarker = "FULL_CTRL_O_LINE_3000";
     const commandArgumentTail = "FULL_CTRL_O_COMMAND_ARGUMENT_TAIL";
     const command =
-      "awk 'BEGIN { for (i = 1; i <= 100; i++) printf \"FULL_CTRL_O_LINE_%04d\\n\", i }'" +
+      "awk 'BEGIN { for (i = 1; i <= 3000; i++) printf \"FULL_CTRL_O_LINE_%04d\\n\", i }'" +
       ` # ${"argument-padding-".repeat(8)}${commandArgumentTail}`;
     const gateway = startFakeGateway([
-      fakeShellRun("ctrl-o-command", command),
+      fakeGatewayToolCall("ctrl-o-command", "terminal", { action: "exec", command }),
       fakeGatewayFinalText("FULL_CTRL_O_DONE"),
     ]);
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
-        env: { ...gatewayEnv(home, gateway), FX_RECORD: tapePath },
+        env: { ...gatewayEnv(home, gateway), FFX_RECORD: tapePath },
         stderrPath,
         width: 100,
         height: 32,
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
+      await waitForScrollback(
+        active,
+        "│ … 2995 lines more (ctrl o to view)",
+      );
       const compact = await waitForScrollback(active, "FULL_CTRL_O_DONE");
-      expect(compact).toContain("● 1 tool call · 1 command");
-      expect(compact).not.toContain("lines more (ctrl o to view)");
       expect(compact).not.toContain(tailMarker);
       await active.waitForPane(
         (pane) => pane.includes("FULL_CTRL_O_DONE") && !pane.includes("Streaming ("),
@@ -1189,37 +1100,34 @@ test.skipIf(!tmuxAvailable())(
       const compactGrid = await active.capturePaneGrid();
 
       await active.sendKeys("C-o");
-      await active.waitForText("Full detail · ctrl o close · PgUp/PgDn scroll · Esc close", TIMEOUT);
-      const expandedAtTail = await active.waitForText(tailMarker, TIMEOUT);
+      await active.waitForText("Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close", TIMEOUT);
+      const review = await active.capturePane();
+      expect(review).toContain("FULL_CTRL_O_LINE_0001");
+      expect(review).toContain("FULL_CTRL_O_LINE_0003");
+      expect(review).not.toContain("FULL_CTRL_O_LINE_0004");
+      expect(review).not.toContain(tailMarker);
+      expect(review).not.toContain(commandArgumentTail);
+      expect(review).toContain("2997 more lines · → to expand");
+      expect(review).not.toMatch(/^\s*input\s*$/m);
+
+      await active.sendKeys("Right");
+      await active.waitForText("Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close", TIMEOUT);
+      const expandedAtTail = await active.capturePane();
       expect(expandedAtTail).toContain(tailMarker);
       expect(expandedAtTail).not.toContain("FULL_CTRL_O_LINE_0001");
 
-      for (let page = 0; page < 20; page += 1) {
-        const before = await active.capturePane();
-        if (
-          before.includes("FULL_CTRL_O_LINE_0001") &&
-          /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} UTC · Tool/.test(before)
-        ) break;
-        await active.sendKeys("PPage");
-        await active.waitForPane((pane) => pane !== before, TIMEOUT);
-      }
+      await active.sendKeys(Array.from({ length: 140 }, () => "PPage").join(" "));
       const expandedAtHead = await active.waitForText("command: awk", TIMEOUT);
-      expect(expandedAtHead).toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} UTC · Tool/);
       expect(expandedAtHead).toContain(commandArgumentTail);
       expect(expandedAtHead).toContain("FULL_CTRL_O_LINE_0001");
       expect(expandedAtHead).not.toContain(tailMarker);
 
-      for (let page = 0; page < 20; page += 1) {
-        const before = await active.capturePane();
-        if (before.includes(tailMarker)) break;
-        await active.sendKeys("NPage");
-        await active.waitForPane((pane) => pane !== before, TIMEOUT);
-      }
+      await active.sendKeys(Array.from({ length: 140 }, () => "NPage").join(" "));
       await active.waitForText(tailMarker, TIMEOUT);
       const full = await active.capturePane();
       expect(full).toContain(tailMarker);
       expect(full).not.toContain("lines more (ctrl o");
-      expect(full).toContain("Full detail · ctrl o close · PgUp/PgDn scroll · Esc close");
+      expect(full).toContain("Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close");
 
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
       const afterPageUp = await active.waitForPane(
@@ -1247,11 +1155,13 @@ test.skipIf(!tmuxAvailable())(
       }
       await active.waitForText(tailMarker, TIMEOUT);
 
+      await active.sendKeys("Left");
+      await active.waitForText("Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close", TIMEOUT);
       await active.sendKeys("C-o");
-      await active.waitForText("● 1 tool call · 1 command", TIMEOUT);
+      await active.waitForText("│ … 2995 lines more (ctrl o to view)", TIMEOUT);
       const restored = await active.capturePane();
       const restoredScrollback = await active.captureFullScrollback();
-      expect(restored).not.toContain("lines more (ctrl o to view)");
+      expect(restored).toContain("│ … 2995 lines more (ctrl o to view)");
       expect(restored).not.toContain(tailMarker);
       expect(normalizeVolatileStatusRows(await active.capturePaneGrid())).toEqual(
         normalizeVolatileStatusRows(compactGrid),
@@ -1274,20 +1184,20 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "cap-crossing command output stays durable while grouped compact returns to input",
+  "cap-crossing command output returns to input and accepts slash commands",
   async () => {
     const timeout = 120_000;
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-output-cap-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-command-output-cap-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
     const tracePath = join(root, "trace.log");
     const tapePath = join(root, "command-output-cap.fxtape");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -1303,21 +1213,21 @@ test.skipIf(!tmuxAvailable())(
       `printf '${stdoutTail}\\n'; sleep 0.05; printf '${stderrTail}\\n' >&2`;
     const finalMarker = "CAP_CROSSING_DONE";
     const gateway = startFakeGateway([
-      fakeShellRun("cap-crossing-command", command),
+      fakeGatewayToolCall("cap-crossing-command", "terminal", { action: "exec", command }),
       fakeGatewayFinalText(finalMarker),
     ]);
     let active: TmuxSession | null = null;
     let passed = false;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: {
           ...gatewayEnv(home, gateway),
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,tool,worker,render,transcript,command_output",
+          FFX_RECORD: tapePath,
+          FFX_RECORD_INPUT: "1",
+          FFX_TRACE_LOG: tracePath,
+          FFX_TRACE_SCOPES: "agent,tool,worker,render,transcript,command_output",
         },
         stderrPath,
         width: 160,
@@ -1325,9 +1235,12 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cap-crossing command.");
+      await waitForScrollback(
+        active,
+        `│ … ${lineCount * 2 - 5} lines more (ctrl o to view)`,
+        timeout,
+      );
       const compact = await waitForScrollback(active, finalMarker, timeout);
-      expect(compact).toContain("● 1 tool call · 1 command");
-      expect(compact).not.toContain("lines more (ctrl o to view)");
       expect(compact).not.toContain(stdoutTail);
       expect(compact).not.toContain(stderrTail);
 
@@ -1337,14 +1250,18 @@ test.skipIf(!tmuxAvailable())(
       expect(active.paneStatus()).toEqual({ dead: false, status: null });
       const sessionId = sessionIdFromHome(home);
 
-      const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
+      const commandDir = join(home, ".ffx", "sessions", sessionId, "logs", "commands");
       const artifactFiles = readdirSync(commandDir);
-      const replayFiles = artifactFiles.filter((name) => name.endsWith(".bin"));
-      expect(replayFiles).toHaveLength(1);
-      const replayBytes = readFileSync(join(commandDir, replayFiles[0]!));
-      expect(replayBytes.byteLength).toBeGreaterThan(1024 * 1024);
-      expect(replayBytes.includes(Buffer.from(stdoutTail))).toBe(true);
-      expect(replayBytes.includes(Buffer.from(stderrTail))).toBe(true);
+      const stdoutName = artifactFiles.find((name) => name.endsWith(".stdout.log"));
+      const stderrName = artifactFiles.find((name) => name.endsWith(".stderr.log"));
+      expect(stdoutName).toBeDefined();
+      expect(stderrName).toBeDefined();
+      const stdoutArtifact = readFileSync(join(commandDir, stdoutName!), "utf8");
+      const stderrArtifact = readFileSync(join(commandDir, stderrName!), "utf8");
+      expect(stdoutArtifact.trimEnd().split("\n")).toHaveLength(lineCount);
+      expect(stderrArtifact.trimEnd().split("\n")).toHaveLength(lineCount);
+      expect(stdoutArtifact).toContain(stdoutTail);
+      expect(stderrArtifact).toContain(stderrTail);
 
       const replay = await runFx(["replay", tapePath, "--json"], {
         cwd: realpathSync(workspace),
@@ -1383,7 +1300,7 @@ test.skipIf(!tmuxAvailable())(
   "active command overflow marks Ctrl-O incomplete until terminal replay attaches",
   async () => {
     const timeout = 120_000;
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-output-active-overflow-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-command-output-active-overflow-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -1401,11 +1318,11 @@ test.skipIf(!tmuxAvailable())(
     const tailMarker = "ACTIVE_OVERFLOW_TAIL";
     const doneMarker = "ACTIVE_OVERFLOW_DONE";
     const futureMarker = "│ … full output available when command finishes";
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
     writeFileSync(
@@ -1431,19 +1348,22 @@ printf '${tailMarker}\\n'
     );
     const gateway = startFakeGateway([
       fakeGatewayFinalText(historicalRows.join("\n")),
-      fakeShellRun("active-overflow-command", "./active-overflow.sh"),
+      fakeGatewayToolCall("active-overflow-command", "terminal", {
+        action: "exec",
+        command: "./active-overflow.sh",
+      }),
       fakeGatewayFinalText(doneMarker),
     ]);
     let active: TmuxSession | null = null;
     let passed = false;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: {
           ...gatewayEnv(home, gateway),
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES:
+          FFX_TRACE_LOG: tracePath,
+          FFX_TRACE_SCOPES:
             "agent,core,tool,worker,render,transcript,command_output,transcript_retention,session",
         },
         stderrPath,
@@ -1468,16 +1388,16 @@ printf '${tailMarker}\\n'
       );
       const activeCompact = await active.waitForPane(
         (pane) =>
-          pane.includes("Running ./active-overflow.sh") &&
-          !pane.includes(stableMarker),
+          pane.includes(stableMarker) &&
+          /│ … \d+ (?:line|lines) more \(ctrl o to view\)/.test(pane),
         timeout,
       );
       const compactOutputRows = activeCompact.split("\n").filter((line) =>
         line.trimStart().startsWith("│ ") && !line.includes("ctrl o to view")
       );
-      expect(compactOutputRows).toHaveLength(0);
+      expect(compactOutputRows).toHaveLength(5);
       expect(activeCompact).not.toContain(tailMarker);
-      expect(activeCompact.match(/Running \.\/active-overflow\.sh/g)).toHaveLength(1);
+      expect(activeCompact.match(/● Running/g)).toHaveLength(1);
 
       await active.sendKeys("C-o");
       await active.waitForText(futureMarker, timeout);
@@ -1515,8 +1435,8 @@ printf '${tailMarker}\\n'
       await active.sendKeys("Escape");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running ./active-overflow.sh") &&
-          !pane.includes(stableMarker) &&
+          pane.includes(stableMarker) &&
+          pane.includes("lines more (ctrl o") &&
           !pane.includes(futureMarker),
         timeout,
       );
@@ -1529,23 +1449,24 @@ printf '${tailMarker}\\n'
       );
 
       const terminalCompact = await active.capturePane();
-      expect(terminalCompact).toContain("Ran ./active-overflow.sh");
-      expect(terminalCompact).not.toContain(stableMarker);
-      expect(terminalCompact).not.toContain("lines more (ctrl o");
+      expect(terminalCompact).toContain(stableMarker);
+      expect(terminalCompact).toContain("lines more (ctrl o");
       expect(terminalCompact).not.toContain(tailMarker);
       expect(terminalCompact).not.toContain(futureMarker);
       const sessionId = sessionIdFromHome(home);
-      const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const replayFiles = readdirSync(commandDir).filter((name) =>
-        name.endsWith(".bin")
+      const commandDir = join(home, ".ffx", "sessions", sessionId, "logs", "commands");
+      const combinedName = readdirSync(commandDir).find((name) =>
+        name.endsWith(".log") &&
+        !name.endsWith(".stdout.log") &&
+        !name.endsWith(".stderr.log")
       );
-      expect(replayFiles).toHaveLength(1);
-      const replayBytes = readFileSync(join(commandDir, replayFiles[0]!));
-      expect(replayBytes.byteLength).toBeGreaterThan(1024 * 1024);
-      expect(replayBytes.includes(Buffer.from(stableMarker))).toBe(true);
-      expect(replayBytes.includes(Buffer.from("ACTIVE_OPEN_059999"))).toBe(true);
-      expect(replayBytes.includes(Buffer.from(continuedMarker))).toBe(true);
-      expect(replayBytes.includes(Buffer.from(tailMarker))).toBe(true);
+      expect(combinedName).toBeDefined();
+      const artifact = readFileSync(join(commandDir, combinedName!), "utf8");
+      expect(Buffer.byteLength(artifact)).toBeGreaterThan(1024 * 1024);
+      expect(artifact).toContain(stableMarker);
+      expect(artifact).toContain("ACTIVE_OPEN_059999");
+      expect(artifact).toContain(continuedMarker);
+      expect(artifact).toContain(tailMarker);
 
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       passed = true;
@@ -1570,10 +1491,10 @@ printf '${tailMarker}\\n'
 );
 
 test.skipIf(!tmuxAvailable())(
-  "cancelled cap-crossing command keeps grouped rows stable and Ctrl-O opens its artifact",
+  "cancelled cap-crossing command keeps inline rows stable and Ctrl-O opens its complete artifact",
   async () => {
     const timeout = 60_000;
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancelled-command-cap-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-cancelled-command-cap-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -1589,11 +1510,11 @@ test.skipIf(!tmuxAvailable())(
     const nextMarker = "CANCEL_CAP_UNRELATED_TURN_DONE";
     const callId = "cancelled-cap-command";
     const readyPath = join(workspace, ".cancel-cap-ready");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
     writeFileSync(join(workspace, ".cancel-cap-row-prefix"), rowPrefix);
@@ -1630,21 +1551,21 @@ while :; do :; done
       );
     });
     const gateway = startFakeGateway([
-      fakeShellRun(callId, "./cancel-cap.sh"),
+      fakeGatewayToolCall(callId, "terminal", { action: "exec", command: "./cancel-cap.sh" }),
       () => nextResponse,
     ]);
     let active: TmuxSession | null = null;
     let passed = false;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: {
           ...gatewayEnv(home, gateway),
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES:
+          FFX_RECORD: tapePath,
+          FFX_RECORD_INPUT: "1",
+          FFX_TRACE_LOG: tracePath,
+          FFX_TRACE_SCOPES:
             "core,agent,tool,worker,interrupt,command_output,transcript,transcript_retention,render",
         },
         stderrPath,
@@ -1653,6 +1574,7 @@ while :; do :; done
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cancellable cap-crossing command.");
+      await waitForScrollback(active, expectedRows[4]!, timeout);
       await waitForCondition(
         () => existsSync(readyPath),
         "the cap-crossing command readiness file",
@@ -1667,6 +1589,7 @@ while :; do :; done
 
       await active.sendKeys("Escape");
       await waitForScrollback(active, "Cancelled", timeout);
+      await waitForScrollback(active, "│ … 619 lines more (ctrl o to view)", timeout);
       await waitForCondition(
         () => readFileSync(tracePath, "utf8").includes("event=interrupt_persisted"),
         "interrupted command finalization",
@@ -1679,31 +1602,47 @@ while :; do :; done
       writeFileSync(beforePath, before);
       writeFileSync(beforeAnsiPath, beforeAnsi);
       const beforePlain = stripAnsi(before);
-      for (const row of expectedRows) {
+      for (const row of expectedRows.slice(0, 5)) {
+        expect(countOccurrences(beforePlain, row)).toBe(1);
+      }
+      for (const row of expectedRows.slice(5)) {
         expect(countOccurrences(beforePlain, row)).toBe(0);
       }
-      expect(historicalLines(before)).toHaveLength(0);
+      expect(historicalLines(before).map(stripAnsi)).toEqual(
+        expectedRows.slice(0, 5).map((row) => expect.stringContaining(row)),
+      );
       expect(beforePlain).not.toContain(tailMarker);
 
       const sessionId = sessionIdFromHome(home);
-      const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const replayNames = readdirSync(commandDir).filter((name) =>
-        name.endsWith(".bin")
+      const commandDir = join(home, ".ffx", "sessions", sessionId, "logs", "commands");
+      const combinedName = readdirSync(commandDir).find((name) =>
+        name.endsWith(".log") &&
+        !name.endsWith(".stdout.log") &&
+        !name.endsWith(".stderr.log")
       );
-      expect(replayNames).toHaveLength(1);
-      const replayName = replayNames[0]!;
-      const replayPath = join(commandDir, replayName);
-      const replayBytes = readFileSync(replayPath);
-      expect(replayBytes.byteLength).toBeGreaterThan(1024 * 1024);
+      expect(combinedName).toBeDefined();
+      const combinedPath = join(commandDir, combinedName!);
+      const artifact = readFileSync(combinedPath, "utf8");
+      expect(Buffer.byteLength(artifact)).toBeGreaterThan(1024 * 1024);
+      expect(artifact).toContain(expectedRows[0]!);
+      expect(artifact).toContain(expectedRows.at(-1)!);
+      expect(artifact).toContain("CAP_FILL_0600_");
+      expect(artifact).toContain(tailMarker);
 
       await active.sendKeys("C-o");
-      await active.waitForText("┃ Full detail · ctrl o close", timeout);
+      await active.waitForText("┃ Review · ←/→ switch · ctrl o close", timeout);
+      expect(await active.capturePane()).not.toContain(tailMarker);
+      await active.sendKeys("Right");
+      await active.waitForText("┃ Full detail · ←/→ switch · ctrl o close", timeout);
+      await active.sendHexBytes(
+        Array.from({ length: 500 }, () => ["1b", "5b", "36", "7e"]).flat(),
+      );
       await active.waitForText(tailMarker, timeout);
       writeFileSync(ctrlOPath, await active.capturePane());
       await active.sendKeys("C-o");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Cancelled") &&
+          pane.includes("│ … 619 lines more (ctrl o to view)") &&
           !pane.includes(tailMarker),
         timeout,
       );
@@ -1730,7 +1669,6 @@ while :; do :; done
       const afterAnsi = await active.captureFullScrollbackEscapes();
       writeFileSync(afterPath, after);
       writeFileSync(afterAnsiPath, afterAnsi);
-      expect(after).toContain(nextMarker);
       expect(historicalLines(after)).toEqual(historicalLines(before));
       expect(historicalLines(afterAnsi)).toEqual(historicalLines(beforeAnsi));
       await waitForCondition(
@@ -1749,12 +1687,12 @@ while :; do :; done
       const calls = parts.filter((part) =>
         part.type === "tool-call" &&
         part.toolCallId === callId &&
-        part.toolName === "shell"
+        part.toolName === "terminal"
       );
       const results = parts.filter((part) =>
         part.type === "tool-result" &&
         part.toolCallId === callId &&
-        part.toolName === "shell"
+        part.toolName === "terminal"
       );
       expect(calls).toHaveLength(1);
       expect(results).toHaveLength(1);
@@ -1763,9 +1701,9 @@ while :; do :; done
       expect(gateway.requests[1]!.body).not.toContain(rowPrefix);
       expect(gateway.requests[1]!.body).not.toContain("CAP_FILL_0600_");
       expect(gateway.requests[1]!.body).not.toContain(tailMarker);
-      expect(gateway.requests[1]!.body).toContain(replayName);
-      expect(gateway.requests[1]!.body).not.toContain(replayPath);
-      expect(readFileSync(replayPath)).toEqual(replayBytes);
+      expect(gateway.requests[1]!.body).not.toContain(combinedName!);
+      expect(gateway.requests[1]!.body).not.toContain(combinedPath);
+      expect(readFileSync(combinedPath, "utf8")).toBe(artifact);
       expect(active.isPaneAlive()).toBe(true);
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -1779,7 +1717,9 @@ while :; do :; done
       });
       expect(replayFrames.code).toBe(0);
       expect(replayFrames.stderr).toBe("");
+      expect(replayFrames.stdout).toContain(expectedRows[0]!);
       expect(replayFrames.stdout).toContain(tailMarker);
+      expect(replayFrames.stdout).toContain(nextMarker);
       const replayJson = await runFx(["replay", tapePath, "--json"], {
         cwd: realpathSync(workspace),
         env: { HOME: home },
@@ -1790,10 +1730,11 @@ while :; do :; done
       expect(JSON.parse(replayJson.stdout).frame_count).toBeGreaterThan(0);
 
       const trace = readFileSync(tracePath, "utf8");
+      const artifactIndex = trace.indexOf("command output artifact created");
       const interruptIndex = trace.indexOf("event=interrupt_persisted");
       expect(trace).toContain("route=approved_shell");
-      expect(trace).toContain("command output retention cap reached");
-      expect(interruptIndex).toBeGreaterThanOrEqual(0);
+      expect(artifactIndex).toBeGreaterThanOrEqual(0);
+      expect(interruptIndex).toBeGreaterThan(artifactIndex);
       expect(trace).not.toContain("dropping buffered command output");
       expect(trace).not.toContain(
         "cancelled worker event dropped kind=command_output_complete",
@@ -1833,7 +1774,7 @@ test.skipIf(!tmuxAvailable())(
   "cancelled below-cap command exposes its TERM tail only through Ctrl-O",
   async () => {
     const timeout = 60_000;
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancelled-command-below-cap-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-cancelled-command-below-cap-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -1842,11 +1783,11 @@ test.skipIf(!tmuxAvailable())(
     const headMarker = "CANCEL_BELOW_CAP_HEAD";
     const tailMarker = "CANCEL_BELOW_CAP_TERM_TAIL_ONLY";
     const readyPath = join(workspace, ".cancel-below-ready");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
     writeFileSync(join(workspace, ".cancel-below-head"), headMarker);
@@ -1866,20 +1807,23 @@ while :; do :; done
     chmodSync(scriptPath, 0o755);
 
     const gateway = startFakeGateway([
-      fakeShellRun("cancelled-below-cap-command", "./cancel-below.sh"),
+      fakeGatewayToolCall("cancelled-below-cap-command", "terminal", {
+        action: "exec",
+        command: "./cancel-below.sh",
+      }),
     ]);
     let active: TmuxSession | null = null;
     let passed = false;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: {
           ...gatewayEnv(home, gateway),
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES:
+          FFX_RECORD: tapePath,
+          FFX_RECORD_INPUT: "1",
+          FFX_TRACE_LOG: tracePath,
+          FFX_TRACE_SCOPES:
             "core,agent,tool,worker,interrupt,command_output,transcript,render",
         },
         stderrPath,
@@ -1888,6 +1832,7 @@ while :; do :; done
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cancellable below-cap command.");
+      await waitForScrollback(active, headMarker, timeout);
       await waitForCondition(
         () => existsSync(readyPath),
         "the below-cap command readiness file",
@@ -1904,22 +1849,26 @@ while :; do :; done
 
       expect(gateway.requests).toHaveLength(1);
       const compact = await active.captureFullScrollback();
-      expect(countOccurrences(compact, headMarker)).toBe(0);
+      expect(countOccurrences(compact, headMarker)).toBe(1);
       expect(compact).not.toContain(tailMarker);
       const sessionId = sessionIdFromHome(home);
-      const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const replayFiles = readdirSync(commandDir).filter((name) =>
-        name.endsWith(".bin")
+      const commandDir = join(home, ".ffx", "sessions", sessionId, "logs", "commands");
+      const combinedName = readdirSync(commandDir).find((name) =>
+        name.endsWith(".log") &&
+        !name.endsWith(".stdout.log") &&
+        !name.endsWith(".stderr.log")
       );
-      expect(replayFiles).toHaveLength(1);
-      expect(statSync(join(commandDir, replayFiles[0]!)).size).toBeGreaterThan(0);
+      expect(combinedName).toBeDefined();
+      const artifact = readFileSync(join(commandDir, combinedName!), "utf8");
+      expect(Buffer.byteLength(artifact)).toBeLessThan(64 * 1024);
+      expect(artifact).toBe(`${headMarker}\n${tailMarker}\n`);
 
       await active.sendKeys("C-o");
       await active.waitForText(tailMarker, timeout);
       expect(await active.capturePane()).toContain(tailMarker);
       await active.sendKeys("Escape");
       await active.waitForPane(
-        (pane) => pane.includes("Cancelled") && !pane.includes(tailMarker),
+        (pane) => pane.includes(headMarker) && !pane.includes(tailMarker),
         timeout,
       );
       expect(await active.captureFullScrollback()).not.toContain(tailMarker);
@@ -1968,9 +1917,9 @@ while :; do :; done
 );
 
 test.skipIf(!tmuxAvailable())(
-  "grouped command status stays compact while Ctrl-O keeps detail",
+  "inline command output follows completed tool status and Ctrl-O keeps detail",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-output-status-order-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-command-output-status-order-")));
     const home = join(root, "home");
     const workspaceDir = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -1981,19 +1930,19 @@ test.skipIf(!tmuxAvailable())(
     const ctrlOScrollbackPath = join(root, "ctrl-o-scrollback.txt");
     const ctrlOAnsiPath = join(root, "ctrl-o-scrollback.ansi.txt");
     const replayJsonPath = join(root, "replay.json");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspaceDir);
     const workspace = realpathSync(workspaceDir);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
     const finalMarker = "ORDER_REPRO_DONE";
     const prompt =
       "Use the shell tool to run exactly pwd and no other commands. Then reply with the completion marker.";
-    const statusLine = "└ Ran pwd";
+    const statusLine = "● Ran pwd";
     const outputLine = workspace;
     const reviewOutputPrefix = workspace.slice(0, 56);
     const visibleLinearText = (text: string): string =>
@@ -2017,24 +1966,27 @@ test.skipIf(!tmuxAvailable())(
       expect(statusIndex).toBeGreaterThanOrEqual(0);
       expect(doneIndex).toBeGreaterThan(statusIndex);
       const transcriptRegion = scrollback.slice(statusIndex, doneIndex);
-      expect(countOccurrences(transcriptRegion, outputLine)).toBe(0);
+      expect(countOccurrences(transcriptRegion, outputLine)).toBe(1);
+      const outputIndex = scrollback.indexOf(outputLine, statusIndex);
+      expect(outputIndex).toBeGreaterThan(statusIndex);
+      expect(doneIndex).toBeGreaterThan(outputIndex);
     };
     const gateway = startFakeGateway([
-      fakeShellRun("order-repro-pwd", "pwd"),
+      fakeGatewayToolCall("order-repro-pwd", "terminal", { action: "exec", command: "pwd" }),
       fakeGatewayFinalText(finalMarker),
     ]);
     let active: TmuxSession | null = null;
     let passed = false;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspace,
         env: {
           ...gatewayEnv(home, gateway),
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,tool,render,transcript,gateway",
+          FFX_RECORD: tapePath,
+          FFX_RECORD_INPUT: "1",
+          FFX_TRACE_LOG: tracePath,
+          FFX_TRACE_SCOPES: "agent,tool,render,transcript,gateway",
         },
         stderrPath,
         width: 100,
@@ -2110,7 +2062,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "streamed document append preserves native scrollback without ONLCR",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-document-append-newlines-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-document-append-newlines-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -2134,7 +2086,7 @@ test.skipIf(!tmuxAvailable())(
         const gateway = startFakeGateway([
           () => streamedTextResponse(response),
         ]);
-        const launch = `${stty}; exec ${shellQuote(FX_BIN)}`;
+        const launch = `${stty}; exec ${shellQuote(FFX_BIN)}`;
         let active: TmuxSession | null = null;
         try {
           active = await TmuxSession.create({
@@ -2178,20 +2130,83 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "slow shell streaming keeps normal inline scrollback lossless",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-slow-command-output-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".ffx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
+    );
+    writeFileSync(stderrPath, "");
+
+    const marker = "SLOW_STREAM_DONE";
+    const command =
+      "zsh -lc 'for i in {001..080}; do print -r -- \"SLOW_STREAM $i\"; sleep 0.05; done'";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("slow-command-output", "terminal", { action: "exec", command }),
+      fakeGatewayFinalText(marker),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FFX_BIN,
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, gateway),
+        },
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Run the prepared streaming command.");
+      const scrollback = await waitForScrollback(active, marker);
+
+      const duplicateLines: string[] = [];
+      for (let i = 1; i <= 5; i += 1) {
+        const line = `│ SLOW_STREAM ${String(i).padStart(3, "0")}`;
+        const count = countOccurrences(scrollback, line);
+        if (count !== 1) duplicateLines.push(`${line}: ${count}`);
+      }
+      expect(duplicateLines).toEqual([]);
+      expect(scrollback).not.toContain("│ SLOW_STREAM 006");
+      expect(scrollback).not.toContain("│ SLOW_STREAM 080");
+      expect(scrollback).toContain("│ … 75 lines more (ctrl o to view)");
+      expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "Ctrl-C closes the Ctrl-O viewer without clearing the unsent draft",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-draft-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-draft-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
     const tapePath = join(root, "ctrl-o-draft.fxtape");
     const sentinel = "CTRL_O_DRAFT_SCROLLBACK_SENTINEL";
     const draft = "CTRL_O_UNSENT_DRAFT";
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(stderrPath, "");
 
-    const cmd = `zsh -lc 'for i in {1..14}; do printf "${sentinel}_%02d: pre-fx shell scrollback\\n" "$i"; done; exec ${FX_BIN}'`;
+    const cmd = `zsh -lc 'for i in {1..14}; do printf "${sentinel}_%02d: pre-Fx shell scrollback\\n" "$i"; done; exec ${FFX_BIN}'`;
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
@@ -2201,8 +2216,8 @@ test.skipIf(!tmuxAvailable())(
           HOME: home,
           AI_GATEWAY_API_KEY: undefined,
           VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_RECORD: tapePath,
+          FFX_AUTO_UPGRADE: "0",
+          FFX_RECORD: tapePath,
           NO_COLOR: "1",
         },
         stderrPath,
@@ -2212,7 +2227,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       const before = await active.captureFullScrollback();
       for (const index of [9, 10, 11]) {
-        expect(before).toContain(`${sentinel}_${index.toString().padStart(2, "0")}: pre-fx shell scrollback`);
+        expect(before).toContain(`${sentinel}_${index.toString().padStart(2, "0")}: pre-Fx shell scrollback`);
       }
 
       await active.sendLiteralText(draft);
@@ -2229,7 +2244,7 @@ test.skipIf(!tmuxAvailable())(
 
       const restored = await active.captureFullScrollback();
       for (const index of [9, 10, 11]) {
-        expect(restored).toContain(`${sentinel}_${index.toString().padStart(2, "0")}: pre-fx shell scrollback`);
+        expect(restored).toContain(`${sentinel}_${index.toString().padStart(2, "0")}: pre-Fx shell scrollback`);
       }
       expect(restored).toContain(`┃ ${draft}`);
       expect(restored).not.toContain("press ctrl+c again to exit");
@@ -2256,13 +2271,13 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "Cmd+R refuses session switching over a draft and opens after explicit clear",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-picker-draft-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-session-picker-draft-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
     const saved = "CMD_R_SAVED_SESSION";
     const draft = "CMD_R_UNSENT_DRAFT";
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(stderrPath, "");
 
@@ -2270,7 +2285,7 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -2324,18 +2339,18 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "Ctrl-O viewer preserves hidden composer input while Ctrl-X stays inert",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-input-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-input-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
     const firstDone = "CTRL_O_INPUT_FIRST_DONE";
     const followUpDone = "CTRL_O_INPUT_FOLLOW_UP_DONE";
     const fullViewDraft = "CTRL_O_FULL_VIEW_COMPOSER_DRAFT";
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2346,7 +2361,7 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -2367,7 +2382,7 @@ test.skipIf(!tmuxAvailable())(
       const fullView = await active.capturePane();
       expect(fullView).toContain(firstDone);
       expect(fullView).not.toContain(fullViewDraft);
-      expect(fullView).toContain("┃ Full detail · ctrl o close");
+      expect(fullView).toContain("┃ Review · ←/→ switch · ctrl o close");
       await active.sendKeys("Escape");
       await active.waitForText(fullViewDraft, TIMEOUT);
       await active.sendKeys("Enter");
@@ -2408,30 +2423,30 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "Ctrl-C leaves Ctrl-O before cancelling a streaming command",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-cancel-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-cancel-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
     const tapePath = join(root, "ctrl-o-cancel.fxtape");
     const streamMarker = "CTRL_O_CANCEL_STREAM";
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
     const command = `sh -c 'while :; do printf "${streamMarker}\\n"; sleep 0.1; done'`;
     const gateway = startFakeGateway([
-      fakeShellRun("ctrl-o-cancel-command", command),
+      fakeGatewayToolCall("ctrl-o-cancel-command", "terminal", { action: "exec", command }),
     ]);
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
-        env: { ...gatewayEnv(home, gateway), FX_RECORD: tapePath },
+        env: { ...gatewayEnv(home, gateway), FFX_RECORD: tapePath },
         stderrPath,
         width: 100,
         height: 32,
@@ -2441,7 +2456,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(streamMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
-      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+      await Bun.sleep(250);
       const enterAlternate = Buffer.from("\x1b[?1049h");
       const leaveAlternate = Buffer.from("\x1b[?1049l");
       const tapeBeforeCancel = readFileSync(tapePath);
@@ -2474,15 +2489,15 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "Ctrl-O keeps command output live while the alternate buffer is open",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-live-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-live-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2490,13 +2505,13 @@ test.skipIf(!tmuxAvailable())(
     const tailMarker = "CTRL_O_LIVE_TAIL";
     const command = "sh -c 'printf \"CTRL_O_LIVE_HEAD\\n\"; sleep 1; printf \"CTRL_O_LIVE_TAIL\\n\"'";
     const gateway = startFakeGateway([
-      fakeShellRun("ctrl-o-live-command", command),
+      fakeGatewayToolCall("ctrl-o-live-command", "terminal", { action: "exec", command }),
       fakeGatewayFinalText("CTRL_O_LIVE_DONE"),
     ]);
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -2505,7 +2520,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
-      await active.waitForText("Running sh -c", TIMEOUT);
+      await active.waitForText(firstMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText(tailMarker, TIMEOUT);
@@ -2535,20 +2550,20 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "streaming scroll stays inline while Ctrl-O preserves native selection and ignores horizontal arrows",
+  "streaming wheel input stays inline until Ctrl-O",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-stream-scroll-inline-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-stream-scroll-inline-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
     const tapePath = join(root, "stream-scroll.fxtape");
     const tracePath = join(root, "trace.log");
     const phaseTwoComplete = join(workspace, "phase-two.complete");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2556,20 +2571,20 @@ test.skipIf(!tmuxAvailable())(
     const doneMarker = "STREAM_SCROLL_INLINE_DONE";
     const command = `zsh -lc 'for i in {1..80}; do printf "${lineMarker} %03d\\n" "$i"; done; sleep 2; for i in {81..160}; do printf "${lineMarker} %03d\\n" "$i"; done; : > ${shellQuote(phaseTwoComplete)}'`;
     const gateway = startFakeGateway([
-      fakeShellRun("stream-scroll-handoff", command),
+      fakeGatewayToolCall("stream-scroll-handoff", "terminal", { action: "exec", command }),
       fakeGatewayFinalText(doneMarker),
     ]);
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: {
           ...gatewayEnv(home, gateway),
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "full_transcript,full_transcript_cache,input,scroll,frame_diff,frame_commit",
+          FFX_RECORD: tapePath,
+          FFX_RECORD_INPUT: "1",
+          FFX_TRACE_LOG: tracePath,
+          FFX_TRACE_SCOPES: "full_transcript,full_transcript_cache,input,scroll,frame_diff,frame_commit",
         },
         stderrPath,
         width: 100,
@@ -2579,8 +2594,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared streaming command.");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running zsh -lc") &&
-          !pane.includes(`${lineMarker} 001`),
+          pane.includes(`${lineMarker} 001`) &&
+          /│ … [1-9]\d* lines more \(ctrl o to view\)/.test(pane),
         TIMEOUT,
       );
       const scrollActions = [
@@ -2596,43 +2611,22 @@ test.skipIf(!tmuxAvailable())(
       await active.sendHexBytes(stressBytes);
       await Bun.sleep(250);
       const inlineAfterWheel = (await active.capturePaneGrid()).join("\n");
-      expect(inlineAfterWheel).not.toContain("Full detail · ctrl o close");
+      expect(inlineAfterWheel).not.toContain("Review · ←/→ switch · ctrl o close");
       expect(readFileSync(tapePath)).not.toContain(Buffer.from("\x1b[?1000h\x1b[?1006h"));
       expect(readFileSync(tracePath, "utf8")).not.toContain(
-        "depth_transition from=inline to=full",
+        "depth_transition from=inline to=review",
       );
 
       await active.sendKeys("C-o");
-      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
-      await active.sendKeys("Left");
-      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
-      await active.sendKeys("Right");
-      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
-      expect(readFileSync(tapePath)).not.toContain(Buffer.from("\x1b[?1000h\x1b[?1006h"));
-      const alternateScrollTraceStart = statSync(tracePath).size;
-      await active.sendHexBytes(["1b", "5b", "41"]);
-      await active.sendHexBytes(["1b", "5b", "42"]);
+      await active.waitForText("┃ Review · ←/→ switch · ctrl o close", TIMEOUT);
+      await active.sendHexBytes(["1b", "5b", "3c", "36", "34", "3b", "31", "3b", "31", "4d"]);
       await waitForCondition(
-        () => {
-          const appended = readFileSync(tracePath)
-            .subarray(alternateScrollTraceStart)
-            .toString("utf8");
-          return appended.includes("direction=up unit=wheel") &&
-            appended.includes("direction=down unit=wheel");
-        },
-        "viewer alternate-scroll trace",
-      );
-      await active.sendHexBytes(["1b", "5b", "35", "7e"]);
-      await waitForCondition(
-        () => readFileSync(tracePath, "utf8").includes("unit=page"),
-        "viewer page trace",
+        () => readFileSync(tracePath, "utf8").includes("unit=wheel rows=3"),
+        "viewer wheel trace",
       );
       const readingBefore = await active.capturePaneGrid();
-      expect(readingBefore.join("\n")).toContain("Full detail · ctrl o close");
-      expect(readingBefore.join("\n")).toMatch(
-        new RegExp(`│ ${lineMarker} \\d{3}`),
-      );
-      expect(readingBefore.join("\n")).not.toContain("ctrl o to view");
+      expect(readingBefore.join("\n")).toContain("Review · ←/→ switch · ctrl o close");
+      expect(readingBefore.join("\n")).toMatch(/\d+ more lines · → to expand/);
 
       await waitForCondition(() => existsSync(phaseTwoComplete), "second output phase");
       await waitForCondition(() => gateway.requests.length >= 2, "post-command gateway request");
@@ -2641,7 +2635,6 @@ test.skipIf(!tmuxAvailable())(
         if (/^└ (?:Running|Ran) /.test(row)) return "<command status>";
         if (/^│  \d+ output lines$/.test(row)) return "<output count>";
         if (/^│  \d+ more lines · → to expand$/.test(row)) return "<fold count>";
-        if (/^(?:auto · )?gpt-5$/.test(row)) return "<status line>";
         return row;
       });
       const normalizedBefore = normalizeLiveMetadata(readingBefore);
@@ -2649,23 +2642,20 @@ test.skipIf(!tmuxAvailable())(
       for (const [rowIndex, row] of normalizedBefore.entries()) {
         if (row !== "") expect(normalizedAfter[rowIndex]).toBe(row);
       }
-      const visibleOutputRows = readingBefore.filter((row) =>
-        row.includes(`│ ${lineMarker} `)
-      );
-      expect(visibleOutputRows.length).toBeGreaterThan(0);
-      for (const marker of visibleOutputRows.slice(0, 3)) {
+      for (const index of [1, 2, 3]) {
+        const marker = `│ ${lineMarker} ${String(index).padStart(3, "0")}`;
         expect(readingAfter.indexOf(marker)).toBe(readingBefore.indexOf(marker));
       }
 
       await active.sendKeys("Escape");
       await active.waitForPane(
-        (pane) => pane.includes(doneMarker) && !pane.includes("┃ Full detail · ctrl o close"),
+        (pane) => pane.includes(doneMarker) && !pane.includes("┃ Review · ←/→ switch · ctrl o close"),
         TIMEOUT,
       );
       const scrollback = await waitForScrollback(active, doneMarker);
-      expect(scrollback).not.toContain(`│ ${lineMarker} 001`);
-      expect(countOccurrences(scrollback, `│ ${lineMarker} 001`)).toBe(0);
-      expect(scrollback).not.toContain("lines more (ctrl o to view)");
+      expect(scrollback).toContain(`│ ${lineMarker} 001`);
+      expect(countOccurrences(scrollback, `│ ${lineMarker} 001`)).toBe(1);
+      expect(scrollback).toContain("│ … 155 lines more (ctrl o to view)");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await active.sendText("/quit");
@@ -2677,10 +2667,10 @@ test.skipIf(!tmuxAvailable())(
           .filter((frame) => frame.kind === 1)
           .map((frame) => frame.payload),
       ).toString("binary");
-      expect(countOccurrences(stdout, "\x1b[?1000h")).toBe(0);
-      expect(countOccurrences(stdout, "\x1b[?1006h")).toBe(0);
-      expect(countOccurrences(stdout, "\x1b[?1000l")).toBe(1);
-      expect(countOccurrences(stdout, "\x1b[?1006l")).toBe(1);
+      expect(countOccurrences(stdout, "\x1b[?1000h")).toBe(1);
+      expect(countOccurrences(stdout, "\x1b[?1006h")).toBe(1);
+      expect(countOccurrences(stdout, "\x1b[?1000l")).toBe(2);
+      expect(countOccurrences(stdout, "\x1b[?1006l")).toBe(2);
       expect(stdout).toContain("\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l");
       expect(countOccurrences(stdout, "\x1b[?1049h")).toBe(1);
       expect(countOccurrences(stdout, "\x1b[?1049l")).toBe(1);
@@ -2706,17 +2696,17 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "Ctrl-O navigation during shell streaming preserves grouped compact rows",
+  "Ctrl-O navigation during shell streaming preserves compact scrollback rows",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-navigation-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-navigation-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2724,16 +2714,16 @@ test.skipIf(!tmuxAvailable())(
     const commandMarker = "CTRL_O_NAV_REPEAT";
     const doneMarker = "CTRL_O_NAVIGATION_DONE";
     const gateway = startFakeGateway([
-      fakeShellRun(
-        "ctrl-o-navigation-command",
-        `zsh -lc 'for i in {1..100}; do printf "${commandMarker} %05d\\n" "$i"; done; sleep 2; for i in {101..${lineCount}}; do printf "${commandMarker} %05d\\n" "$i"; done'`,
-      ),
+      fakeGatewayToolCall("ctrl-o-navigation-command", "terminal", {
+        action: "exec",
+        command: `zsh -lc 'for i in {1..100}; do printf "${commandMarker} %05d\\n" "$i"; done; sleep 2; for i in {101..${lineCount}}; do printf "${commandMarker} %05d\\n" "$i"; done'`,
+      }),
       fakeGatewayFinalText(doneMarker),
     ]);
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -2744,8 +2734,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run the prepared streaming command.");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running zsh -lc") &&
-          !pane.includes(`${commandMarker} 00005`),
+          pane.includes(`${commandMarker} 00005`) &&
+          /│ … [1-9]\d* lines more \(ctrl o to view\)/.test(pane),
         TIMEOUT,
       );
 
@@ -2759,15 +2749,20 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Escape");
 
       const scrollback = await waitForScrollback(active, doneMarker);
+      const missingOrDuplicate: string[] = [];
       for (let index = 1; index <= 5; index += 1) {
         const line = `│ ${commandMarker} ${String(index).padStart(5, "0")}`;
-        expect(countOccurrences(scrollback, line)).toBe(0);
+        const count = countOccurrences(scrollback, line);
+        if (count !== 1) missingOrDuplicate.push(`${line}: ${count}`);
       }
+      expect(missingOrDuplicate).toEqual([]);
       expect(scrollback).not.toContain(`│ ${commandMarker} 00006`);
       expect(scrollback).not.toContain(
         `│ ${commandMarker} ${String(lineCount).padStart(5, "0")}`,
       );
-      expect(scrollback).not.toContain("lines more (ctrl o to view)");
+      expect(scrollback).toContain(
+        `│ … ${lineCount - 5} lines more (ctrl o to view)`,
+      );
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
     } finally {
       if (active) {
@@ -2786,16 +2781,16 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "an ask-user prompt takes over Ctrl-O and accepts its choice inline",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-question-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-question-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
     const tapePath = join(root, "ctrl-o-question.fxtape");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2803,10 +2798,10 @@ test.skipIf(!tmuxAvailable())(
     const questionMarker = "CTRL_O_QUESTION_PROMPT";
     const doneMarker = "CTRL_O_QUESTION_DONE";
     const gateway = startFakeGateway([
-      fakeShellRun(
-        "ctrl-o-question-command",
-        `sh -c 'printf "${commandMarker}\\n"; sleep 1'`,
-      ),
+      fakeGatewayToolCall("ctrl-o-question-command", "terminal", {
+        action: "exec",
+        command: `sh -c 'printf "${commandMarker}\\n"; sleep 1'`,
+      }),
       fakeGatewayToolCall("ctrl-o-question", "ask_user_question", {
         questions: [
           {
@@ -2823,9 +2818,9 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
-        env: { ...gatewayEnv(home, gateway), FX_RECORD: tapePath },
+        env: { ...gatewayEnv(home, gateway), FFX_RECORD: tapePath },
         stderrPath,
         width: 100,
         height: 32,
@@ -2866,15 +2861,15 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "Ctrl-O preserves inline block spacing while expanding tool detail",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-spacing-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-spacing-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -2885,15 +2880,8 @@ test.skipIf(!tmuxAvailable())(
     const gateway = startFakeGateway([
       fakeGatewaySerializedToolCall(
         "ctrl-o-spacing-command",
-        "shell",
-        JSON.stringify({
-          request: {
-            action: "run",
-            command,
-            yield_time_ms: 30_000,
-            timeout_ms: 600_000,
-          },
-        }),
+        "terminal",
+        JSON.stringify({ action: "exec", command }),
         beforeMarker,
       ),
       fakeGatewayFinalText(afterMarker),
@@ -2901,7 +2889,7 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -2924,42 +2912,32 @@ test.skipIf(!tmuxAvailable())(
           pane.includes(beforeMarker) &&
           pane.includes("1 tool call") &&
           pane.includes("Ran ") &&
+          pane.includes("1 output line") &&
           pane.includes(outputMarker) &&
           pane.includes(afterMarker),
         TIMEOUT,
       );
       const grid = fullTranscript.replace(/\n$/, "").split("\n");
       const before = grid.findIndex((line) => line.includes(beforeMarker));
-      const toolTimestamp = grid.findIndex(
-        (line, index) => index > before && line.includes("UTC · Tool"),
-      );
       const header = grid.findIndex((line) => line.includes("1 tool call"));
       const tool = grid.findIndex((line) => line.includes("Ran "));
+      const metadata = grid.findIndex((line) => line.includes("1 output line"));
       const output = grid.findIndex((line) => line.trimStart().startsWith(`│ ${outputMarker}`));
-      const afterTimestamp = grid.findIndex(
-        (line, index) => index > output && line.includes("UTC · Response"),
-      );
       const after = grid.findIndex((line) => line.includes(afterMarker));
       if (
-        before < 0 || toolTimestamp < 0 || header < 0 || tool < 0 ||
-        output < 0 || afterTimestamp < 0 || after < 0
+        before < 0 || header < 0 || tool < 0 ||
+        metadata < 0 || output < 0 || after < 0
       ) {
         throw new Error(`missing full transcript rows:\n${grid.join("\n")}`);
       }
       expect(fullTranscript).not.toContain(
         "Permissions: Auto agent approved this request",
       );
-      expect(grid[before + 1]).toBe("");
-      expect(toolTimestamp).toBe(before + 2);
-      expect(header).toBe(toolTimestamp + 1);
+      expect(header).toBe(before + 2);
       expect(tool).toBe(header + 1);
-      expect(grid[tool + 1]).toContain("action: run");
-      expect(grid[tool + 2]).toContain("yield_time_ms: 30000");
-      expect(grid[tool + 3]).toContain("timeout_ms: 600000");
-      expect(output).toBe(tool + 4);
-      expect(grid[output + 1]).toBe("");
-      expect(afterTimestamp).toBe(output + 2);
-      expect(after).toBe(afterTimestamp + 1);
+      expect(metadata).toBe(tool + 1);
+      expect(output).toBe(metadata + 1);
+      expect(after).toBe(output + 2);
 
       await active.sendKeys("Escape");
       await active.waitForComposer(TIMEOUT);
@@ -2989,15 +2967,15 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "Ctrl-O restores a long Markdown transcript without replaying it into scrollback",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-markdown-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-markdown-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -3016,7 +2994,7 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -3055,15 +3033,15 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "Ctrl-O renders read_file results as readable content",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-read-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-read-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(
       join(workspace, "README.md"),
@@ -3078,7 +3056,7 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -3091,13 +3069,14 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("C-o");
       await active.waitForText("READ_RESULT_MARKER", TIMEOUT);
-      const full = await active.capturePane();
-      expect(full).toContain("Full detail · ctrl o close · PgUp/PgDn scroll · Esc close");
-      expect(full).toContain("READ_RESULT_MARKER");
-      expect(full).not.toContain("<path>");
-      expect(full).not.toContain("<content>");
-      expect(full).not.toContain("\\x0a");
-      expect(full).not.toMatch(/^\s*input\s*$/m);
+      const review = await active.capturePane();
+      expect(review).toContain("Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close");
+      expect(review).toContain("1 line");
+      expect(review).toContain("READ_RESULT_MARKER");
+      expect(review).not.toContain("<path>");
+      expect(review).not.toContain("<content>");
+      expect(review).not.toContain("\\x0a");
+      expect(review).not.toMatch(/^\s*input\s*$/m);
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
     } finally {
       if (active) {
@@ -3116,15 +3095,15 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "Ctrl-O expands each parallel read-only tool detail",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-parallel-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-parallel-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(join(workspace, "README.md"), "READ_FULL_DETAIL_MARKER\n");
     writeFileSync(join(workspace, "LIST_FULL_DETAIL_MARKER"), "");
@@ -3132,7 +3111,7 @@ test.skipIf(!tmuxAvailable())(
 
     const gateway = startFakeGateway([
       fakeGatewaySse([
-        { type: "tool-call", toolCallId: "parallel-glob", toolName: "glob_files", input: { pattern: "*" } },
+        { type: "tool-call", toolCallId: "parallel-list", toolName: "list_files", input: { path: "." } },
         { type: "tool-call", toolCallId: "parallel-read", toolName: "read_file", input: { path: "README.md" } },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]),
@@ -3141,7 +3120,7 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -3156,7 +3135,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("LIST_FULL_DETAIL_MARKER", TIMEOUT);
       const firstDetail = await active.capturePane();
       expect(firstDetail).toContain("LIST_FULL_DETAIL_MARKER");
-      expect(firstDetail).toContain("Full detail · ctrl o close · PgUp/PgDn scroll · Esc close");
+      expect(firstDetail).toContain("Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close");
       expect(firstDetail).not.toMatch(/^\s*input\s*$/m);
 
       await active.waitForText("READ_FULL_DETAIL_MARKER", TIMEOUT);
@@ -3181,19 +3160,20 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "a file approval takes over Ctrl-O and resolves back to the inline transcript",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-approval-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-approval-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
     const tapePath = join(root, "ctrl-o-file-approval.fxtape");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
+      join(home, ".ffx", "settings.json"),
       JSON.stringify({
         sandbox: "none",
         permission_mode: "ask",
         permission: {},
+        maxxing_mode: "legacy",
       }),
     );
     writeFileSync(stderrPath, "");
@@ -3209,20 +3189,16 @@ test.skipIf(!tmuxAvailable())(
       () => "The denied write remains visible while this streamed assistant response advances the compact transcript window.",
     ).join(" ")} CTRL_O_HANDOFF_DONE`;
     const gateway = startFakeGateway([
-      fakeShellRun("ctrl-o-handoff-prior", priorCommand),
+      fakeGatewayToolCall("ctrl-o-handoff-prior", "terminal", { action: "exec", command: priorCommand }),
       fakeGatewayFinalText(priorSummary),
       fakeGatewaySse([
         {
           type: "tool-call",
           toolCallId: "ctrl-o-handoff-command",
-          toolName: "shell",
+          toolName: "terminal",
           input: {
-            request: {
-              action: "run",
-              command: "sh -c 'sleep 5; printf \"CTRL_O_HANDOFF_READY\\n\"'",
-              yield_time_ms: 30_000,
-              timeout_ms: 600_000,
-            },
+            action: "exec",
+            command: "sh -c 'sleep 5; printf \"CTRL_O_HANDOFF_READY\\n\"'",
           },
         },
         {
@@ -3242,9 +3218,9 @@ test.skipIf(!tmuxAvailable())(
     let passed = false;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
-        env: { ...gatewayEnv(home, gateway), FX_RECORD: tapePath },
+        env: { ...gatewayEnv(home, gateway), FFX_RECORD: tapePath },
         stderrPath,
         width: 100,
         height: 30,
@@ -3255,10 +3231,10 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const beforeHandoff = await waitForScrollback(active, priorSummary);
-      expect(beforeHandoff).not.toContain("lines more (ctrl o to view)");
+      expect(beforeHandoff).toContain("│ … 645 lines more (ctrl o to view)");
       expect(countOccurrences(beforeHandoff, priorSummary)).toBe(1);
       const compactOutputRows = beforeHandoff.match(/CTRL_O_FILE_FOLD_\d{4}/g) ?? [];
-      expect(compactOutputRows).toHaveLength(0);
+      expect(compactOutputRows).toHaveLength(5);
       expect(beforeHandoff).not.toContain("CTRL_O_FILE_FOLD_0006");
       expect(beforeHandoff).not.toContain("CTRL_O_FILE_FOLD_0650");
       for (const line of compactOutputRows) {
@@ -3279,12 +3255,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("3");
       await active.sendKeys("Enter");
       await active.waitForText("CTRL_O_HANDOFF_DONE", TIMEOUT);
-      const scrollback = await active.waitForStableScrollback(
-        (value) =>
-          value.includes("CTRL_O_HANDOFF_DONE") &&
-          countOccurrences(value, priorSummary) === 1,
-        TIMEOUT,
-      );
+      const scrollback = await active.captureFullScrollback();
       const inline = await active.capturePane();
       expect(inline).toContain("CTRL_O_HANDOFF_DONE");
       expect(inline).not.toContain("Apply this change?");
@@ -3320,32 +3291,32 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "a shell approval takes over Ctrl-O and accepts its choice inline",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-shell-approval-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-shell-approval-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
     const gateway = startFakeGateway([
       async () => {
         await Bun.sleep(300);
-        return fakeShellRun(
-          "ctrl-o-shell-approval",
-          "sh -c 'printf \"CTRL_O_SHELL_APPROVAL_RAN\\n\"'",
-        );
+        return fakeGatewayToolCall("ctrl-o-shell-approval", "terminal", {
+          action: "exec",
+          command: "sh -c 'printf \"CTRL_O_SHELL_APPROVAL_RAN\\n\"'",
+        });
       },
       fakeGatewayFinalText("CTRL_O_SHELL_APPROVAL_DONE"),
     ]);
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -3381,17 +3352,17 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "a shell approval handoff does not duplicate a long Ctrl-O transcript in scrollback",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-handoff-scrollback-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-handoff-scrollback-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
     const actionTimeout = 8_000;
     const transcriptTimeout = 90_000;
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -3458,27 +3429,19 @@ test.skipIf(!tmuxAvailable())(
         {
           type: "tool-call",
           toolCallId: "ctrl-o-handoff-first",
-          toolName: "shell",
+          toolName: "terminal",
           input: {
-            request: {
-              action: "run",
-              command: "sh -c 'touch ctrl-o-handoff-first; printf \"CTRL_O_HANDOFF_FIRST_RUNNING\\n\"; sleep 1; printf \"CTRL_O_HANDOFF_FIRST_DONE\\n\"'",
-              yield_time_ms: 30_000,
-              timeout_ms: 600_000,
-            },
+            action: "exec",
+            command: "sh -c 'touch ctrl-o-handoff-first; printf \"CTRL_O_HANDOFF_FIRST_RUNNING\\n\"; sleep 1; printf \"CTRL_O_HANDOFF_FIRST_DONE\\n\"'",
           },
         },
         {
           type: "tool-call",
           toolCallId: "ctrl-o-handoff-second",
-          toolName: "shell",
+          toolName: "terminal",
           input: {
-            request: {
-              action: "run",
-              command: "touch ctrl-o-handoff-second && printf 'CTRL_O_HANDOFF_SECOND_DONE\\n'",
-              yield_time_ms: 30_000,
-              timeout_ms: 600_000,
-            },
+            action: "exec",
+            command: "touch ctrl-o-handoff-second && printf 'CTRL_O_HANDOFF_SECOND_DONE\\n'",
           },
         },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
@@ -3488,7 +3451,7 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -3501,7 +3464,8 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("C-o");
       await Bun.sleep(150);
-      await active.waitForText("┃ Full detail · ctrl o close", actionTimeout);
+      await active.sendKeys("Right");
+      await active.waitForText("┃ Full detail · ←/→ switch · ctrl o close", actionTimeout);
       await active.sendHexBytes(
         Array.from({ length: 20 }, () => ["1b", "5b", "36", "7e"]).flat(),
       );
@@ -3553,7 +3517,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "Ctrl-O pressure preserves transcript and modal ownership under deterministic load",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-full-transcript-pressure-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-full-transcript-pressure-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -3562,11 +3526,11 @@ test.skipIf(!tmuxAvailable())(
     const scrollbackPath = join(root, "scrollback.txt");
     const ansiScrollbackPath = join(root, "scrollback.ansi.txt");
     const releasePath = join(workspace, ".ctrl-o-pressure-release");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
     writeFileSync(seedPath, "9767\n");
@@ -3626,21 +3590,17 @@ test.skipIf(!tmuxAvailable())(
       });
     };
     const gateway = startFakeGateway([
-      fakeShellRun("ctrl-o-pressure-setup", setupCommand),
+      fakeGatewayToolCall("ctrl-o-pressure-setup", "terminal", {
+        action: "exec",
+        command: setupCommand,
+      }),
       fakeGatewayFinalText(`${assistantHistory}\n${setupSentinel}`),
       fakeGatewaySse([
         {
           type: "tool-call",
           toolCallId: "ctrl-o-pressure-command",
-          toolName: "shell",
-          input: {
-            request: {
-              action: "run",
-              command: activeCommand,
-              yield_time_ms: 30_000,
-              timeout_ms: 600_000,
-            },
-          },
+          toolName: "terminal",
+          input: { action: "exec", command: activeCommand },
         },
         {
           type: "tool-call",
@@ -3665,19 +3625,23 @@ test.skipIf(!tmuxAvailable())(
     const pressureRows = (scrollback: string): string[] =>
       scrollback.split("\n").filter((line) =>
         line.includes("CTRL_O_PRESSURE_ASSISTANT_") ||
-        line.includes(setupSentinel)
+        line.includes(setupSentinel) ||
+        line.includes("CTRL_O_PRESSURE_SETUP_OUTPUT_") ||
+        line.includes(activeStart) ||
+        line.includes(streamPrefix) ||
+        line.includes(streamGate)
       ).map((line) => line.trimEnd());
 
     let active: TmuxSession | null = null;
     let passed = false;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: {
           ...gatewayEnv(home, gateway),
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
+          FFX_RECORD: tapePath,
+          FFX_RECORD_INPUT: "1",
         },
         stderrPath,
         width: 104,
@@ -3693,13 +3657,14 @@ test.skipIf(!tmuxAvailable())(
       const setupScrollback = await waitForScrollbackMarkers(active, [
         assistantHead,
         assistantTail,
+        setupCompactLine,
         setupSentinel,
       ]);
       expect(setupScrollback).toContain(assistantHead);
       expect(setupScrollback).toContain(assistantTail);
-      expect(setupScrollback).not.toContain(setupCompactLine);
+      expect(setupScrollback).toContain(setupCompactLine);
       expect(setupScrollback).not.toContain(setupFullLine);
-      expect(setupScrollback).not.toContain("lines more (ctrl o to view)");
+      expect(setupScrollback).toContain("│ … 67 lines more (ctrl o to view)");
 
       await active.sendText("Run the prepared streaming command and file review.");
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
@@ -3707,8 +3672,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Enter");
       await active.waitForPane(
         (pane) =>
-          pane.includes("Running sh -c") &&
-          !pane.includes(`${streamPrefix}004`),
+          pane.includes(`${streamPrefix}004`) &&
+          /│ … [1-9]\d* lines more \(ctrl o to view\)/.test(pane),
         TIMEOUT,
       );
       const compactRowsBeforeNavigation = pressureRows(await active.captureFullScrollback());
@@ -3718,7 +3683,8 @@ test.skipIf(!tmuxAvailable())(
         () => alternateDepthAt(tapeText()) === 1,
         "Ctrl-O to enter the alternate screen",
       );
-      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+      await active.sendKeys("Right");
+      await active.waitForText("┃ Full detail · ←/→ switch · ctrl o close", TIMEOUT);
       await active.sendHexBytes(["1b", "5b", "36", "7e"]);
       const tailViewport = await active.waitForText(streamGate, TIMEOUT);
       expect(tailViewport).toContain(streamGate);
@@ -3770,7 +3736,8 @@ test.skipIf(!tmuxAvailable())(
         () => alternateDepthAt(tapeText()) === 1,
         "the repeated Ctrl-O entry",
       );
-      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+      await active.sendKeys("Right");
+      await active.waitForText("┃ Full detail · ←/→ switch · ctrl o close", TIMEOUT);
       await active.sendKeys("C-o");
       await waitForCondition(
         () => alternateDepthAt(tapeText()) === 0,
@@ -3804,7 +3771,8 @@ test.skipIf(!tmuxAvailable())(
       );
       const afterFileRejection = await active.waitForPane(
         (pane) =>
-          pane.includes("Ran sh -c") &&
+          pane.includes(activeStart) &&
+          pane.includes("│ … 16 lines more (ctrl o to view)") &&
           !pane.includes("Apply this change?"),
         TIMEOUT,
       );
@@ -3833,23 +3801,23 @@ test.skipIf(!tmuxAvailable())(
       const finalPane = await active.capturePane();
       expect(finalScrollback).toContain(assistantHead);
       expect(finalScrollback).toContain(assistantTail);
-      expect(finalScrollback).not.toContain(setupCompactLine);
+      expect(finalScrollback).toContain(setupCompactLine);
       expect(finalScrollback).not.toContain(setupFullLine);
       expect(finalScrollback).toContain(`\n  1) ${questionMarker}`);
       expect(countOccurrences(finalScrollback, setupSentinel)).toBe(1);
       expect(countOccurrences(finalScrollback, finalSentinel)).toBe(1);
       for (let index = 1; index <= 4; index += 1) {
         const outputRow = `│ ${streamPrefix}${String(index).padStart(3, "0")}`;
-        expect(countOccurrences(finalScrollback, outputRow)).toBe(0);
+        expect(countOccurrences(finalScrollback, outputRow)).toBe(1);
       }
       for (let index = 5; index <= 18; index += 1) {
         const outputRow = `│ ${streamPrefix}${String(index).padStart(3, "0")}`;
         expect(countOccurrences(finalScrollback, outputRow)).toBe(0);
       }
-      expect(countOccurrences(finalScrollback, `│ ${activeStart}`)).toBe(0);
+      expect(countOccurrences(finalScrollback, `│ ${activeStart}`)).toBe(1);
       expect(countOccurrences(finalScrollback, `│ ${streamGate}`)).toBe(0);
       expect(countOccurrences(finalScrollback, `│ ${activeDone}`)).toBe(0);
-      expect(finalScrollback).not.toContain("lines more (ctrl o to view)");
+      expect(finalScrollback).toContain("│ … 16 lines more (ctrl o to view)");
       expect(finalPane).not.toContain("Apply this change?");
       expect(finalPane).not.toContain(questionAnswerInstruction);
       expect(finalPane).not.toContain(questionCancelInstruction);
@@ -3893,7 +3861,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("/quit");
       await waitForCondition(
         () => active?.paneStatus().dead === true,
-        "fx to exit after /quit",
+        "Fx to exit after /quit",
       );
       expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3944,7 +3912,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "contended startup resume stays non-interactive and recovers after release",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-contended-resume-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-contended-resume-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const ownerStderrPath = join(root, "owner-stderr.log");
@@ -3965,7 +3933,7 @@ test.skipIf(!tmuxAvailable())(
     try {
       writeFileSync(ownerStderrPath, "");
       owner = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, ownerGateway),
         stderrPath: ownerStderrPath,
@@ -3977,12 +3945,12 @@ test.skipIf(!tmuxAvailable())(
 
       writeFileSync(contenderStderrPath, "");
       contender = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume`,
+        cmd: `${FFX_BIN} --resume`,
         cwd: workspaceRoot,
         env: {
           ...gatewayEnv(home, ownerGateway),
-          FX_RECORD: contenderTapePath,
-          FX_RECORD_INPUT: "1",
+          FFX_RECORD: contenderTapePath,
+          FFX_RECORD_INPUT: "1",
         },
         stderrPath: contenderStderrPath,
         remainOnExit: true,
@@ -3996,7 +3964,7 @@ test.skipIf(!tmuxAvailable())(
 
       expect(paneExitMatches(contender.paneStatus(), 1)).toBe(true);
       expect(readFileSync(contenderStderrPath, "utf8")).toBe(
-        "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
+        "ffx: another Fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
       );
       expect(owner.isPaneAlive()).toBe(true);
       const contenderScrollback = await contender.captureFullScrollback();
@@ -4026,7 +3994,7 @@ test.skipIf(!tmuxAvailable())(
 
       writeFileSync(retryStderrPath, "");
       retry = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume`,
+        cmd: `${FFX_BIN} --resume`,
         cwd: workspaceRoot,
         env: gatewayEnv(home, retryGateway),
         stderrPath: retryStderrPath,
@@ -4042,7 +4010,7 @@ test.skipIf(!tmuxAvailable())(
       await retry.sendLiteralText("/");
       await retry.waitForPane(
         (pane) =>
-          pane.split("\n").some((row) => /^┃ \/\/$/.test(row)) &&
+          pane.split("\n").some((row) => /^(?:┃|❯) \/\/$/.test(row)) &&
           !pane.includes("show available slash commands"),
         TIMEOUT,
       );
@@ -4073,7 +4041,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "interactive resume shows session contention and retries the preserved selection",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-interactive-contention-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-interactive-contention-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const ownerStderrPath = join(root, "owner-stderr.log");
@@ -4091,7 +4059,7 @@ test.skipIf(!tmuxAvailable())(
     try {
       writeFileSync(ownerStderrPath, "");
       owner = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, ownerGateway),
         stderrPath: ownerStderrPath,
@@ -4104,7 +4072,7 @@ test.skipIf(!tmuxAvailable())(
 
       writeFileSync(contenderStderrPath, "");
       contender = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, contenderGateway),
         stderrPath: contenderStderrPath,
@@ -4119,7 +4087,7 @@ test.skipIf(!tmuxAvailable())(
       await contender.sendKeys("Enter");
       await contender.waitForPane(
         (pane) => stripAnsi(pane).includes(
-          "This session is open in another fx. Close it there, then press Enter to retry.",
+          "This session is open in another Fx. Close it there, then press Enter to retry.",
         ),
         1_000,
       );
@@ -4128,7 +4096,7 @@ test.skipIf(!tmuxAvailable())(
       const contendedPicker = stripAnsi(await contender.capturePane());
       expect(contendedPicker).toContain(savedTitle);
       expect(contendedPicker).toContain(
-        "This session is open in another fx. Close it there, then press Enter to retry.",
+        "This session is open in another Fx. Close it there, then press Enter to retry.",
       );
       expect(contendedPicker).not.toContain("SessionBusy");
       const contendedEntries = visibleSessionPickerEntries(
@@ -4171,19 +4139,19 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "context-withheld scoped tools remain explicitly not run after resume",
+  "context-deferred scoped tools remain deferred after resume",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-deferred-tools-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-resume-deferred-tools-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const nested = join(workspace, "nested");
     const liveStderrPath = join(root, "live-stderr.log");
     const resumeStderrPath = join(root, "resume-stderr.log");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(nested, { recursive: true });
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(join(workspace, "AGENTS.md"), "DEFERRED_TOOL_ROOT_SCOPE\n");
     writeFileSync(join(nested, "AGENTS.md"), "DEFERRED_TOOL_NESTED_SCOPE\n");
@@ -4204,19 +4172,11 @@ test.skipIf(!tmuxAvailable())(
           delta: JSON.stringify({ path: "nested/input.txt" }),
         },
         { type: "tool-input-end", id: "deferred-read" },
-        { type: "tool-input-start", id: "deferred-command", toolName: "shell" },
+        { type: "tool-input-start", id: "deferred-command", toolName: "terminal" },
         {
           type: "tool-input-delta",
           id: "deferred-command",
-          delta: JSON.stringify({
-            request: {
-              action: "run",
-              command,
-              cwd: "nested",
-              yield_time_ms: 30_000,
-              timeout_ms: 600_000,
-            },
-          }),
+          delta: JSON.stringify({ action: "exec", command, cwd: "nested" }),
         },
         { type: "tool-input-end", id: "deferred-command" },
         {
@@ -4228,16 +4188,8 @@ test.skipIf(!tmuxAvailable())(
         {
           type: "tool-call",
           toolCallId: "deferred-command",
-          toolName: "shell",
-          input: {
-            request: {
-              action: "run",
-              command,
-              cwd: "nested",
-              yield_time_ms: 30_000,
-              timeout_ms: 600_000,
-            },
-          },
+          toolName: "terminal",
+          input: { action: "exec", command, cwd: "nested" },
         },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]),
@@ -4251,29 +4203,14 @@ test.skipIf(!tmuxAvailable())(
         {
           type: "tool-call",
           toolCallId: "reissued-command",
-          toolName: "shell",
-          input: {
-            request: {
-              action: "run",
-              command,
-              cwd: "nested",
-              yield_time_ms: 30_000,
-              timeout_ms: 600_000,
-            },
-          },
+          toolName: "terminal",
+          input: { action: "exec", command, cwd: "nested" },
         },
         {
           type: "tool-call",
           toolCallId: "ordinary-failure",
-          toolName: "shell",
-          input: {
-            request: {
-              action: "run",
-              command: failureCommand,
-              yield_time_ms: 30_000,
-              timeout_ms: 600_000,
-            },
-          },
+          toolName: "terminal",
+          input: { action: "exec", command: failureCommand },
         },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]),
@@ -4283,26 +4220,20 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
 
     function expectDeferredPresentation(scrollback: string): void {
-      expect(scrollback).toContain("1 failed");
-      expect(scrollback).toContain("1 command not run");
-      expect(scrollback).not.toContain("1 deferred");
-      expect(scrollback).toContain(`Not run — project instructions changed: ${command}`);
+      expect(scrollback).toContain(`↻ Context updated ${command}`);
+      expect(countOccurrences(scrollback, "Context updated")).toBe(1);
       expect(scrollback).not.toContain("Not executed");
-      expect(scrollback).not.toContain("├ terminal");
-      expect(scrollback).not.toContain("└ terminal");
-      expect(scrollback).not.toContain("├ read_file");
-      expect(scrollback).not.toContain("└ read_file");
       expect(scrollback).not.toContain("● Failed nested/input.txt");
       expect(scrollback).not.toContain(`● Failed ${command}`);
-      expect(scrollback).toContain("Read nested/input.txt");
-      expect(scrollback).toContain(`Ran ${command}`);
-      expect(scrollback).toContain(`Exited 7 ${failureCommand}`);
-      expect(scrollback).not.toContain("│ exit code 7");
+      expect(scrollback).toContain("● Read nested/input.txt");
+      expect(scrollback).toContain(`● Ran ${command}`);
+      expect(scrollback).toContain(`● Ran ${failureCommand}`);
+      expect(scrollback).toContain("│ exit code 7");
     }
 
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, gateway),
         stderrPath: liveStderrPath,
@@ -4320,7 +4251,7 @@ test.skipIf(!tmuxAvailable())(
       );
       const liveScrollback = await active.captureFullScrollback();
       expectDeferredPresentation(liveScrollback);
-      expect(liveScrollback).not.toContain("│ ordinary-failure-control");
+      expect(liveScrollback).toContain("│ ordinary-failure-control");
       expect(readFileSync(liveStderrPath, "utf8")).toBe("");
 
       await active.sendText("/quit");
@@ -4329,7 +4260,7 @@ test.skipIf(!tmuxAvailable())(
       active = null;
 
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} resume last`,
+        cmd: `${FFX_BIN} resume last`,
         cwd: workspaceRoot,
         env: gatewayEnv(home, resumeGateway),
         stderrPath: resumeStderrPath,
@@ -4342,17 +4273,16 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("C-o");
       const detail = await active.waitForPane(
         (pane) =>
-          pane.includes(`Not run — project instructions changed: ${command}`) &&
+          pane.includes(`↻ Context updated ${command}`) &&
           pane.includes("ordinary-failure-control"),
         TIMEOUT,
       );
-      expect(countOccurrences(detail, "Not run — project instructions changed:")).toBe(1);
+      expect(countOccurrences(detail, "Context updated")).toBe(1);
       expect(detail).not.toContain("Not executed");
       expect(detail).not.toContain('{"path":"nested/input.txt"}');
       expect(detail).not.toContain(JSON.stringify({ command, cwd: "nested" }));
       expect(detail).toContain(failureCommand);
-      expect(detail).toContain("1 command not run");
-      expect(detail).not.toContain("1 deferred");
+      expect(detail).toContain("1 deferred");
       expect(detail).toContain("1 failed");
       expect(readFileSync(resumeStderrPath, "utf8")).toBe("");
 
@@ -4375,7 +4305,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "new and resumed sessions drop kill-ring and large-paste backing state",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-session-input-reset-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-session-input-reset-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -4412,7 +4342,7 @@ test.skipIf(!tmuxAvailable())(
 
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -4453,7 +4383,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "graceful exit prints an exact resume command",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-exit-handoff-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-exit-handoff-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const binDir = join(root, "bin");
@@ -4464,7 +4394,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(home);
     mkdirSync(workspace);
     mkdirSync(binDir);
-    symlinkSync(FX_BIN, join(binDir, "fx"));
+    symlinkSync(FFX_BIN, join(binDir, "ffx"));
     writeFileSync(stderrPath, "");
     writeFileSync(resumedStderrPath, "");
     const initialGateway = startFakeGateway([fakeGatewayFinalText(marker)]);
@@ -4475,13 +4405,13 @@ test.skipIf(!tmuxAvailable())(
 
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: {
           ...gatewayEnv(home, initialGateway),
           PATH: path,
-          FX_RECORD: tapePath,
-          FX_THEME: "dark",
+          FFX_RECORD: tapePath,
+          FFX_THEME: "dark",
         },
         stderrPath,
         width: 120,
@@ -4492,7 +4422,6 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Save this conversation for the exit handoff.");
       await active.waitForText(marker, TIMEOUT);
       const sessionId = sessionIdFromHome(home);
-      expect(sessionId).toMatch(/^[A-Za-z0-9_-]{12}$/);
 
       await active.sendText("/quit");
       await waitForCondition(
@@ -4502,7 +4431,7 @@ test.skipIf(!tmuxAvailable())(
       expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
       const scrollback = stripAnsi(await active.captureFullScrollback());
       const ansiScrollback = await active.captureFullScrollbackEscapes();
-      const expected = `Continue session with: fx --resume ${sessionId}`;
+      const expected = `Continue session with: ffx --resume ${sessionId}`;
       expect(scrollback).toContain(expected);
       expect(scrollback).not.toContain("To continue this session, run:");
       expect(ansiScrollback).toContain(`\x1b[38;5;245m${expected}\x1b[39m`);
@@ -4516,7 +4445,7 @@ test.skipIf(!tmuxAvailable())(
         .map((line) => line.trim())
         .find((line) => line === expected);
       const printedCommand = handoffLine?.slice("Continue session with: ".length);
-      expect(printedCommand).toBe(`fx --resume ${sessionId}`);
+      expect(printedCommand).toBe(`ffx --resume ${sessionId}`);
 
       await active.kill();
       active = await TmuxSession.create({
@@ -4555,81 +4484,10 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "rapid Ctrl-C during active-turn exit preserves the resume handoff",
-  async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-exit-sigint-race-")));
-    const home = join(root, "home");
-    const workspace = join(root, "workspace");
-    const stderrPath = join(root, "stderr.log");
-    const tracePath = join(root, "trace.log");
-    mkdirSync(home);
-    mkdirSync(workspace);
-    writeFileSync(stderrPath, "");
-    const hold: HoldState = { started: false, cancelled: false };
-    const initialGateway = startFakeGateway([() => heldGatewayResponse(hold)]);
-    let active: TmuxSession | null = null;
-    let passed = false;
-
-    try {
-      active = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: workspace,
-        env: {
-          ...gatewayEnv(home, initialGateway),
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "input,worker,gateway,session",
-        },
-        stderrPath,
-        width: 120,
-        height: 32,
-        remainOnExit: true,
-      });
-      await active.waitForComposer(TIMEOUT);
-      await active.sendText("Save and cancel this active session.");
-      await waitForCondition(() => hold.started, "held gateway response");
-      const sessionId = sessionIdFromHome(home);
-
-      active.sendKeysImmediate(["C-c"]);
-      await waitForCondition(
-        () =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes(
-            "cancel requested processing=true",
-          ),
-        "active-turn Ctrl-C cancellation",
-      );
-      active.sendKeysImmediate(["C-c"]);
-      active.sendKeysImmediate(["C-c"]);
-
-      await waitForCondition(
-        () => active?.paneStatus().dead === true,
-        "the rapid Ctrl-C exit pane to stop",
-      );
-      const scrollback = stripAnsi(await active.captureFullScrollback());
-      const expected = `Continue session with: fx --resume ${sessionId}`;
-      expect(countOccurrences(scrollback, expected)).toBe(1);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      await active.kill();
-      active = null;
-      passed = true;
-    } finally {
-      if (active) await active.kill();
-      initialGateway.stop();
-      if (passed) {
-        rmSync(root, { recursive: true, force: true });
-      } else {
-        console.error(`retained rapid exit artifacts at ${root}`);
-      }
-    }
-  },
-  TIMEOUT * 2,
-);
-
-test.skipIf(!tmuxAvailable())(
   "closing the startup resume picker starts a writable fresh session",
   async () => {
     const root = realpathSync(
-      mkdtempSync(join(tmpdir(), "fx-tui-resume-picker-cancel-")),
+      mkdtempSync(join(tmpdir(), "ffx-tui-resume-picker-cancel-")),
     );
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -4644,7 +4502,7 @@ test.skipIf(!tmuxAvailable())(
     try {
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} -r`,
+        cmd: `${FFX_BIN} -r`,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -4686,7 +4544,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "interactive resume aliases restore history and return to a live composer",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-resume-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -4704,7 +4562,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(initialGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, initialGateway),
         stderrPath,
@@ -4723,7 +4581,7 @@ test.skipIf(!tmuxAvailable())(
       const sessionId = sessionIdFromHome(home);
       const resumeViewPath = join(
         home,
-        ".fx",
+        ".ffx",
         "sessions",
         sessionId,
         "resume-view.bin",
@@ -4735,7 +4593,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(pickerGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} -r`,
+        cmd: `${FFX_BIN} -r`,
         cwd: workspaceRoot,
         env: gatewayEnv(home, pickerGateway),
         stderrPath,
@@ -4777,13 +4635,13 @@ test.skipIf(!tmuxAvailable())(
         gateways.push(gateway);
         writeFileSync(stderrPath, "");
         active = await TmuxSession.create({
-          cmd: `${FX_BIN} ${args.join(" ")}`,
+          cmd: `${FFX_BIN} ${args.join(" ")}`,
           cwd: workspaceRoot,
           env: {
             ...gatewayEnv(home, gateway),
-            FX_RECORD: tapePath,
-            FX_TRACE_LOG: tracePath,
-            FX_TRACE_SCOPES: "session",
+            FFX_RECORD: tapePath,
+            FFX_TRACE_LOG: tracePath,
+            FFX_TRACE_SCOPES: "session",
           },
           stderrPath,
           width: args[0] === `--resume-${sessionId}` ? 42 : 100,
@@ -4875,9 +4733,9 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(markdownGateway);
       writeFileSync(markdownStderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(markdownWorkspace),
-        env: { ...gatewayEnv(markdownHome, markdownGateway), FX_RECORD: markdownTapePath },
+        env: { ...gatewayEnv(markdownHome, markdownGateway), FFX_RECORD: markdownTapePath },
         stderrPath: markdownStderrPath,
         width: 72,
         height: 32,
@@ -4919,9 +4777,9 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(resumedMarkdownGateway);
       writeFileSync(markdownStderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FFX_BIN} --resume-last`,
         cwd: realpathSync(markdownWorkspace),
-        env: { ...gatewayEnv(markdownHome, resumedMarkdownGateway), FX_RECORD: resumedMarkdownTapePath },
+        env: { ...gatewayEnv(markdownHome, resumedMarkdownGateway), FFX_RECORD: resumedMarkdownTapePath },
         stderrPath: markdownStderrPath,
         width: 42,
         height: 32,
@@ -4964,22 +4822,22 @@ test.skipIf(!tmuxAvailable())(
       const toolWorkspace = join(root, "tool-workspace");
       const toolStderrPath = join(root, "tool-stderr.log");
       const toolWorkspaceMarker = "tool-workspace";
-      mkdirSync(join(toolHome, ".fx"), { recursive: true });
+      mkdirSync(join(toolHome, ".ffx"), { recursive: true });
       mkdirSync(toolWorkspace);
       writeFileSync(
-        join(toolHome, ".fx", "settings.json"),
-        JSON.stringify({}),
+        join(toolHome, ".ffx", "settings.json"),
+        JSON.stringify({ maxxing_mode: "legacy" }),
       );
       const toolWorkspaceRoot = realpathSync(toolWorkspace);
       const toolReply = "TOOL_RESUME_FINAL_REPLY";
       const toolGateway = startFakeGateway([
-        fakeShellRun("resume_pwd", "pwd"),
+        fakeGatewayToolCall("resume_pwd", "terminal", { action: "exec", command: "pwd" }),
         fakeGatewayFinalText(toolReply),
       ]);
       gateways.push(toolGateway);
       writeFileSync(toolStderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: toolWorkspaceRoot,
         env: gatewayEnv(toolHome, toolGateway),
         stderrPath: toolStderrPath,
@@ -4990,7 +4848,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run pwd once for resume.");
       const liveToolScrollback = await waitForScrollback(active, toolReply);
       expect(liveToolScrollback).toContain("Ran pwd");
-      expect(liveToolScrollback).not.toContain(toolWorkspaceMarker);
+      expect(liveToolScrollback).toContain(toolWorkspaceMarker);
       expectNoRawToolReplay(liveToolScrollback);
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -5010,7 +4868,7 @@ test.skipIf(!tmuxAvailable())(
         gateways.push(gateway);
         writeFileSync(toolStderrPath, "");
         active = await TmuxSession.create({
-          cmd: `${FX_BIN} ${args.join(" ")}`,
+          cmd: `${FFX_BIN} ${args.join(" ")}`,
           cwd: toolWorkspaceRoot,
           env: gatewayEnv(toolHome, gateway),
           stderrPath: toolStderrPath,
@@ -5020,12 +4878,13 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForComposer(TIMEOUT);
         const resumedToolScrollback = await waitForScrollback(active, toolReply);
         expect(resumedToolScrollback).toContain("Ran pwd");
-        expect(resumedToolScrollback).not.toContain(toolWorkspaceMarker);
+        expect(resumedToolScrollback).toContain(toolWorkspaceMarker);
         expect(resumedToolScrollback).toContain(toolReply);
         expectNoRawToolReplay(resumedToolScrollback);
         if (index === 0) {
           await active.sendKeys("C-o");
-          await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+          await active.sendKeys("Right");
+          await active.waitForText("┃ Full detail · ←/→ switch · ctrl o close", TIMEOUT);
           await active.waitForText(toolWorkspaceMarker, TIMEOUT);
           const full = await active.capturePane();
           expect(full).toContain("Ran pwd");
@@ -5051,55 +4910,10 @@ test.skipIf(!tmuxAvailable())(
   TIMEOUT * 5,
 );
 
-test("manual upgrade output links stable notes and dev changes", async () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-upgrade-links-")));
-  const argvLogPath = join(root, "upgrade-argv.log");
-  const installedFx = join(root, "fx");
-  const home = join(root, "home");
-  mkdirSync(home);
-  const currentRevision = (await runFx(["status", "--json"], {
-    env: { AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined },
-  })).stdout;
-  const revision = "abcdef0123456789abcdef0123456789abcdef01";
-  const release = startUpgradeServer(root, argvLogPath, { revision });
-  copyFileSync(FX_BIN, installedFx);
-  chmodSync(installedFx, 0o755);
-
-  try {
-    const stable = Bun.spawn([installedFx, "upgrade", "--channel", "stable"], {
-      env: { ...process.env, HOME: home, FX_E2E_UPGRADE_BASE_URL: release.baseUrl },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const stableExitCode = await stable.exited;
-    expect(stableExitCode).toBe(0);
-    expect(await new Response(stable.stdout).text()).toContain(
-      "notes: https://fx.sh/changelog#v9.9.9",
-    );
-
-    copyFileSync(FX_BIN, installedFx);
-    chmodSync(installedFx, 0o755);
-    const dev = Bun.spawn([installedFx, "upgrade", "--channel", "dev"], {
-      env: { ...process.env, HOME: home, FX_E2E_UPGRADE_BASE_URL: release.baseUrl },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const devExitCode = await dev.exited;
-    expect(devExitCode).toBe(0);
-    const buildRevision = JSON.parse(currentRevision).build_revision;
-    expect(await new Response(dev.stdout).text()).toContain(
-      `changes: https://github.com/vercel-labs/fx/compare/${buildRevision}...${revision}`,
-    );
-  } finally {
-    release.stop();
-    rmSync(root, { recursive: true, force: true });
-  }
-}, UPGRADE_TIMEOUT);
-
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g reloads the background-installed binary and resumes",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-upgrade-ctrl-g-")));
     const home = join(root, "home");
     const freshHome = join(root, "fresh-home");
     const workspace = join(root, "workspace");
@@ -5112,8 +4926,8 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     mkdirSync(installDir);
     const workspaceRoot = realpathSync(workspace);
-    const installedFx = join(installDir, "fx");
-    copyFileSync(FX_BIN, installedFx);
+    const installedFx = join(installDir, "ffx");
+    copyFileSync(FFX_BIN, installedFx);
     chmodSync(installedFx, 0o755);
 
     let active: TmuxSession | null = null;
@@ -5132,8 +4946,8 @@ test.skipIf(!tmuxAvailable())(
         cwd: workspaceRoot,
         env: {
           ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_E2E_UPGRADE_BASE_URL: release.baseUrl,
+          FFX_AUTO_UPGRADE: "1",
+          FFX_E2E_UPGRADE_BASE_URL: release.baseUrl,
         },
         stderrPath,
         width: 110,
@@ -5146,7 +4960,7 @@ test.skipIf(!tmuxAvailable())(
       const sessionId = sessionIdFromHome(home);
 
       await active.waitForText(
-        "update ready: ctrl+g to reload",
+        "Update installed: ctrl+g to reload",
         UPGRADE_TIMEOUT,
       );
       expect(readFileSync(installedFx, "utf8")).toContain(argvLogPath);
@@ -5163,7 +4977,7 @@ test.skipIf(!tmuxAvailable())(
       expect(readFileSync(argvLogPath, "utf8").trim().split("\n")).toEqual([
         installedFx,
       ]);
-      expect(await fresh.capturePane()).not.toContain("update ready: ctrl+g to reload");
+      expect(await fresh.capturePane()).not.toContain("Update installed: ctrl+g to reload");
       await fresh.sendText("/quit");
       expect(await fresh.waitForSessionEnd()).toBe(true);
       await fresh.kill();
@@ -5172,16 +4986,11 @@ test.skipIf(!tmuxAvailable())(
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      const updatedNotice = `● fx has been updated to v${version} (notes)`;
+      const updatedNotice = `● 𝒇x has been updated to v${version}`;
       await active.waitForText(updatedNotice, TIMEOUT);
       const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
-      const noticeEscapes = await active.capturePaneEscapes();
-      expect(noticeEscapes).toContain(
-        `(\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\notes\x1b[0m`,
-      );
-      expect(noticeEscapes).toContain("\x1b]8;;\x1b\\)");
       expect(resumed).not.toContain("● Session resumed:");
       expect(resumed).not.toContain("● Session: resumed:");
 
@@ -5221,7 +5030,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g repairs an exact corrupt boundary and resumes",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-corrupt-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-upgrade-corrupt-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const installDir = join(root, "install");
@@ -5231,8 +5040,8 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     mkdirSync(installDir);
     const workspaceRoot = realpathSync(workspace);
-    const installedFx = join(installDir, "fx");
-    copyFileSync(FX_BIN, installedFx);
+    const installedFx = join(installDir, "ffx");
+    copyFileSync(FFX_BIN, installedFx);
     chmodSync(installedFx, 0o755);
 
     let active: TmuxSession | null = null;
@@ -5249,8 +5058,8 @@ test.skipIf(!tmuxAvailable())(
         cwd: workspaceRoot,
         env: {
           ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_E2E_UPGRADE_BASE_URL: release.baseUrl,
+          FFX_AUTO_UPGRADE: "1",
+          FFX_E2E_UPGRADE_BASE_URL: release.baseUrl,
         },
         stderrPath,
         width: 110,
@@ -5263,11 +5072,11 @@ test.skipIf(!tmuxAvailable())(
       await waitForCommittedSessionMarker(home, "UPGRADE_CORRUPT_INITIAL_DONE");
       const sessionId = sessionIdFromHome(home);
       await active.waitForText(
-        "update ready: ctrl+g to reload",
+        "Update installed: ctrl+g to reload",
         UPGRADE_TIMEOUT,
       );
 
-      const sessionDir = join(home, ".fx", "sessions", sessionId);
+      const sessionDir = join(home, ".ffx", "sessions", sessionId);
       const watermarkName = readdirSync(sessionDir).find(
         (name) => name.startsWith("commit.") && name.endsWith(".json"),
       )!;
@@ -5275,10 +5084,7 @@ test.skipIf(!tmuxAvailable())(
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      await active.waitForText(
-        `● fx has been updated to v${version} (notes)`,
-        TIMEOUT,
-      );
+      await active.waitForText(`● 𝒇x has been updated to v${version}`, TIMEOUT);
       const resumed = await waitForScrollback(
         active,
         "UPGRADE_CORRUPT_INITIAL_DONE",
@@ -5310,7 +5116,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "answered question cards survive flag and picker resume",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-question-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-resume-question-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -5362,7 +5168,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(initialGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, initialGateway),
         stderrPath,
@@ -5385,7 +5191,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(flagGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FFX_BIN} --resume-last`,
         cwd: workspaceRoot,
         env: gatewayEnv(home, flagGateway),
         stderrPath,
@@ -5408,7 +5214,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(pickerGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, pickerGateway),
         stderrPath,
@@ -5442,7 +5248,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "recorded file diffs survive resume and retain their Ctrl-O detail",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-file-diff-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-resume-file-diff-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -5458,11 +5264,11 @@ test.skipIf(!tmuxAvailable())(
     );
     const firstCompletion = "RESUMED_FIRST_FILE_COMPLETE";
     const secondCompletion = "RESUMED_SECOND_FILE_COMPLETE";
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(stderrPath, "");
 
@@ -5482,9 +5288,9 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
-        env: { ...gatewayEnv(home, initialGateway), FX_RECORD: initialTapePath },
+        env: { ...gatewayEnv(home, initialGateway), FFX_RECORD: initialTapePath },
         stderrPath,
         width: 120,
         height: 32,
@@ -5495,8 +5301,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const firstLive = await waitForScrollback(active, firstCompletion);
-      expect(firstLive).toContain("Wrote first-large.md +120");
-      expect(firstLive).not.toContain("RESUMED_FIRST_FILE_LINE_001");
+      expect(firstLive).toContain("Wrote first-large.md");
+      expect(firstLive).toContain("⋯ +");
       expect(readFileSync(join(workspace, "first-large.md"), "utf8")).toBe(
         `${firstLines.join("\n")}\n`,
       );
@@ -5506,9 +5312,9 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const live = await waitForScrollback(active, secondCompletion);
-      expect(live).toContain("Wrote first-large.md +120");
-      expect(live).toContain("Wrote second-large.md +60");
-      expect(live).not.toContain("RESUMED_SECOND_FILE_LINE_001");
+      expect(live).toContain("Wrote first-large.md");
+      expect(live).toContain("Wrote second-large.md");
+      expect(live).toContain("⋯ +");
       expect(readFileSync(join(workspace, "second-large.md"), "utf8")).toBe(
         `${secondLines.join("\n")}\n`,
       );
@@ -5521,28 +5327,39 @@ test.skipIf(!tmuxAvailable())(
 
       const sessionId = sessionIdFromHome(home);
       const eventsJsonl = readFileSync(
-        join(home, ".fx", "sessions", sessionId, "events.jsonl"),
+        join(home, ".ffx", "sessions", sessionId, "events.jsonl"),
         "utf8",
       );
       expect(eventsJsonl).toContain("committed_file_presentation");
       expect(eventsJsonl).not.toContain("sk-abcdefghijklmnop");
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-${sessionId}`,
+        cmd: `${FFX_BIN} --resume-${sessionId}`,
         cwd: realpathSync(workspace),
-        env: { ...gatewayEnv(home, resumedGateway), FX_RECORD: resumedTapePath },
+        env: { ...gatewayEnv(home, resumedGateway), FFX_RECORD: resumedTapePath },
         stderrPath,
         width: 120,
         height: 32,
       });
       await active.waitForComposer(TIMEOUT);
       const resumed = await waitForScrollback(active, secondCompletion);
-      expect(resumed).toContain("Wrote first-large.md +120");
-      expect(resumed).toContain("Wrote second-large.md +60");
-      expect(resumed).not.toContain("RESUMED_SECOND_FILE_LINE_001");
+      expect(resumed).toContain("Wrote first-large.md");
+      expect(resumed).toContain("Wrote second-large.md");
+      expect(resumed).toContain("⋯ +");
 
       await active.sendKeys("C-o");
-      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+      await active.waitForText("┃ Review · ←/→ switch · ctrl o close", TIMEOUT);
+      const review = await active.capturePane();
+      expect(review).toContain("RESUMED_SECOND_FILE_LINE_001");
+      expect(review).toContain("RESUMED_SECOND_FILE_LINE_003");
+      expect(review).not.toContain("RESUMED_SECOND_FILE_LINE_004");
+      expect(review).not.toContain("RESUMED_SECOND_FILE_LINE_060");
+      expect(review).toContain("57 more lines · → to expand");
+      expect(review).toMatch(/^  │  57 more lines · → to expand/m);
+      expect(review).not.toMatch(/^│  57 more lines · → to expand/m);
+      expect(review).not.toMatch(/^\s*│?\s*60 lines\s*$/m);
+      await active.sendKeys("Right");
+      await active.waitForText("┃ Full detail · ←/→ switch · ctrl o close", TIMEOUT);
       await active.sendHexBytes(
         Array.from({ length: 10 }, () => ["1b", "5b", "36", "7e"]).flat(),
       );
@@ -5559,7 +5376,7 @@ test.skipIf(!tmuxAvailable())(
       expect(firstFull).not.toContain('"content":"RESUMED_FIRST_FILE_LINE');
 
       await active.sendKeys("C-o");
-      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("⋯ +", TIMEOUT);
 
       await active.sendText("/undo");
       await active.waitForText("Nothing to undo.", TIMEOUT);
@@ -5596,17 +5413,17 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "command output folding survives flag and picker resume",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-command-output-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-resume-command-output-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
     mkdirSync(home);
     mkdirSync(workspace);
     const workspaceRoot = realpathSync(workspace);
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {}, maxxing_mode: "legacy" }),
     );
     const lineCount = 40;
     const commandLine = "x".repeat(40);
@@ -5640,20 +5457,26 @@ printf '${stdoutTail2}\\n'
     for (const marker of orderedTailMarkers) expect(fixtureCommand).not.toContain(marker);
     const firstMarker = "RESUME_COMMAND_LINE_000";
     const completion = "RESUME_COMMAND_OUTPUT_COMPLETE";
+    const compactHint = "lines more (ctrl o to view)";
     const gateways: Array<ReturnType<typeof startFakeGateway>> = [];
     let active: TmuxSession | null = null;
 
     function expectCompactCommandOutput(pane: string): void {
-      expect(pane).toContain("● 1 tool call · 1 command");
-      expect(pane).toContain("Ran ./resume-command-output.sh");
-      expect(pane).not.toContain("lines more (ctrl o to view)");
-      expect(pane).not.toContain(firstMarker);
+      const lines = pane.split("\n");
+      const hintIndex = lines.findIndex((line) => line.includes(compactHint));
+      expect(hintIndex).toBeGreaterThanOrEqual(5);
+      const payloadRows = lines.slice(hintIndex - 5, hintIndex);
+      expect(payloadRows).toHaveLength(5);
+      for (const row of payloadRows) expect(row.trimStart().startsWith("│ ")).toBe(true);
+      expect(pane).toContain(firstMarker);
       expect(pane).not.toContain("RESUME_COMMAND_TAIL");
     }
 
     async function expectRestoredViewerOutput(session: TmuxSession): Promise<void> {
       await session.sendKeys("C-o");
-      await session.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+      await session.waitForText("┃ Review · ←/→ switch · ctrl o close", TIMEOUT);
+      await session.sendKeys("Right");
+      await session.waitForText("┃ Full detail · ←/→ switch · ctrl o close", TIMEOUT);
       const tail = await session.capturePane();
       expect(tail).toContain(stdoutTail2);
       expect(tail).not.toContain(firstMarker);
@@ -5694,15 +5517,15 @@ printf '${stdoutTail2}\\n'
 
     try {
       const initialGateway = startFakeGateway([
-        fakeShellRun("resume_long_command", fixtureCommand),
+        fakeGatewayToolCall("resume_long_command", "terminal", { action: "exec", command: fixtureCommand }),
         fakeGatewayFinalText(completion),
       ]);
       gateways.push(initialGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
-        env: { ...gatewayEnv(home, initialGateway), FX_PERMISSION_MODE: "ask" },
+        env: { ...gatewayEnv(home, initialGateway), FFX_PERMISSION_MODE: "ask" },
         stderrPath,
         width: 100,
         height: 32,
@@ -5712,7 +5535,7 @@ printf '${stdoutTail2}\\n'
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
       await active.sendKeys("Enter");
       await active.waitForText(completion, TIMEOUT);
-      await active.waitForPane((pane) => pane.includes("Ran ./resume-command-output.sh"), TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(compactHint), TIMEOUT);
       const live = await active.capturePane();
       expectCompactCommandOutput(live);
       await active.sendText("/quit");
@@ -5725,7 +5548,7 @@ printf '${stdoutTail2}\\n'
       gateways.push(flagGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FFX_BIN} --resume-last`,
         cwd: workspaceRoot,
         env: gatewayEnv(home, flagGateway),
         stderrPath,
@@ -5733,7 +5556,7 @@ printf '${stdoutTail2}\\n'
         height: 32,
       });
       await active.waitForComposer(TIMEOUT);
-      await active.waitForPane((pane) => pane.includes("Ran ./resume-command-output.sh"), TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(compactHint), TIMEOUT);
       const flagResumed = await active.capturePane();
       expectCompactCommandOutput(flagResumed);
       expectNoRawToolReplay(flagResumed);
@@ -5748,7 +5571,7 @@ printf '${stdoutTail2}\\n'
       gateways.push(pickerGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, pickerGateway),
         stderrPath,
@@ -5759,7 +5582,7 @@ printf '${stdoutTail2}\\n'
       await active.sendText("/resume");
       await waitForSessionPicker(active);
       await active.sendKeys("Enter");
-      await active.waitForPane((pane) => pane.includes("Ran ./resume-command-output.sh"), TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(compactHint), TIMEOUT);
       const pickerResumed = await active.capturePane();
       expectCompactCommandOutput(pickerResumed);
       expectNoRawToolReplay(pickerResumed);
@@ -5782,7 +5605,7 @@ printf '${stdoutTail2}\\n'
 test.skipIf(!tmuxAvailable())(
   "interactive /resume opens a searchable scoped catalog and resumes the selection",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-session-picker-workspace-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-session-picker-workspace-")));
     const home = join(root, "home");
     const workspaceA = join(root, "workspace-a");
     const workspaceB = join(root, "workspace-b");
@@ -5802,7 +5625,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(workspaceAGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceARoot,
         env: gatewayEnv(home, workspaceAGateway),
         stderrPath,
@@ -5821,7 +5644,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(workspaceBGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceBRoot,
         env: gatewayEnv(home, workspaceBGateway),
         stderrPath,
@@ -5840,7 +5663,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(pickerGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceARoot,
         env: gatewayEnv(home, pickerGateway),
         stderrPath,
@@ -5853,7 +5676,7 @@ test.skipIf(!tmuxAvailable())(
       const currentPicker = stripAnsi(await active.capturePane());
       expect(currentPicker).toContain("Sessions 1");
       expect(currentPicker).toContain("[Current workspace]");
-      expect(currentPicker).toContain("𝒇x");
+      expect(currentPicker).not.toContain("𝒇x");
       expect(currentPicker).toContain("Save the workspace A transcript.");
       expect(currentPicker).not.toContain("Save the workspace B transcript.");
 
@@ -5880,7 +5703,7 @@ test.skipIf(!tmuxAvailable())(
       expect(filteredPicker).toContain("workspace B");
       expect(filteredPicker).toContain("workspace-b");
       expect(filteredPicker).not.toContain("Preview:");
-      const sessionIds = readdirSync(join(home, ".fx", "sessions"), {
+      const sessionIds = readdirSync(join(home, ".ffx", "sessions"), {
         withFileTypes: true,
       })
         .filter((entry) => entry.name !== "latest" && entry.isDirectory())
@@ -5912,7 +5735,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "interactive /resume keeps shared-prefix titles distinguishable at narrow widths",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-session-picker-narrow-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-session-picker-narrow-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -5934,7 +5757,7 @@ test.skipIf(!tmuxAvailable())(
       for (let index = 0; index < titles.length; index += 1) {
         writeFileSync(stderrPath, "");
         active = await TmuxSession.create({
-          cmd: FX_BIN,
+          cmd: FFX_BIN,
           cwd: workspaceRoot,
           env: gatewayEnv(home, sessionGateway),
           stderrPath,
@@ -5955,7 +5778,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(pickerGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, pickerGateway),
         stderrPath,
@@ -5971,7 +5794,7 @@ test.skipIf(!tmuxAvailable())(
       }
       const rows = pane
         .split("\n")
-        .filter((line) => /(?:alpha|beta|gamma)\b/.test(line))
+        .filter((line) => /(?:alpha|beta|gamma)\b.*\bturns?\b/.test(line))
         .map((line) => line.trim());
       expect(new Set(rows).size).toBe(titles.length);
       expect(active.isPaneAlive()).toBe(true);
@@ -5988,7 +5811,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "interactive /resume highlight reaches bottom before the list scrolls",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-session-picker-row-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-session-picker-row-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -6010,11 +5833,11 @@ test.skipIf(!tmuxAvailable())(
         gateways.push(gateway);
         writeFileSync(stderrPath, "");
         active = await TmuxSession.create({
-          cmd: FX_BIN,
+          cmd: FFX_BIN,
           cwd: workspaceRoot,
           env: {
             ...gatewayEnv(home, gateway),
-            FX_THEME: "dark",
+            FFX_THEME: "dark",
             NO_COLOR: undefined,
           },
           stderrPath,
@@ -6035,11 +5858,11 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(pickerGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: {
           ...gatewayEnv(home, pickerGateway),
-          FX_THEME: "dark",
+          FFX_THEME: "dark",
           NO_COLOR: undefined,
         },
         stderrPath,
@@ -6051,7 +5874,7 @@ test.skipIf(!tmuxAvailable())(
       await waitForSessionPicker(active);
 
       let sessionEntries = visibleSessionPickerEntries(await active.capturePaneEscapes());
-      expect(sessionEntries).toHaveLength(2);
+      expect(sessionEntries.length).toBeGreaterThanOrEqual(7);
       expect(sessionEntries.findIndex((entry) => entry.selected)).toBe(0);
       const firstVisibleRow = sessionEntries[0]!.row;
       const firstVisibleTitle = sessionEntries[0]!.title;
@@ -6091,9 +5914,8 @@ test.skipIf(!tmuxAvailable())(
       expect(hintRow).toBeGreaterThan(loadMoreRow);
       const firstEntryRow = visibleSessionPickerEntries(await active.capturePaneEscapes())[0]!.row;
 
-      for (let index = 0; index < 10 - visibleCount; index += 1) {
-        await active.sendKeys("Down");
-      }
+      await active.sendKeys("Down");
+      await active.sendKeys("Down");
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
         return /Sessions 1[12]\b/.test(plain) && !plain.includes("Load more");
@@ -6125,7 +5947,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "interactive /resume loads more sessions and dismisses cleanly",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-session-picker-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-session-picker-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -6146,7 +5968,7 @@ test.skipIf(!tmuxAvailable())(
         gateways.push(gateway);
         writeFileSync(stderrPath, "");
         active = await TmuxSession.create({
-          cmd: FX_BIN,
+          cmd: FFX_BIN,
           cwd: workspaceRoot,
           env: gatewayEnv(home, gateway),
           stderrPath,
@@ -6167,7 +5989,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(gateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -6209,9 +6031,7 @@ test.skipIf(!tmuxAvailable())(
       await waitForSessionPicker(active);
       await active.sendKeys("Escape");
       const afterEscape = await waitForSessionPickerClosed(active);
-      expect(await active.captureFullScrollback()).toContain(
-        `● Session resumed: Save ${savedMarkers[0]!}.`,
-      );
+      expect(afterEscape).toContain(`● Session resumed: Save ${savedMarkers[0]!}.`);
       expect(afterEscape).toContain(savedMarkers[0]!);
       expect(afterEscape).not.toContain(`● Session resumed: Save ${savedMarkers[10]!}.`);
       expect(afterEscape).not.toContain(savedMarkers[10]!);
@@ -6247,9 +6067,9 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "new and resumed sessions preserve native terminal scrollback while fx is active",
+  "new and resumed sessions preserve native terminal scrollback while ffx is active",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-direct-resume-scroll-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-direct-resume-scroll-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -6275,11 +6095,11 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(initialGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: {
           ...gatewayEnv(home, initialGateway),
-          FX_RECORD: initialTapePath,
+          FFX_RECORD: initialTapePath,
         },
         stderrPath,
         width: 80,
@@ -6302,11 +6122,11 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(resumedGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} resume ${sessionId}`,
+        cmd: `${FFX_BIN} resume ${sessionId}`,
         cwd: workspaceRoot,
         env: {
           ...gatewayEnv(home, resumedGateway),
-          FX_RECORD: tapePath,
+          FFX_RECORD: tapePath,
         },
         stderrPath,
         width: 80,
@@ -6339,7 +6159,7 @@ test.skipIf(!tmuxAvailable())(
 test.skipIf(!tmuxAvailable())(
   "interactive /resume refuses a live stream and preserves Escape cancellation",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-session-picker-stream-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-tui-session-picker-stream-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const stderrPath = join(root, "stderr.log");
@@ -6354,7 +6174,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(savedGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, savedGateway),
         stderrPath,
@@ -6372,7 +6192,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(heldGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: workspaceRoot,
         env: gatewayEnv(home, heldGateway),
         stderrPath,
@@ -6380,7 +6200,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Keep this response active.");
       await waitForCondition(() => hold.started, "held gateway response");
-      await active.waitForText("Generating", TIMEOUT);
+      await active.waitForText("Thinking", TIMEOUT);
 
       await active.sendText("/resume");
       await active.waitForText("resume is unavailable until the response finishes", TIMEOUT);
@@ -6389,37 +6209,6 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("Escape");
       await waitForCondition(() => hold.cancelled, "Escape to cancel the held response");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-      await active.sendText("/quit");
-      expect(await active.waitForSessionEnd()).toBe(true);
-      await active.kill();
-      active = null;
-
-      const resumedGateway = startFakeGateway([]);
-      gateways.push(resumedGateway);
-      active = await TmuxSession.create({
-        cmd: `${FX_BIN} resume last`,
-        cwd: workspaceRoot,
-        env: gatewayEnv(home, resumedGateway),
-        stderrPath,
-        width: 120,
-        height: 40,
-      });
-      await active.waitForComposer(TIMEOUT);
-      await active.waitForText("What can fx do differently?", TIMEOUT);
-      const resumedGrid = await active.capturePaneGrid();
-      const footer = findFooterBlocks(resumedGrid).at(-1);
-      const cancelledRow = resumedGrid.findIndex((row) => row.includes("■ Cancelled"));
-      expect(footer).toBeDefined();
-      expect(cancelledRow).toBeGreaterThanOrEqual(0);
-      expect(cancelledRow).toBeLessThan(footer!.topDivider);
-      const gapRows = resumedGrid.slice(cancelledRow + 1, footer!.topDivider);
-      expect(gapRows.length).toBeGreaterThanOrEqual(1);
-      expect(gapRows.map((row) => row.trim())).toEqual(
-        Array.from({ length: gapRows.length }, () => ""),
-      );
-      expect(resumedGateway.requests).toHaveLength(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await active.sendText("/quit");
@@ -6438,7 +6227,7 @@ test.skipIf(!tmuxAvailable())(
   "cancelled command presentation survives a distinct-process resume",
   async () => {
     const timeout = 60_000;
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancelled-command-resume-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-cancelled-command-resume-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const initialStderrPath = join(root, "initial-stderr.log");
@@ -6451,11 +6240,11 @@ test.skipIf(!tmuxAvailable())(
     const bufferedTailMarker = "INTERRUPT_BUFFERED_TAIL";
     const artifactTailMarker = "INTERRUPT_TERM_TAIL";
     const followUpMarker = "INTERRUPT_FOLLOW_UP_DONE";
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(initialStderrPath, "");
     writeFileSync(resumedStderrPath, "");
@@ -6474,15 +6263,8 @@ while :; do sleep 1; done
     const initialGateway = startFakeGateway([
       fakeGatewaySerializedToolCall(
         "resume-cancelled-command",
-        "shell",
-        JSON.stringify({
-          request: {
-            action: "run",
-            command: "./resume-cancel.sh",
-            yield_time_ms: 30_000,
-            timeout_ms: 600_000,
-          },
-        }),
+        "terminal",
+        JSON.stringify({ action: "exec", command: "./resume-cancel.sh" }),
         assistantMarker,
       ),
       fakeGatewayFinalText(followUpMarker),
@@ -6492,12 +6274,12 @@ while :; do sleep 1; done
     let passed = false;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: {
           ...gatewayEnv(home, initialGateway),
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "session,agent,tool,worker,interrupt,command_output,transcript",
+          FFX_TRACE_LOG: tracePath,
+          FFX_TRACE_SCOPES: "session,agent,tool,worker,interrupt,command_output,transcript",
         },
         stderrPath: initialStderrPath,
         width: 120,
@@ -6505,7 +6287,7 @@ while :; do sleep 1; done
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared interrupt command.");
-      await waitForScrollback(active, "Running ./resume-cancel.sh", timeout);
+      await waitForScrollback(active, outputMarker, timeout);
       await waitForCondition(
         () => existsSync(readyPath),
         "the interrupt command readiness file",
@@ -6520,7 +6302,7 @@ while :; do sleep 1; done
         timeout,
       );
       const liveCancelled = stripAnsi(await active.captureFullScrollback());
-      expect(liveCancelled).not.toContain(outputMarker);
+      expect(liveCancelled).toContain(outputMarker);
       expect(liveCancelled).not.toContain(bufferedTailMarker);
       expect(liveCancelled).not.toContain(artifactTailMarker);
 
@@ -6538,16 +6320,24 @@ while :; do sleep 1; done
       expect(followUpBody).not.toContain(".command_artifacts");
 
       const sessionId = sessionIdFromHome(home);
-      const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const replayNames = readdirSync(commandDir).filter((name) =>
-        name.endsWith(".bin")
+      const commandDir = join(home, ".ffx", "sessions", sessionId, "logs", "commands");
+      const artifactName = readdirSync(commandDir).find((name) =>
+        name.endsWith(".log") &&
+        !name.endsWith(".stdout.log") &&
+        !name.endsWith(".stderr.log")
       );
-      expect(replayNames).toHaveLength(1);
-      const replayName = replayNames[0]!;
-      const replayPath = join(commandDir, replayName);
-      expect(statSync(replayPath).size).toBeGreaterThan(0);
-      expect(followUpBody).toContain(replayName);
-      expect(followUpBody).not.toContain(replayPath);
+      expect(artifactName).toBeDefined();
+      const artifact = readFileSync(join(commandDir, artifactName!), "utf8");
+      expect(artifact).toContain(outputMarker);
+      expect(artifact).toContain(bufferedTailMarker);
+      expect(artifact).toContain(artifactTailMarker);
+      expect(artifact.indexOf(artifactTailMarker)).toBeGreaterThan(artifact.indexOf(outputMarker));
+      const artifactDigest = createHash("sha256")
+        .update(artifact)
+        .digest("hex")
+        .slice(0, 16);
+      expect(artifactName).toEndWith(`-${artifactDigest}.log`);
+      expect(followUpBody).not.toContain(artifactName!);
 
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -6556,7 +6346,7 @@ while :; do sleep 1; done
       expect(readFileSync(initialStderrPath, "utf8")).toBe("");
 
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} resume last`,
+        cmd: `${FFX_BIN} resume last`,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, resumedGateway),
         stderrPath: resumedStderrPath,
@@ -6567,9 +6357,13 @@ while :; do sleep 1; done
       const resumed = stripAnsi(await waitForScrollback(active, followUpMarker, timeout));
       const assistantIndex = resumed.indexOf(assistantMarker);
       const cancelledIndex = resumed.indexOf("Cancelled");
+      const outputIndex = resumed.indexOf(outputMarker);
+      const cancellationNoticeIndex = resumed.indexOf("● System: cancelled");
       expect(assistantIndex).toBeGreaterThanOrEqual(0);
       expect(cancelledIndex).toBeGreaterThan(assistantIndex);
-      expect(resumed).not.toContain(outputMarker);
+      expect(outputIndex).toBeGreaterThan(cancelledIndex);
+      expect(cancellationNoticeIndex).toBeGreaterThan(outputIndex);
+      expect(countOccurrences(resumed, "● System: cancelled")).toBe(1);
       expect(resumed).not.toContain("Interrupted by user after completing");
       expect(resumed).not.toContain("<turn_aborted>");
       expect(resumed).not.toContain(bufferedTailMarker);
@@ -6614,7 +6408,7 @@ test.skipIf(!tmuxAvailable())(
   "zero-output cancelled command restores its row without an output block",
   async () => {
     const timeout = 60_000;
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-zero-output-cancel-resume-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-zero-output-cancel-resume-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const initialStderrPath = join(root, "initial-stderr.log");
@@ -6622,11 +6416,11 @@ test.skipIf(!tmuxAvailable())(
     const tracePath = join(root, "trace.log");
     const readyPath = join(workspace, ".zero-ready");
     const scriptPath = join(workspace, "z.sh");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      join(home, ".ffx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {}, maxxing_mode: "legacy" }),
     );
     writeFileSync(initialStderrPath, "");
     writeFileSync(resumedStderrPath, "");
@@ -6637,19 +6431,19 @@ test.skipIf(!tmuxAvailable())(
     chmodSync(scriptPath, 0o755);
 
     const initialGateway = startFakeGateway([
-      fakeShellRun("resume-zero-output-command", "./z.sh"),
+      fakeGatewayToolCall("resume-zero-output-command", "terminal", { action: "exec", command: "./z.sh" }),
     ]);
     const resumedGateway = startFakeGateway([]);
     let active: TmuxSession | null = null;
     let passed = false;
     try {
       active = await TmuxSession.create({
-        cmd: FX_BIN,
+        cmd: FFX_BIN,
         cwd: realpathSync(workspace),
         env: {
           ...gatewayEnv(home, initialGateway),
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "session,agent,tool,worker,interrupt,command_output,transcript",
+          FFX_TRACE_LOG: tracePath,
+          FFX_TRACE_SCOPES: "session,agent,tool,worker,interrupt,command_output,transcript",
         },
         stderrPath: initialStderrPath,
         width: 100,
@@ -6677,7 +6471,7 @@ test.skipIf(!tmuxAvailable())(
       expect(readFileSync(initialStderrPath, "utf8")).toBe("");
 
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} resume last`,
+        cmd: `${FFX_BIN} resume last`,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, resumedGateway),
         stderrPath: resumedStderrPath,
@@ -6685,20 +6479,15 @@ test.skipIf(!tmuxAvailable())(
         height: 32,
       });
       await active.waitForComposer(TIMEOUT);
-      const resumed = stripAnsi(await waitForScrollback(
-        active,
-        "What can fx do differently?",
-        timeout,
-      ));
+      const resumed = stripAnsi(await waitForScrollback(active, "● System: cancelled", timeout));
       const cancelledIndex = resumed.indexOf("Cancelled");
+      const cancellationNoticeIndex = resumed.indexOf("● System: cancelled");
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
-      expect(resumed).toContain("■ Cancelled");
-      expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
-      expect(resumed).not.toContain("System: cancelled");
-      expect(resumed).not.toContain("Cancelling");
+      expect(cancellationNoticeIndex).toBeGreaterThan(cancelledIndex);
+      expect(countOccurrences(resumed, "● System: cancelled")).toBe(1);
       expect(resumed).not.toContain("Interrupted by user after completing");
       expect(resumed).not.toContain("<turn_aborted>");
-      const restoredPresentation = resumed.slice(cancelledIndex);
+      const restoredPresentation = resumed.slice(cancelledIndex, cancellationNoticeIndex);
       expect(
         restoredPresentation.split("\n").some((line) => line.trimStart().startsWith("│")),
       ).toBe(false);

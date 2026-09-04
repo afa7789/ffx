@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin_skills = @import("../../builtins/skills.zig");
+const io_mod = @import("../../core/shared/io.zig");
 const skill_invocation = @import("../../core/skills/skill_invocation.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
@@ -88,25 +89,6 @@ pub fn validate(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) to
     return null;
 }
 
-pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
-    const resource = if (args.get("resource")) |value| resource: {
-        if (value != .string or value.string.len == 0) return null;
-        break :resource value.string;
-    } else "SKILL.md";
-    const offset = if (args.get("offset")) |value| offset: {
-        if (value != .integer or value.integer < 0) return null;
-        break :offset std.math.cast(usize, value.integer) orelse return null;
-    } else 0;
-    if (offset == 0 and std.mem.eql(u8, resource, "SKILL.md")) return null;
-    return .{
-        .activity_kind = .read,
-        .action_label = "Reading skill resource",
-        .completed_action_label = "Read skill resource",
-        .label_arg_kind = .resource,
-        .label_arg_default = "SKILL.md",
-    };
-}
-
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
     const result = loadByIdentity(
@@ -181,7 +163,7 @@ fn loadByIdentity(
     limits: context_limits.Values,
     max_tool_result_bytes: ?usize,
 ) !skill_invocation.ExecuteResult {
-    var discovery = try builtin_skills.loadVisibleSkillsForTool(alloc, workspace_root, skills_dir);
+    var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
     defer discovery.deinit(alloc);
     skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);
     return skill_invocation.loadByIdentity(
@@ -194,6 +176,23 @@ fn loadByIdentity(
         limits,
         max_tool_result_bytes,
     );
+}
+
+fn loadVisibleSkillsForContext(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    skills_dir: []const u8,
+) !skill_runtime.SkillDiscovery {
+    if (io_mod.getenv("HOME") orelse homeFromSkillsDir(skills_dir)) |home| {
+        return skill_runtime.loadVisibleSkills(alloc, workspace_root, home, skills_dir, builtin_skills.root_policy);
+    }
+    return skill_runtime.loadVisibleSkills(alloc, workspace_root, null, skills_dir, builtin_skills.root_policy);
+}
+
+fn homeFromSkillsDir(skills_dir: []const u8) ?[]const u8 {
+    const suffix = "/.ffx/skills";
+    if (!std.mem.endsWith(u8, skills_dir, suffix)) return null;
+    return skills_dir[0 .. skills_dir.len - suffix.len];
 }
 
 pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
@@ -262,47 +261,4 @@ test "skill tool decode cleans allocation failures" {
         checkDecodeAllocationFailures,
         .{},
     );
-}
-
-test "skill presentation distinguishes the initial document from resource reads" {
-    const Case = struct {
-        args: []const u8,
-        expected: ?struct {
-            active: []const u8,
-            completed: []const u8,
-            value: []const u8,
-        },
-    };
-    const cases = [_]Case{
-        .{ .args = "{\"name\":\"workflow\"}", .expected = null },
-        .{ .args = "{\"name\":\"workflow\",\"resource\":\"SKILL.md\",\"offset\":0}", .expected = null },
-        .{ .args = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}", .expected = .{
-            .active = "Reading skill resource",
-            .completed = "Read skill resource",
-            .value = "references/contract-design.md",
-        } },
-        .{ .args = "{\"name\":\"workflow\",\"offset\":128}", .expected = .{
-            .active = "Reading skill resource",
-            .completed = "Read skill resource",
-            .value = "SKILL.md",
-        } },
-    };
-
-    for (cases) |case| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.args, .{});
-        defer parsed.deinit();
-        const resolved = presentation(parsed.value.object);
-        if (case.expected) |expected| {
-            const value = resolved orelse return error.TestExpectedEqual;
-            try std.testing.expectEqualStrings(expected.active, value.action_label);
-            try std.testing.expectEqualStrings(expected.completed, value.completed_action_label);
-            try std.testing.expectEqual(tool_dispatch.LabelArgKind.resource, value.label_arg_kind);
-            try std.testing.expectEqualStrings(
-                expected.value,
-                tool_dispatch.presentationLabelValue(value, parsed.value.object) orelse value.label_arg_default,
-            );
-        } else {
-            try std.testing.expect(resolved == null);
-        }
-    }
 }

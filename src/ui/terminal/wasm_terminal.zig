@@ -1,8 +1,8 @@
 const types = @import("../../core/shared/types.zig");
 const terminal = @import("terminal.zig");
 
-extern "fx" fn fx_term_size(cols: *u16, rows: *u16) void;
-extern "fx" fn fx_term_poll_input(timeout_ms: i32) i32;
+extern "ffx" fn fx_term_size(cols: *u16, rows: *u16) void;
+extern "ffx" fn fx_term_poll_input(timeout_ms: i32) i32;
 
 pub const Size = struct {
     cols: u16,

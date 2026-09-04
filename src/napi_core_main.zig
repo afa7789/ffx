@@ -2,15 +2,17 @@ const std = @import("std");
 const build_options = @import("build_options");
 const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
+const background_process_provider = @import("core/execution/background_process_provider.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
-const provider_set = @import("core/gateway/provider_set.zig");
-const context_contract = @import("core/workspace/context_contract.zig");
+const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const host = @import("core/hosts/host.zig");
+const debug_trace = @import("core/shared/debug_trace.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
+const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
 
@@ -32,51 +34,6 @@ const max_active_runtimes = 64;
 const runtime_handle_type_tag = c.napi_type_tag{
     .lower = 0x4c4942465852544d,
     .upper = 0xa71d7c52e9314b08,
-};
-
-const ReadyNotifier = struct {
-    reader: ?c_int,
-    writer: c_int,
-
-    fn init() error{ReadyChannelFailed}!ReadyNotifier {
-        var pair: [2]c_int = undefined;
-        const flags = if (@import("builtin").os.tag == .macos) 0 else std.c.SOCK.CLOEXEC | std.c.SOCK.NONBLOCK;
-        const socket_type = std.c.SOCK.STREAM | flags;
-        if (std.c.socketpair(std.c.AF.UNIX, socket_type, 0, &pair) != 0) return error.ReadyChannelFailed;
-        errdefer for (pair) |fd| {
-            _ = std.c.close(fd);
-        };
-        // Darwin does not accept close-on-exec/nonblocking bits in socketpair's type.
-        if (flags == 0) for (pair) |fd| {
-            if (std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) != 0 or
-                std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true }))) != 0)
-                return error.ReadyChannelFailed;
-        };
-        return .{ .reader = pair[0], .writer = pair[1] };
-    }
-
-    fn notify(self: *ReadyNotifier) void {
-        const byte: u8 = 1;
-        while (true) {
-            const written = std.c.send(self.writer, &byte, 1, std.c.MSG.NOSIGNAL);
-            if (written == 1) return;
-            switch (std.posix.errno(written)) {
-                .INTR => continue,
-                // A full socket already has a wake pending; queue contents are authoritative.
-                .AGAIN => return,
-                else => {
-                    // Surface a broken notification channel as EOF instead of silently hanging.
-                    _ = std.c.shutdown(self.writer, std.c.SHUT.WR);
-                    return;
-                },
-            }
-        }
-    }
-
-    fn deinit(self: *ReadyNotifier) void {
-        if (self.reader) |fd| _ = std.c.close(fd);
-        _ = std.c.close(self.writer);
-    }
 };
 
 comptime {
@@ -147,7 +104,6 @@ const OutputQueue = struct {
     mutex: std.Io.Mutex = .init,
     bytes: std.ArrayList(u8) = .empty,
     offset: usize = 0,
-    ready: ?*ReadyNotifier = null,
 
     fn write(self: *OutputQueue, alloc: Allocator, data: []const u8) !void {
         const io = io_mod.getIo();
@@ -161,7 +117,6 @@ const OutputQueue = struct {
             self.offset = 0;
         }
         try self.bytes.appendSlice(alloc, data);
-        if (queued == 0) self.ready.?.notify();
     }
 
     fn drain(self: *OutputQueue, destination: []u8) usize {
@@ -201,11 +156,19 @@ const FetchBridge = struct {
     phase: fetch_state.Phase = .idle,
     next_handle: fetch_state.Handle = 1,
     status: u16 = 0,
-    ready: ?*ReadyNotifier = null,
 
-    fn clearPendingRequest(self: *FetchBridge) void {
+    fn clearPendingRequest(self: *FetchBridge, reason: []const u8) void {
         if (self.request.items.len == 0) return;
+        debug_trace.logf("napi", "dropping pending host fetch reason={s} bytes={d}", .{ reason, self.request.items.len });
         self.request.clearRetainingCapacity();
+    }
+
+    fn trace_stale(operation: []const u8, handle: fetch_state.Handle, reason: fetch_state.StaleReason) void {
+        debug_trace.logf(
+            "napi",
+            "dropping stale host fetch operation={s} handle={d} reason={s}",
+            .{ operation, handle, @tagName(reason) },
+        );
     }
 
     fn advance_handle(self: *FetchBridge) void {
@@ -224,6 +187,10 @@ const FetchBridge = struct {
         const handle = self.next_handle;
         const decision = fetch_state.decide(self.phase, .{ .open = handle });
         switch (decision.action) {
+            .cancelled => {
+                self.phase = decision.phase;
+                return error.Cancelled;
+            },
             .unavailable, .shutting_down => return error.HostStreamUnavailable,
             .applied => {},
             else => unreachable,
@@ -250,7 +217,6 @@ const FetchBridge = struct {
         self.phase = decision.phase;
         self.advance_handle();
         self.wake.broadcast(io);
-        self.ready.?.notify();
         return handle;
     }
 
@@ -321,14 +287,16 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .close = handle });
-        if (decision.action == .stale) return;
-        self.clearPendingRequest();
+        if (decision.action == .stale) {
+            trace_stale("close", handle, decision.stale_reason.?);
+            return;
+        }
+        self.clearPendingRequest("stream_close");
         self.phase = decision.phase;
         self.status = 0;
         self.response.clearRetainingCapacity();
         self.response_offset = 0;
         self.wake.broadcast(io);
-        self.ready.?.notify();
     }
 
     fn startResponse(self: *FetchBridge, handle: fetch_state.Handle, status: u16) FetchOperationResult {
@@ -336,7 +304,10 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .start = handle });
-        if (decision.action == .stale) return .stale;
+        if (decision.action == .stale) {
+            trace_stale("start", handle, decision.stale_reason.?);
+            return .stale;
+        }
         self.status = status;
         self.phase = decision.phase;
         self.wake.broadcast(io);
@@ -348,7 +319,10 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .push = handle });
-        if (decision.action == .stale) return .stale;
+        if (decision.action == .stale) {
+            trace_stale("push", handle, decision.stale_reason.?);
+            return .stale;
+        }
         const queued = self.response.items.len - self.response_offset;
         if (data.len > max_fetch_response_bytes or queued > max_fetch_response_bytes - data.len) return .backpressure;
         if (self.response_offset > 0) {
@@ -366,7 +340,10 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .finish = handle });
-        if (decision.action == .stale) return .stale;
+        if (decision.action == .stale) {
+            trace_stale("finish", handle, decision.stale_reason.?);
+            return .stale;
+        }
         self.phase = decision.phase;
         self.wake.broadcast(io);
         return .applied;
@@ -377,7 +354,10 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .fail = handle });
-        if (decision.action == .stale) return .stale;
+        if (decision.action == .stale) {
+            trace_stale("fail", handle, decision.stale_reason.?);
+            return .stale;
+        }
         self.phase = decision.phase;
         self.wake.broadcast(io);
         return .applied;
@@ -395,7 +375,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .cancel);
-        self.clearPendingRequest();
+        self.clearPendingRequest("abort");
         self.phase = decision.phase;
         self.wake.broadcast(io);
     }
@@ -405,7 +385,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .shutdown);
-        self.clearPendingRequest();
+        self.clearPendingRequest("shutdown");
         self.phase = decision.phase;
         self.wake.broadcast(io);
     }
@@ -433,7 +413,6 @@ const Runtime = struct {
     home: []u8,
     workspace_root: []u8,
     gateway_chat_url: []u8,
-    ready: ReadyNotifier,
     thread: std.Thread,
     exited: std.atomic.Value(bool) = .init(false),
     exit_code: std.atomic.Value(u8) = .init(0),
@@ -446,6 +425,7 @@ const Runtime = struct {
     fn writeOutput(context: ?*anyopaque, bytes: []const u8) !void {
         const self: *Runtime = @ptrCast(@alignCast(context.?));
         self.output.write(self.alloc, bytes) catch |err| {
+            debug_trace.logf("napi", "native output failed err={s}", .{@errorName(err)});
             self.exit_code.store(1, .seq_cst);
             return err;
         };
@@ -453,15 +433,15 @@ const Runtime = struct {
 
     fn run(self: *Runtime) void {
         const provider = gateway_provider.Provider{
+            .agent_stream = host_stream_provider.provider(&self.stream_context),
             .oauth_transport = oauth_transport.unavailable_provider,
             .chat_url = builtin_gateway.provider.chat_url,
+            .cli_model_catalog = builtin_gateway.provider.cli_model_catalog,
+            .credits = builtin_gateway.provider.credits,
+            .generation_usage = generation_usage_provider.unavailable_provider,
+            .web_search = builtin_gateway.provider.web_search,
+            .model_catalog = builtin_gateway.provider.model_catalog,
         };
-        const providers = provider_set.gateway_only(.{
-            .presentation = builtin_gateway.provider_bundle.presentation,
-            .auth_strategy = .vercel,
-            .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
-            .agent_stream = host_stream_provider.provider(&self.stream_context),
-        });
         acp_server.runWithTransport(
             self.alloc,
             .{
@@ -471,9 +451,9 @@ const Runtime = struct {
                 .gateway_chat_url = self.gateway_chat_url,
                 .gateway_models_path = builtin_gateway.models_path,
                 .gateway_provider = provider,
-                .provider_set = providers,
+                .background_process_provider = background_process_provider.unavailable_provider,
                 .secret_store = host.unavailable_secret_store,
-                .prompt_policy = .{ .system_prompt = "" },
+                .prompt_policy = builtin_context.prompt_policy,
                 .ignored_list_entries = &.{},
                 .max_list_entries = 0,
                 .max_read_file_bytes = 0,
@@ -482,7 +462,7 @@ const Runtime = struct {
                 .max_command_output_bytes = 0,
                 .max_tool_result_bytes = 64 * 1024,
                 .max_history_turns = 100,
-                .context_registry = .{ .default_provider = context_contract.empty_provider },
+                .context_registry = .{ .default_provider = builtin_context.provider },
                 .mode_registry = builtin_modes.registry,
                 .credential_override = self.credential,
                 .model_override = self.model,
@@ -490,15 +470,14 @@ const Runtime = struct {
                 .workspace_root_override = self.workspace_root,
                 .allow_acp_mcp = false,
                 .allow_native_tools = false,
-                .minimal_kernel = true,
             },
             jsonrpc.Reader.initCallback(self, Runtime.readInput),
             jsonrpc.Writer.initCallback(self, Runtime.writeOutput),
-        ) catch {
+        ) catch |err| {
+            debug_trace.logf("napi", "native runtime failed err={s}", .{@errorName(err)});
             self.exit_code.store(1, .seq_cst);
         };
         self.exited.store(true, .seq_cst);
-        self.ready.notify();
     }
 
     fn closeInput(self: *Runtime) void {
@@ -513,7 +492,6 @@ const Runtime = struct {
         self.closeInput();
         self.fetch.shutdown();
         self.thread.join();
-        self.ready.deinit();
         self.fetch.deinit();
         self.input.deinit(self.alloc);
         self.output.deinit(self.alloc);
@@ -530,16 +508,6 @@ const Runtime = struct {
 const RuntimeHandle = struct {
     mutex: std.Io.Mutex = .init,
     runtime: ?*Runtime,
-    cleanup_hook_registered: bool,
-
-    fn unregisterCleanup(self: *RuntimeHandle, env: c.napi_env) void {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        const registered = self.cleanup_hook_registered;
-        self.cleanup_hook_registered = false;
-        self.mutex.unlock(io);
-        if (registered) _ = c.napi_remove_env_cleanup_hook(env, cleanupRuntimeHandle, self);
-    }
 
     fn destroy(self: *RuntimeHandle) void {
         const io = io_mod.getIo();
@@ -550,15 +518,6 @@ const RuntimeHandle = struct {
         if (runtime) |value| value.deinit();
     }
 };
-
-fn cleanupRuntimeHandle(data: ?*anyopaque) callconv(.c) void {
-    const handle: *RuntimeHandle = @ptrCast(@alignCast(data orelse return));
-    const io = io_mod.getIo();
-    handle.mutex.lockUncancelable(io);
-    handle.cleanup_hook_registered = false;
-    handle.mutex.unlock(io);
-    handle.destroy();
-}
 
 var threaded_io: ?std.Io.Threaded = null;
 var threaded_io_state: std.atomic.Value(u8) = .init(0);
@@ -584,6 +543,9 @@ fn ensureThreadedIo() void {
         io_mod.setIo(threaded_io.?.io());
         const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
         io_mod.setRawEnviron(raw_environ);
+        const workspace_root = io_mod.realpathAlloc(std.heap.c_allocator, ".") catch null;
+        defer if (workspace_root) |path| std.heap.c_allocator.free(path);
+        debug_trace.configureFromEnv(std.heap.c_allocator, workspace_root orelse ".");
         threaded_io_state.store(2, .release);
         return;
     }
@@ -597,7 +559,7 @@ fn throw(env: c.napi_env, code: [*:0]const u8, message: [*:0]const u8) c.napi_va
 
 fn statusOk(env: c.napi_env, status: c.napi_status, message: [*:0]const u8) bool {
     if (status == c.napi_ok) return true;
-    _ = c.napi_throw_error(env, "LIBFX_NAPI", message);
+    _ = c.napi_throw_error(env, "LIBFFX_NAPI", message);
     return false;
 }
 
@@ -605,7 +567,7 @@ fn callbackArgs(env: c.napi_env, info: c.napi_callback_info, argv: []c.napi_valu
     var argc = argv.len;
     if (!statusOk(env, c.napi_get_cb_info(env, info, &argc, argv.ptr, null, null), "could not read arguments")) return false;
     if (argc == argv.len) return true;
-    _ = c.napi_throw_type_error(env, "LIBFX_INVALID_ARGUMENT", "missing required argument");
+    _ = c.napi_throw_type_error(env, "LIBFFX_INVALID_ARGUMENT", "missing required argument");
     return false;
 }
 
@@ -628,28 +590,15 @@ fn getNamedString(
     max_len: usize,
 ) !?[]u8 {
     var present = false;
-    if (c.napi_has_named_property(env, object, name, &present) != c.napi_ok) {
-        if (exceptionPending(env)) return error.JavaScriptException;
-        return error.InvalidArgument;
-    }
-    if (!present) return null;
+    if (c.napi_has_named_property(env, object, name, &present) != c.napi_ok or !present) return null;
     var value: c.napi_value = undefined;
-    if (c.napi_get_named_property(env, object, name, &value) != c.napi_ok) {
-        if (exceptionPending(env)) return error.JavaScriptException;
-        return error.InvalidArgument;
-    }
+    if (c.napi_get_named_property(env, object, name, &value) != c.napi_ok) return error.InvalidArgument;
     var value_type: c.napi_valuetype = undefined;
     if (c.napi_typeof(env, value, &value_type) != c.napi_ok or value_type != c.napi_string) return error.InvalidArgument;
     return try stringArg(env, value, alloc, max_len);
 }
 
-fn exceptionPending(env: c.napi_env) bool {
-    var pending = false;
-    return c.napi_is_exception_pending(env, &pending) == c.napi_ok and pending;
-}
-
 const CreateError = error{
-    JavaScriptException,
     TooManyRuntimes,
     InvalidApiKey,
     InvalidModel,
@@ -658,7 +607,6 @@ const CreateError = error{
     InvalidGatewayUrl,
     OutOfMemory,
     ThreadFailed,
-    ReadyChannelFailed,
 };
 
 fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
@@ -666,32 +614,27 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     errdefer releaseRuntimeSlot();
     const alloc = std.heap.c_allocator;
     const credential = getNamedString(env, options, "apiKey", alloc, max_api_key_bytes) catch |err| switch (err) {
-        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidApiKey,
     };
     const api_key = credential orelse return error.InvalidApiKey;
     errdefer alloc.free(api_key);
     const model = getNamedString(env, options, "model", alloc, max_model_bytes) catch |err| switch (err) {
-        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidModel,
     };
     errdefer if (model) |value| alloc.free(value);
     const home = (getNamedString(env, options, "home", alloc, max_path_bytes) catch |err| switch (err) {
-        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidHome,
     }) orelse return error.InvalidHome;
     errdefer alloc.free(home);
     const workspace_root = (getNamedString(env, options, "workspaceRoot", alloc, max_path_bytes) catch |err| switch (err) {
-        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidWorkspaceRoot,
     }) orelse return error.InvalidWorkspaceRoot;
     errdefer alloc.free(workspace_root);
     const gateway_chat_url = (getNamedString(env, options, "gatewayChatUrl", alloc, max_url_bytes) catch |err| switch (err) {
-        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidGatewayUrl,
     }) orelse (alloc.dupe(u8, builtin_gateway.default_chat_url) catch return error.OutOfMemory);
@@ -704,8 +647,6 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
 
     const runtime = alloc.create(Runtime) catch return error.OutOfMemory;
     errdefer alloc.destroy(runtime);
-    var ready = try ReadyNotifier.init();
-    errdefer ready.deinit();
     runtime.* = .{
         .alloc = alloc,
         .credential = api_key,
@@ -713,12 +654,9 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .home = home,
         .workspace_root = workspace_root,
         .gateway_chat_url = gateway_chat_url,
-        .ready = ready,
         .thread = undefined,
     };
-    runtime.fetch.ready = &runtime.ready;
-    runtime.output.ready = &runtime.ready;
-    runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{ .fixed = runtime.gateway_chat_url }, .{
+    runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{
         .context = &runtime.fetch,
         .open_fn = FetchBridge.open,
         .status_fn = FetchBridge.statusFn,
@@ -731,22 +669,19 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
 
 fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
     return switch (err) {
-        error.JavaScriptException => null,
-        error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", "too many active native runtimes"),
-        error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
-        error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),
-        error.InvalidHome => throw(env, "LIBFX_INVALID_ARGUMENT", "home is required and must be a bounded string"),
-        error.InvalidWorkspaceRoot => throw(env, "LIBFX_INVALID_ARGUMENT", "workspaceRoot is required and must be a bounded string"),
-        error.InvalidGatewayUrl => throw(env, "LIBFX_INVALID_ARGUMENT", "gatewayChatUrl must be a bounded string"),
-        error.OutOfMemory => throw(env, "LIBFX_NATIVE_OOM", "could not allocate native runtime"),
-        error.ThreadFailed => throw(env, "LIBFX_NATIVE_THREAD", "could not start native runtime thread"),
-        error.ReadyChannelFailed => throw(env, "LIBFX_NATIVE_IO", "could not create native readiness channel"),
+        error.TooManyRuntimes => throw(env, "LIBFFX_NATIVE_LIMIT", "too many active native runtimes"),
+        error.InvalidApiKey => throw(env, "LIBFFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
+        error.InvalidModel => throw(env, "LIBFFX_INVALID_ARGUMENT", "model must be a bounded string"),
+        error.InvalidHome => throw(env, "LIBFFX_INVALID_ARGUMENT", "home is required and must be a bounded string"),
+        error.InvalidWorkspaceRoot => throw(env, "LIBFFX_INVALID_ARGUMENT", "workspaceRoot is required and must be a bounded string"),
+        error.InvalidGatewayUrl => throw(env, "LIBFFX_INVALID_ARGUMENT", "gatewayChatUrl must be a bounded string"),
+        error.OutOfMemory => throw(env, "LIBFFX_NATIVE_OOM", "could not allocate native runtime"),
+        error.ThreadFailed => throw(env, "LIBFFX_NATIVE_THREAD", "could not start native runtime thread"),
     };
 }
 
-fn finalizeRuntimeHandle(env: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+fn finalizeRuntimeHandle(_: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
     const handle: *RuntimeHandle = @ptrCast(@alignCast(data orelse return));
-    handle.unregisterCleanup(env);
     handle.destroy();
     std.heap.c_allocator.destroy(handle);
 }
@@ -754,24 +689,15 @@ fn finalizeRuntimeHandle(env: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) cal
 fn createCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
     var argv: [1]c.napi_value = undefined;
     if (!callbackArgs(env, info, &argv)) return null;
+
     const runtime = createRuntime(env, argv[0]) catch |err| return throwCreateError(env, err);
     var runtime_owned = true;
     defer if (runtime_owned) runtime.deinit();
     const handle = std.heap.c_allocator.create(RuntimeHandle) catch
-        return throw(env, "LIBFX_NATIVE_OOM", "could not allocate runtime handle");
+        return throw(env, "LIBFFX_NATIVE_OOM", "could not allocate runtime handle");
     var handle_owned = true;
-    defer if (handle_owned) {
-        handle.unregisterCleanup(env);
-        std.heap.c_allocator.destroy(handle);
-    };
-    handle.* = .{ .runtime = runtime, .cleanup_hook_registered = false };
-
-    if (!statusOk(
-        env,
-        c.napi_add_env_cleanup_hook(env, cleanupRuntimeHandle, handle),
-        "could not register native runtime cleanup",
-    )) return null;
-    handle.cleanup_hook_registered = true;
+    defer if (handle_owned) std.heap.c_allocator.destroy(handle);
+    handle.* = .{ .runtime = runtime };
 
     var result: c.napi_value = undefined;
     if (!statusOk(env, c.napi_create_object(env, &result), "could not create runtime handle")) return null;
@@ -799,7 +725,7 @@ fn runtimeHandleArg(env: c.napi_env, info: c.napi_callback_info, argv: []c.napi_
         "could not validate runtime handle",
     )) return null;
     if (!branded) {
-        _ = c.napi_throw_type_error(env, "LIBFX_INVALID_ARGUMENT", "invalid runtime handle");
+        _ = c.napi_throw_type_error(env, "LIBFFX_INVALID_ARGUMENT", "invalid runtime handle");
         return null;
     }
     var context: ?*anyopaque = null;
@@ -811,7 +737,7 @@ fn lockRuntime(env: c.napi_env, handle: *RuntimeHandle) ?*Runtime {
     handle.mutex.lockUncancelable(io_mod.getIo());
     const runtime = handle.runtime orelse {
         handle.mutex.unlock(io_mod.getIo());
-        _ = c.napi_throw_error(env, "LIBFX_NATIVE_CLOSED", "native runtime is closed");
+        _ = c.napi_throw_error(env, "LIBFFX_NATIVE_CLOSED", "native runtime is closed");
         return null;
     };
     return runtime;
@@ -819,19 +745,6 @@ fn lockRuntime(env: c.napi_env, handle: *RuntimeHandle) ?*Runtime {
 
 fn unlockRuntime(handle: *RuntimeHandle) void {
     handle.mutex.unlock(io_mod.getIo());
-}
-
-fn takeCoreReadyFd(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
-    var argv: [1]c.napi_value = undefined;
-    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
-    const runtime = lockRuntime(env, handle) orelse return null;
-    defer unlockRuntime(handle);
-    const reader = runtime.ready.reader orelse
-        return throw(env, "LIBFX_INVALID_ARGUMENT", "readiness descriptor already transferred");
-    var value: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_int32(env, reader, &value), "could not transfer readiness descriptor")) return null;
-    runtime.ready.reader = null;
-    return value;
 }
 
 fn fetch_handle_arg(env: c.napi_env, value: c.napi_value) ?fetch_state.Handle {
@@ -842,7 +755,7 @@ fn fetch_handle_arg(env: c.napi_env, value: c.napi_value) ?fetch_state.Handle {
         number > @as(f64, @floatFromInt(std.math.maxInt(fetch_state.Handle))) or
         @floor(number) != number)
     {
-        _ = c.napi_throw_type_error(env, "LIBFX_INVALID_ARGUMENT", "fetch handle must be a positive int32");
+        _ = c.napi_throw_type_error(env, "LIBFFX_INVALID_ARGUMENT", "fetch handle must be a positive int32");
         return null;
     }
     return @intFromFloat(number);
@@ -862,11 +775,11 @@ fn writeCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_va
     var data: ?*anyopaque = null;
     var len: usize = 0;
     if (!statusOk(env, c.napi_get_buffer_info(env, argv[1], &data, &len), "write() requires a Buffer")) return null;
-    const bytes = if (len == 0) &.{} else @as([*]const u8, @ptrCast(data orelse return throw(env, "LIBFX_NATIVE_IO", "Buffer data is unavailable")))[0..len];
+    const bytes = if (len == 0) &.{} else @as([*]const u8, @ptrCast(data orelse return throw(env, "LIBFFX_NATIVE_IO", "Buffer data is unavailable")))[0..len];
     runtime.input.write(runtime.alloc, bytes) catch |err| return switch (err) {
-        error.InputClosed => throw(env, "LIBFX_NATIVE_CLOSED", "native runtime input is closed"),
-        error.InputQueueFull => throw(env, "LIBFX_NATIVE_BACKPRESSURE", "native runtime input queue is full"),
-        error.OutOfMemory => throw(env, "LIBFX_NATIVE_OOM", "could not queue native input"),
+        error.InputClosed => throw(env, "LIBFFX_NATIVE_CLOSED", "native runtime input is closed"),
+        error.InputQueueFull => throw(env, "LIBFFX_NATIVE_BACKPRESSURE", "native runtime input queue is full"),
+        error.OutOfMemory => throw(env, "LIBFFX_NATIVE_OOM", "could not queue native input"),
     };
     var value: c.napi_value = undefined;
     _ = c.napi_get_undefined(env, &value);
@@ -895,7 +808,7 @@ fn drainCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_va
     if (!statusOk(env, c.napi_create_buffer(env, len, &data, &value), "could not allocate output Buffer")) return null;
     if (len == 0) return value;
     const written = runtime.output.drain(@as([*]u8, @ptrCast(data.?))[0..len]);
-    if (written != len) return throw(env, "LIBFX_NATIVE_IO", "native output changed while draining");
+    if (written != len) return throw(env, "LIBFFX_NATIVE_IO", "native output changed while draining");
     return value;
 }
 
@@ -942,7 +855,7 @@ fn startCoreFetchResponse(env: c.napi_env, info: c.napi_callback_info) callconv(
     defer unlockRuntime(runtime_handle);
     var status: u32 = 0;
     if (c.napi_get_value_uint32(env, argv[2], &status) != c.napi_ok or status > std.math.maxInt(u16))
-        return throw(env, "LIBFX_INVALID_ARGUMENT", "fetch response status must be a uint16");
+        return throw(env, "LIBFFX_INVALID_ARGUMENT", "fetch response status must be a uint16");
     return fetch_operation_value(env, runtime.fetch.startResponse(fetch_handle, @intCast(status)));
 }
 
@@ -957,7 +870,7 @@ fn pushCoreFetchResponse(env: c.napi_env, info: c.napi_callback_info) callconv(.
     if (!statusOk(env, c.napi_get_buffer_info(env, argv[2], &data, &len), "fetch response chunk requires a Buffer")) return null;
     const bytes = if (len == 0) &.{} else @as([*]const u8, @ptrCast(data.?))[0..len];
     const result = runtime.fetch.pushResponse(fetch_handle, bytes) catch
-        return throw(env, "LIBFX_NATIVE_OOM", "could not queue fetch response");
+        return throw(env, "LIBFFX_NATIVE_OOM", "could not queue fetch response");
     return fetch_operation_value(env, result);
 }
 
@@ -1013,7 +926,6 @@ fn coreExitCode(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi
 fn destroyCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
     var argv: [1]c.napi_value = undefined;
     const handle = runtimeHandleArg(env, info, &argv) orelse return null;
-    handle.unregisterCleanup(env);
     handle.destroy();
     var value: c.napi_value = undefined;
     _ = c.napi_get_undefined(env, &value);
@@ -1029,10 +941,9 @@ fn exportFunction(env: c.napi_env, exports: c.napi_value, name: [*:0]const u8, c
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callconv(.c) c.napi_value {
     ensureThreadedIo();
     var api_version: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_uint32(env, 3, &api_version), "could not create API version")) return null;
+    if (!statusOk(env, c.napi_create_uint32(env, 2, &api_version), "could not create API version")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "libfxApiVersion", api_version), "could not export API version")) return null;
     if (!exportFunction(env, exports, "createCore", createCore)) return null;
-    if (!exportFunction(env, exports, "takeCoreReadyFd", takeCoreReadyFd)) return null;
     if (!exportFunction(env, exports, "writeCore", writeCore)) return null;
     if (!exportFunction(env, exports, "closeCore", closeCore)) return null;
     if (!exportFunction(env, exports, "drainCore", drainCore)) return null;

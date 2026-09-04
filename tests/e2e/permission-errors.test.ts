@@ -10,12 +10,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FFX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
-  fakeShellRun,
+  fakeGatewayToolCall,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -42,19 +42,19 @@ function createIsolatedRoot(prefix: string) {
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   mkdirSync(home, { recursive: true });
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   return { root, home, workspace };
 }
 
 function parseFxJson(result: { stdout: string; stderr: string; code: number | null }): FxJson {
   if (result.code !== 0) {
-    throw new Error(`fx exited ${result.code}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    throw new Error(`ffx exited ${result.code}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
   }
   return JSON.parse(result.stdout.trim()) as FxJson;
 }
 
-function executionDeniedReason(body: string, toolCallId: string): string {
+function toolResultText(body: string, toolCallId: string): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
   };
@@ -63,10 +63,9 @@ function executionDeniedReason(body: string, toolCallId: string): string {
     .find((part) => part.type === "tool-result" && part.toolCallId === toolCallId);
   expect(result).toBeDefined();
   const output = result!.output as Record<string, unknown>;
-  expect(output.type).toBe("execution-denied");
-  expect(typeof output.reason).toBe("string");
-  expect(output.value).toBeUndefined();
-  return output.reason as string;
+  expect(output.type).toBe("text");
+  expect(typeof output.value).toBe("string");
+  return output.value as string;
 }
 
 function permissionEnv(
@@ -75,13 +74,13 @@ function permissionEnv(
 ) {
   return {
     HOME: home,
-    AI_GATEWAY_API_KEY: "permission-error-fake-key",
+    FFX_PROVIDER_API_KEY: "permission-error-fake-key",
     VERCEL_OIDC_TOKEN: undefined,
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: FAKE_GATEWAY_MODEL,
-    FX_AUTO_UPGRADE: "0",
+    FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FFX_MODEL: FAKE_GATEWAY_MODEL,
+    FFX_AUTO_UPGRADE: "0",
     NO_COLOR: "1",
   };
 }
@@ -100,7 +99,7 @@ async function waitForPaneExit(
     await Bun.sleep(25);
   }
   throw new Error(
-    `Timed out waiting for fx ask to exit.\n${await session.captureFullScrollback()}`,
+    `Timed out waiting for ffx ask to exit.\n${await session.captureFullScrollback()}`,
   );
 }
 
@@ -109,31 +108,32 @@ async function runTtyPromptPermissionsCase(
   decision: "approve" | "deny",
 ) {
   const root = createIsolatedRoot(
-    `fx-${outputMode}-prompt-permissions-${decision}-`,
+    `ffx-${outputMode}-prompt-permissions-${decision}-`,
   );
   const marker = join(root.workspace, `${decision}-marker.txt`);
   const stdoutPath = join(root.root, `${decision}.stdout`);
   writeFileSync(
-    join(root.home, ".fx", "settings.json"),
+    join(root.home, ".ffx", "settings.json"),
     JSON.stringify({ permission_mode: "ask", sandbox: "none" }),
   );
   writeFileSync(stdoutPath, "");
   const gateway = startFakeGateway([
-    fakeShellRun(`${decision}_${outputMode}_call`, `touch ${JSON.stringify(marker)}`, {
-      timeout_ms: 600_000,
+    fakeGatewayToolCall(`${decision}_${outputMode}_call`, "terminal", {
+      action: "exec",
+      command: `touch ${JSON.stringify(marker)}`,
     }),
     fakeGatewayFinalText(`${decision} ${outputMode} complete`),
   ]);
   let session: TmuxSession | null = null;
   try {
     session = await TmuxSession.create({
-      cmd: `${JSON.stringify(FX_BIN)} ask --${outputMode} --prompt-permissions --no-save "Run the exact ${outputMode} fixture." > ${JSON.stringify(stdoutPath)}`,
+      cmd: `${JSON.stringify(FFX_BIN)} ask --${outputMode} --prompt-permissions --no-save "Run the exact ${outputMode} fixture." > ${JSON.stringify(stdoutPath)}`,
       cwd: root.workspace,
       env: permissionEnv(root.home, gateway),
       remainOnExit: true,
     });
     const prompt = await session.waitForText("Approve? [y/N]", TIMEOUT);
-    expect(prompt).toContain("fx wants to run:");
+    expect(prompt).toContain("ffx wants to run:");
     expect(existsSync(marker)).toBe(false);
     await session.sendText(decision === "approve" ? "y" : "n");
     await waitForPaneExit(session, 0);
@@ -145,7 +145,7 @@ async function runTtyPromptPermissionsCase(
       expect(json.exit_code).toBe(0);
       expect(json.tool_calls).toContainEqual(
         expect.objectContaining({
-          name: "shell",
+          name: "terminal",
           status: decision === "approve" ? "success" : "error",
         }),
       );
@@ -165,18 +165,19 @@ describe("generic permission typed errors", () => {
   test(
     "returns typed JSON for denied terminal",
     async () => {
-      const root = createIsolatedRoot("fx-permission-error-");
+      const root = createIsolatedRoot("ffx-permission-error-");
       const marker = join(root.workspace, "denied-marker.txt");
       const toolCallId = "permission_denied_call";
       const gateway = startFakeGateway([
-        fakeShellRun(toolCallId, `touch ${JSON.stringify(marker)}`, {
-          timeout_ms: 600_000,
+        fakeGatewayToolCall(toolCallId, "terminal", {
+          action: "exec",
+          command: `touch ${JSON.stringify(marker)}`,
         }),
         fakeGatewayFinalText("permission error observed"),
       ]);
       try {
         writeFileSync(
-          join(root.home, ".fx", "settings.json"),
+          join(root.home, ".ffx", "settings.json"),
           JSON.stringify({
             workspaces: {
               [root.workspace]: {
@@ -194,36 +195,27 @@ describe("generic permission typed errors", () => {
           cwd: root.workspace,
           env: {
             HOME: root.home,
-            AI_GATEWAY_API_KEY: "permission-error-fake-key",
+            FFX_PROVIDER_API_KEY: "permission-error-fake-key",
             VERCEL_OIDC_TOKEN: undefined,
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_MODEL: FAKE_GATEWAY_MODEL,
-            FX_AUTO_UPGRADE: "0",
+            FFX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FFX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FFX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FFX_MODEL: FAKE_GATEWAY_MODEL,
+            FFX_AUTO_UPGRADE: "0",
           },
           timeoutMs: TIMEOUT,
         });
         const json = parseFxJson(result);
-        expect(result.stderr).toBe('Running touch "./denied-marker.txt"\n');
-        expect(json.tool_calls).toContainEqual({
-          name: "shell",
-          status: "error",
-          action: "run",
-          error: {
-            category: "rejected",
-            code: "rejected",
-          },
-        });
+        expect(json.tool_calls).toContainEqual({ name: "terminal", status: "error" });
         expect(existsSync(marker)).toBe(false);
         expect(gateway.requests).toHaveLength(2);
 
         const toolResult = JSON.parse(
-          executionDeniedReason(gateway.requests[1]!.body, toolCallId),
+          toolResultText(gateway.requests[1]!.body, toolCallId),
         ) as { error: PermissionEcho };
         const echo = toolResult.error;
         expect(echo.type).toBe("tool_permission_denied");
-        expect(echo.tool_name).toBe("shell");
+        expect(echo.tool_name).toBe("terminal");
         expect(echo.message).toBe("Tool access was denied by configured policy");
         expect(echo.reason).toBe("policy_denied");
         expect(echo.denied).toBe(true);
@@ -246,36 +238,34 @@ describe("generic permission typed errors", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "JSON prompt-permissions does not prompt after repeated advisory cautions",
+    "JSON prompt-permissions does not prompt after automatic recovery exhaustion",
     async () => {
-      const root = createIsolatedRoot("fx-json-auto-prompt-permissions-");
+      const root = createIsolatedRoot("ffx-json-auto-prompt-permissions-");
       const markers = Array.from(
         { length: 4 },
         (_, index) => join(root.workspace, `auto-marker-${index + 1}.txt`),
       );
       const stdoutPath = join(root.root, "auto.stdout");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "auto", sandbox: "none" }),
       );
       writeFileSync(stdoutPath, "");
       const gateway = startFakeGateway(
         [
           ...markers.map((marker, index) => (body?: string) => {
-            if (index > 0) expect(body).toContain("review_caution");
-            return fakeShellRun(
-              `auto_call_${index + 1}`,
-              `touch ${JSON.stringify(marker)}`,
-              { timeout_ms: 600_000 },
-            );
+            if (index > 0) expect(body).toContain("auto_denied");
+            return fakeGatewayToolCall(`auto_call_${index + 1}`, "terminal", {
+              action: "exec",
+              command: `touch ${JSON.stringify(marker)}`,
+            });
           }),
-          fakeGatewayFinalText("Advisory cautions handled normally."),
         ],
         {
           classifierResponses: Array.from(
             { length: 4 },
             (_, index) => fakeGatewayPermissionDecision(
-              "caution",
+              "ask",
               `auto_review_${index + 1}`,
             ),
           ),
@@ -284,7 +274,7 @@ describe("generic permission typed errors", () => {
       let session: TmuxSession | null = null;
       try {
         session = await TmuxSession.create({
-          cmd: `${JSON.stringify(FX_BIN)} ask --auto --json --prompt-permissions --no-save "Run the advisory caution fixture." > ${JSON.stringify(stdoutPath)}`,
+          cmd: `${JSON.stringify(FFX_BIN)} ask --auto --json --prompt-permissions --no-save "Run the automatic threshold fixture." > ${JSON.stringify(stdoutPath)}`,
           cwd: root.workspace,
           env: permissionEnv(root.home, gateway),
           remainOnExit: true,
@@ -298,10 +288,12 @@ describe("generic permission typed errors", () => {
         const stdout = readFileSync(stdoutPath, "utf8");
         expect(stdout).not.toContain("Approve? [y/N]");
         const json = JSON.parse(stdout) as FxJson;
-        expect(json.output).toContain("Advisory cautions handled normally.");
+        expect(json.output).toContain(
+          "I couldn't continue because the required actions were blocked by automatic safety checks.",
+        );
         expect(json.tool_calls.filter((call) => call.status === "error")).toHaveLength(4);
         expect(json.tool_calls.filter((call) => call.status === "success")).toHaveLength(0);
-        expect(gateway.requests).toHaveLength(5);
+        expect(gateway.requests).toHaveLength(4);
         expect(gateway.classifierRequests).toHaveLength(4);
       } finally {
         if (session) await session.kill();
@@ -334,16 +326,17 @@ describe("generic permission typed errors", () => {
 
       for (const testCase of cases) {
         const root = createIsolatedRoot(
-          `fx-${testCase.mode}-${testCase.optIn ? "opt-in" : "default"}-non-tty-`,
+          `ffx-${testCase.mode}-${testCase.optIn ? "opt-in" : "default"}-non-tty-`,
         );
         const marker = join(root.workspace, "must-not-run.txt");
         writeFileSync(
-          join(root.home, ".fx", "settings.json"),
+          join(root.home, ".ffx", "settings.json"),
           JSON.stringify({ permission_mode: "ask", sandbox: "none" }),
         );
         const gateway = startFakeGateway([
-          fakeShellRun("non_tty_call", `touch ${JSON.stringify(marker)}`, {
-            timeout_ms: 600_000,
+          fakeGatewayToolCall("non_tty_call", "terminal", {
+            action: "exec",
+            command: `touch ${JSON.stringify(marker)}`,
           }),
         ]);
         try {

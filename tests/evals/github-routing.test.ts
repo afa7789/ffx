@@ -16,10 +16,12 @@ import {
 
 const TIMEOUT = 300_000;
 const LOCAL_FIRST_TOOLS = [
+  "list_files",
   "glob_files",
   "grep_files",
+  "semantic_search",
   "read_file",
-  "shell",
+  "terminal",
 ] as const;
 
 let workDir: string | null = null;
@@ -63,8 +65,8 @@ function seedV0ChangelogRepo(dir: string): void {
 }
 
 function seedFxHistoryRepo(dir: string): void {
-  seedGitRepo(dir, "https://github.com/vercel-labs/fx.git");
-  writeFileSync(join(dir, "README.md"), "# fx\n");
+  seedGitRepo(dir, "https://github.com/vercel-labs/ffx.git");
+  writeFileSync(join(dir, "README.md"), "# ffx\n");
   execSync("git add . && git commit -m initial", { cwd: dir, stdio: "pipe" });
 }
 
@@ -76,7 +78,7 @@ function assertNoWebSearchOrHandleQuestion(result: EvalResult): void {
 function assertFirstActionIsLocal(result: EvalResult): void {
   assertFirstToolIn(result, LOCAL_FIRST_TOOLS);
   const first = result.json.tool_calls[0];
-  if (first?.name === "shell") {
+  if (first?.name === "terminal") {
     expect(/^git\s+/.test(first.command_result?.command ?? "")).toBe(true);
   }
 }
@@ -111,7 +113,7 @@ describe("eval: GitHub and repo routing", () => {
       seedFxHistoryRepo(workDir);
 
       const result = await runEval(
-        "look for changes/last commits in the fx",
+        "look for changes/last commits in the ffx",
         {
           cwd: workDir,
           timeoutSec: 180,
@@ -130,7 +132,7 @@ describe("eval: GitHub and repo routing", () => {
     "routes non-matching GitHub URL metadata through gh before web_search",
     async () => {
       workDir = createWorkDir();
-      seedGitRepo(workDir, "https://github.com/vercel-labs/fx.git");
+      seedGitRepo(workDir, "https://github.com/vercel-labs/ffx.git");
 
       const result = await runEval(
         "For https://github.com/vercel/v0, use GitHub metadata to tell me how many open pull requests it currently has. Do not answer from the URL alone.",

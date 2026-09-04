@@ -1,5 +1,7 @@
 const std = @import("std");
+const background_runtime = @import("../background/background_runtime.zig");
 const change_tracker = @import("change_tracker.zig");
+const session_runtime = @import("../session/session.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("workspace_access.zig");
@@ -92,7 +94,7 @@ pub const ContextOmissionSummaryBuilder = struct {
     pub fn add(self: *ContextOmissionSummaryBuilder, source: []const u8, reason: OmissionReason) void {
         self.omitted_count += 1;
         self.reason_counts[@intFromEnum(reason)] += 1;
-        self.hasher.update("fx.context.omission-record\x00");
+        self.hasher.update("ffx.context.omission-record\x00");
         self.hasher.update(&.{@intFromEnum(reason)});
         hashUsize(&self.hasher, source.len);
         self.hasher.update(source);
@@ -102,7 +104,7 @@ pub const ContextOmissionSummaryBuilder = struct {
         if (summary.omitted_count == 0) return;
         self.omitted_count += summary.omitted_count;
         for (&self.reason_counts, summary.reason_counts) |*count, additional| count.* += additional;
-        self.hasher.update("fx.context.omission-summary\x00");
+        self.hasher.update("ffx.context.omission-summary\x00");
         hashUsize(&self.hasher, summary.omitted_count);
         for (summary.reason_counts) |count| hashUsize(&self.hasher, count);
         self.hasher.update(&summary.digest);
@@ -251,6 +253,8 @@ pub const TransientContextInput = struct {
     interactive: bool,
     permission_mode: types.PermissionMode,
     tracker: ?*change_tracker.ChangeTracker,
+    background: *background_runtime.BackgroundRuntime,
+    session: *session_runtime.SessionRuntime,
 };
 
 pub const Provider = struct {
@@ -275,22 +279,6 @@ pub const Provider = struct {
     pub fn appendTransient(self: Provider, input: TransientContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
         return self.append_transient_fn(input, alloc, messages);
     }
-};
-
-fn gather_empty_context(_: Allocator, _: InitialContextInput) ProviderError!ProviderContext {
-    return .{};
-}
-
-fn append_no_context(_: StaticContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
-
-fn append_no_transient_context(_: TransientContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
-
-pub const empty_provider = Provider{
-    .id = "core.empty_context",
-    .gather_project_context_fn = gather_empty_context,
-    .select_applicable_project_context_fn = selectNoApplicableProjectContext,
-    .append_static_fn = append_no_context,
-    .append_transient_fn = append_no_transient_context,
 };
 
 pub fn selectNoApplicableProjectContext(_: Allocator, _: LaterContextInput) ProviderError!ProviderContext {
@@ -382,7 +370,7 @@ fn appendDupedStrings(alloc: Allocator, destination: *std.ArrayList([]u8), strin
     }
 }
 
-pub const contract_name = "fx.shared_model_context.v1";
+pub const contract_name = "ffx.shared_model_context.v1";
 
 pub const Fragment = enum {
     workspace_identity,
@@ -427,7 +415,7 @@ pub const EntryPoint = enum {
     fn label(self: EntryPoint) []const u8 {
         return switch (self) {
             .interactive => "interactive",
-            .ask => "fx ask",
+            .ask => "ffx ask",
             .acp => "ACP",
             .subagent => "subagent",
         };
@@ -476,7 +464,7 @@ const current_inventory = [_]EntrypointInventory{
         .assembly_path = "main.App.enqueuePrompt -> app_agent_runtime.processQueuedPrompt -> agent_runtime dependencies",
         .static_context = "builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before enqueue, then adds scoped deltas from effective structured tool targets",
         .transient_context = "tool_runtime transient context each model step: env_context, captured permission mode, background runtime, non-live background history",
-        .tools = "App.snapshotModelToolProjection pairs full tool advertisement with included custom-provider guidance after permission and deferred MCP discovery",
+        .tools = "App.snapshotGatewayToolProjection pairs full tool advertisement with included custom-provider guidance after permission and deferred MCP discovery",
         .permission = "PermissionEngine mode, persistent rules, and session grants are enforced by interactive permission prompts",
         .session = "live SessionRuntime history plus persisted session/log/artifact stores when enabled",
         .drift_status = .intentional,
@@ -488,7 +476,7 @@ const current_inventory = [_]EntrypointInventory{
         .static_context = "builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before the prompt, then adds scoped deltas from effective structured tool targets",
         .transient_context = "tool_runtime transient context each model step with captured permission mode, noninteractive output callbacks, and no live user question path",
         .tools = "mode-filtered paired tool advertisement and included custom-provider guidance with permission rules and deferred MCP discovery",
-        .permission = "ask, --auto, or --yolo mode; approval-required actions fail with a noninteractive blocker instead of prompting unless yolo bypasses fx policy",
+        .permission = "ask, --auto, or --yolo mode; approval-required actions fail with a noninteractive blocker instead of prompting unless yolo bypasses Fx policy",
         .session = "fresh headless SessionRuntime, optional persisted session id, empty prior history, no local approval grants",
         .drift_status = .intentional,
         .drift = "noninteractive permission blockers and absent live clarification UI differ from interactive by design",
@@ -511,7 +499,7 @@ const current_inventory = [_]EntrypointInventory{
         .transient_context = "tool_runtime transient context each model step over the child SessionRuntime with noninteractive output callbacks and no live user question path",
         .tools = "identical to the launching surface's own gateway tool advertisement: permission-filtered builtins, deferred MCP discovery tools, and the subagent tool for nested children",
         .permission = "per-child ask/auto/yolo mode (new children default to yolo) resolves live host authority per action for tools, roots, integrations, rules, and grants, revalidating the retained action identity whenever the authority generation advances before the effect",
-        .session = "internal child session resumed for write by its saved parent, canonical child history restored from and committed back to that session, and persistent agent instructions plus model and effort from the parent's immutable profile snapshot",
+        .session = "ordinary child session resumed for write from the shared session store for one-off and persistent children, canonical child history restored from and committed back to that session, and per-child model and effort from the stored child configuration",
         .drift_status = .intentional,
         .drift = "separate child session and history, noninteractive child callbacks, approvals projected to the parent and human surfaces, and bounded parent/child delivery instead of transcript merging",
     },
@@ -560,7 +548,7 @@ pub fn writeEntrypointLayoutSnapshot(writer: *std.Io.Writer) !void {
         \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
         \\  user_prompt_position: after stable system context and history
         \\  intentional_difference: live terminal approvals and clarification UI
-        \\- entrypoint: fx ask
+        \\- entrypoint: ffx ask
         \\  static_context_refresh: one applicable snapshot before the prompt; scoped deltas attach before affected tool execution
         \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog, optional_prepared_parent_turn_delivery_context
         \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
@@ -640,7 +628,7 @@ test "minimum shared model context contract snapshot" {
     defer std.testing.allocator.free(snapshot);
 
     try std.testing.expectEqualStrings(
-        \\contract: fx.shared_model_context.v1
+        \\contract: ffx.shared_model_context.v1
         \\required_fragments:
         \\- workspace_identity: workspace root and current directory
         \\- repo_identity: git branch, worktree state, and sanitized GitHub origin when known
@@ -660,23 +648,23 @@ test "entrypoint context inventory snapshot documents current deltas" {
     defer std.testing.allocator.free(snapshot);
 
     try std.testing.expectEqualStrings(
-        \\contract: fx.shared_model_context.v1
+        \\contract: ffx.shared_model_context.v1
         \\entrypoints:
         \\- entrypoint: interactive
         \\  assembly_path: main.App.enqueuePrompt -> app_agent_runtime.processQueuedPrompt -> agent_runtime dependencies
         \\  static_context: builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before enqueue, then adds scoped deltas from effective structured tool targets
         \\  transient_context: tool_runtime transient context each model step: env_context, captured permission mode, background runtime, non-live background history
-        \\  tools: App.snapshotModelToolProjection pairs full tool advertisement with included custom-provider guidance after permission and deferred MCP discovery
+        \\  tools: App.snapshotGatewayToolProjection pairs full tool advertisement with included custom-provider guidance after permission and deferred MCP discovery
         \\  permission: PermissionEngine mode, persistent rules, and session grants are enforced by interactive permission prompts
         \\  session: live SessionRuntime history plus persisted session/log/artifact stores when enabled
         \\  drift_status: intentional
         \\  drift: live terminal approvals, clarification UI, and full interactive tool surface differ from headless entrypoints by design
-        \\- entrypoint: fx ask
+        \\- entrypoint: ffx ask
         \\  assembly_path: cli_ask.runPromptInternal -> agent_runtime dependencies
         \\  static_context: builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before the prompt, then adds scoped deltas from effective structured tool targets
         \\  transient_context: tool_runtime transient context each model step with captured permission mode, noninteractive output callbacks, and no live user question path
         \\  tools: mode-filtered paired tool advertisement and included custom-provider guidance with permission rules and deferred MCP discovery
-        \\  permission: ask, --auto, or --yolo mode; approval-required actions fail with a noninteractive blocker instead of prompting unless yolo bypasses fx policy
+        \\  permission: ask, --auto, or --yolo mode; approval-required actions fail with a noninteractive blocker instead of prompting unless yolo bypasses Fx policy
         \\  session: fresh headless SessionRuntime, optional persisted session id, empty prior history, no local approval grants
         \\  drift_status: intentional
         \\  drift: noninteractive permission blockers and absent live clarification UI differ from interactive by design
@@ -695,7 +683,7 @@ test "entrypoint context inventory snapshot documents current deltas" {
         \\  transient_context: tool_runtime transient context each model step over the child SessionRuntime with noninteractive output callbacks and no live user question path
         \\  tools: identical to the launching surface's own gateway tool advertisement: permission-filtered builtins, deferred MCP discovery tools, and the subagent tool for nested children
         \\  permission: per-child ask/auto/yolo mode (new children default to yolo) resolves live host authority per action for tools, roots, integrations, rules, and grants, revalidating the retained action identity whenever the authority generation advances before the effect
-        \\  session: internal child session resumed for write by its saved parent, canonical child history restored from and committed back to that session, and persistent agent instructions plus model and effort from the parent's immutable profile snapshot
+        \\  session: ordinary child session resumed for write from the shared session store for one-off and persistent children, canonical child history restored from and committed back to that session, and per-child model and effort from the stored child configuration
         \\  drift_status: intentional
         \\  drift: separate child session and history, noninteractive child callbacks, approvals projected to the parent and human surfaces, and bounded parent/child delivery instead of transcript merging
         \\
@@ -709,7 +697,7 @@ test "entrypoint model-visible layout snapshot covers major entrypoints" {
     defer std.testing.allocator.free(snapshot);
 
     try std.testing.expectEqualStrings(
-        \\contract: fx.shared_model_context.v1
+        \\contract: ffx.shared_model_context.v1
         \\model_visible_layout:
         \\- entrypoint: interactive
         \\  static_context_refresh: one applicable snapshot before enqueue; scoped deltas attach before affected tool execution
@@ -718,7 +706,7 @@ test "entrypoint model-visible layout snapshot covers major entrypoints" {
         \\  per_step_overlay_order: explicit_skill_chunks, transient_runtime_context
         \\  user_prompt_position: after stable system context and history
         \\  intentional_difference: live terminal approvals and clarification UI
-        \\- entrypoint: fx ask
+        \\- entrypoint: ffx ask
         \\  static_context_refresh: one applicable snapshot before the prompt; scoped deltas attach before affected tool execution
         \\  stable_prefix_initial_order: system_prompt, effective_custom_tool_guidance, visible_skills, optional_model_prompt_overlay, optional_interruption_or_resume_intent_context, shared_project_context, mcp_server_catalog, optional_prepared_parent_turn_delivery_context
         \\  stable_prefix_later_additions: applicable_project_context_deltas committed mid-turn when a tool batch has applicable targets
@@ -774,6 +762,10 @@ test "context registry routes the default provider" {
     defer snapshot.deinit(alloc);
     const contribution = snapshot.contribution orelse return error.TestExpectedEqual;
 
+    var background: background_runtime.BackgroundRuntime = .{};
+    defer background.deinit(alloc);
+    var session: session_runtime.SessionRuntime = .{ .max_history_turns = 4 };
+    defer session.deinit(alloc);
     var tracker: change_tracker.ChangeTracker = .{};
     defer tracker.deinit(alloc);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -788,6 +780,8 @@ test "context registry routes the default provider" {
         .interactive = true,
         .permission_mode = .ask,
         .tracker = &tracker,
+        .background = &background,
+        .session = &session,
     }, arena, &messages);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);

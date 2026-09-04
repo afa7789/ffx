@@ -20,11 +20,14 @@ try {
       const agent = await createFxAgent({
         nativeAddon: workerData.addonPath,
         backend: "native",
-        apiKey: "worker-termination-key",
-        gatewayChatUrl: workerData.gatewayUrl,
-        model: "native/test-model",
+        env: {
+          AI_GATEWAY_API_KEY: "worker-termination-key",
+          FX_GATEWAY_CHAT_URL: workerData.gatewayUrl,
+          FX_MODEL: "native/test-model",
+        },
       });
-      agent.prompt("stall during worker termination");
+      const session = await agent.createSession();
+      session.prompt("stall during worker termination");
       parentPort.postMessage("started");
     })().catch((error) => { throw error; });
   `, {

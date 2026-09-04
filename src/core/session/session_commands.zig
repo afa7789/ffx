@@ -169,15 +169,12 @@ fn appendShadowedUserSources(
     sources: config_runtime.ConfigSources,
 ) !void {
     var wrote_header = false;
-    const model_source = if (patch.model_preference) |preference|
-        sources.models.get(preference.provider)
-    else
-        .compiled_default;
-    try appendShadowedUserSource(writer, "model", patch.model_preference != null, model_source, &wrote_header);
+    try appendShadowedUserSource(writer, "model", patch.model != null, sources.model, &wrote_header);
     try appendShadowedUserSource(writer, "permission_mode", patch.permission_mode != null, sources.permission_mode, &wrote_header);
     try appendShadowedUserSource(writer, "effort", patch.effort != null, sources.effort, &wrote_header);
     try appendShadowedUserSource(writer, "fast_mode", patch.fast_mode != null, sources.fast_mode, &wrote_header);
     try appendShadowedUserSource(writer, "startup_scrollback", patch.startup_scrollback != null, sources.startup_scrollback, &wrote_header);
+    try appendShadowedUserSource(writer, "input_appearance", patch.input_appearance != null, sources.input_appearance, &wrote_header);
     try appendShadowedUserSource(writer, "prompt_history", patch.prompt_history_enabled != null, sources.prompt_history_enabled, &wrote_header);
     if (patch.statusline_item) |item| {
         const source: ?config_runtime.ConfigSource = switch (item.item) {
@@ -342,6 +339,37 @@ pub fn Commands(comptime App: type) type {
             const resolved = try resolveModelQuery(app, query);
             defer app.alloc.free(resolved);
             try setResolvedModel(app, resolved, true);
+        }
+
+        /// Show the active direct provider's model catalogue as a notice.
+        /// Returns true when the notice was printed (caller should skip the
+        /// legacy Vercel menu); false when no direct provider is active.
+        pub fn handleDirectProviderModels(app: *App) bool {
+            const builtin_providers = @import("../../builtins/providers.zig");
+            const source = app.auth.credentialSource() orelse return false;
+            if (source != .env_var) return false;
+            const id = io_mod.getenv("FFX_ACTIVE_PROVIDER") orelse return false;
+            const provider = builtin_providers.byId(id) orelse return false;
+            const key = io_mod.getenv(provider.env_var) orelse return false;
+            const base_url = io_mod.getenv("FFX_PROVIDER_BASE_URL") orelse provider.default_base_url;
+            const ids = builtin_providers.fetchModels(app.alloc, provider, key, base_url) catch
+                return false;
+            defer {
+                for (ids) |id_owned| app.alloc.free(id_owned);
+                app.alloc.free(ids);
+            }
+            if (ids.len == 0) return false;
+            var out: std.Io.Writer.Allocating = .init(app.alloc);
+            defer out.deinit();
+            out.writer.print("Models from {s} ({s}):\n", .{ provider.display_name, base_url }) catch
+                return false;
+            for (ids, 0..) |mid, i| {
+                out.writer.print("  {d}. {s}\n", .{ i + 1, mid }) catch continue;
+            }
+            const body = out.written();
+            app.writeDomainNotice(.{ .topic = "models", .tone = .neutral, .body = body }, true) catch
+                return false;
+            return true;
         }
 
         pub fn handlePermissions(app: *App, rest: []const u8) !void {
@@ -723,11 +751,7 @@ pub fn Commands(comptime App: type) type {
             if (persist) {
                 try persistPreferenceTargets(
                     app,
-                    .{
-                        .provider = provider_runtime.provider(app),
-                        .model = provider_runtime.model(app),
-                        .fast_mode = app.fast_mode,
-                    },
+                    .{ .fast_mode = app.fast_mode },
                     "fast",
                     !announce,
                 );
@@ -771,15 +795,19 @@ pub fn Commands(comptime App: type) type {
                 .model = model,
             };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
-            if (capabilities.reasoning_efforts.len > 0) {
+            if (capabilities.reasoning_efforts.len == 0) {
+                if (capabilities.supports_fast_mode) {
+                    try applyFastMode(app, fast_mode, false, false);
+                    patch.fast_mode = fast_mode;
+                }
+            } else {
                 try applyEffort(app, effort, false, false);
                 patch.effort = effort;
+                if (capabilities.supports_fast_mode) {
+                    try applyFastMode(app, fast_mode, false, false);
+                    patch.fast_mode = fast_mode;
+                }
             }
-            const selected_fast_mode = capabilities.supports_fast_mode and fast_mode;
-            if (selected_fast_mode != app.fast_mode) {
-                try applyFastMode(app, selected_fast_mode, false, false);
-            }
-            patch.fast_mode = selected_fast_mode;
             try persistPreferenceTargets(app, patch, "model picker", false);
         }
 
@@ -932,7 +960,7 @@ pub fn Commands(comptime App: type) type {
             const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
             const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
                 provider_runtime.model(app),
-                @tagName(detailed.sources.models.get(.gateway)),
+                @tagName(detailed.sources.model),
                 permissions.permissionModeLabel(app.permission_engine.mode),
                 app.workspace_root,
                 app.agent_step_limit,
@@ -1014,6 +1042,15 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn resolveModelQuery(app: *App, query: []const u8) ![]u8 {
+            // 1. Direct-provider active: hit the upstream `/v1/models`
+            //    so fuzzy matches land against the real catalogue
+            //    (MiniMax-M3, big-pickle, gpt-4o-mini,...) instead of
+            //    the legacy Vercel cache.
+            if (try resolveProviderModelQuery(app, query)) |resolved| {
+                return resolved;
+            }
+
+            // 2. Otherwise ask the Vercel cache snapshotted by app.
             if (try app.snapshotCachedModelIds(app.alloc)) |snapshot| {
                 var ids = snapshot;
                 defer freeStringList(app.alloc, &ids);
@@ -1022,6 +1059,7 @@ pub fn Commands(comptime App: type) type {
                 }
             }
 
+            // 3. Fallback to a fresh fetch through the agent runtime.
             var ids = fetchModelIds(app) catch {
                 return app.alloc.dupe(u8, query);
             };
@@ -1034,18 +1072,40 @@ pub fn Commands(comptime App: type) type {
             return app.alloc.dupe(u8, query);
         }
 
-        fn setResolvedModel(app: *App, resolved: []const u8, announce: bool) !void {
-            const model_changed = !std.mem.eql(u8, provider_runtime.model(app), resolved);
-            try setResolvedModelRuntime(app, resolved, announce);
-            if (model_changed and app.fast_mode) {
-                try applyFastMode(app, false, false, false);
+        fn resolveProviderModelQuery(app: *App, query: []const u8) !?[]u8 {
+            const builtin_providers = @import("../../builtins/providers.zig");
+            const source = app.auth.credentialSource() orelse {
+                debug_trace.logf("model", "resolveProviderModelQuery: no credential source", .{});
+                return null;
+            };
+            if (source != .env_var) {
+                debug_trace.logf("model", "resolveProviderModelQuery: source={t} not direct_provider", .{source});
+                return null;
             }
+            const id = io_mod.getenv("FFX_ACTIVE_PROVIDER") orelse return null;
+            const provider = builtin_providers.byId(id) orelse return null;
+            const key = io_mod.getenv(provider.env_var) orelse return null;
+            const base_url = io_mod.getenv("FFX_PROVIDER_BASE_URL") orelse provider.default_base_url;
+            const ids = builtin_providers.fetchModels(app.alloc, provider, key, base_url) catch
+                return null;
+            defer {
+                for (ids) |id_owned| app.alloc.free(id_owned);
+                app.alloc.free(ids);
+            }
+            if (ids.len == 0) return null;
+            if (try resolveModelQueryFromIds(app.alloc, ids, query)) |resolved| {
+                return resolved;
+            }
+            return null;
+        }
+
+        fn setResolvedModel(app: *App, resolved: []const u8, announce: bool) !void {
+            try setResolvedModelRuntime(app, resolved, announce);
             try persistPreferenceTargets(
                 app,
                 .{
                     .provider = provider_runtime.provider(app),
                     .model = resolved,
-                    .fast_mode = app.fast_mode,
                 },
                 "model",
                 !announce,
@@ -1244,10 +1304,17 @@ fn isKnownAllowlistTool(tool_registry: tool_dispatch.Registry, name: []const u8)
 
     const categories = [_][]const u8{
         "edit",
+        "create_folder",
+        "open_file",
+        "rename_file",
+        "copy_file",
         "read",
+        "list",
         "glob",
         "grep",
         "skill",
+        "memory",
+        "semantic_search",
         permissions.web_search_permission,
     };
     for (categories) |category| {
@@ -1410,7 +1477,12 @@ fn writeAllowlistPattern(writer: *std.Io.Writer, group: AllowlistRuleGroup, patt
 fn isWorkspacePathToolPermission(permission: []const u8) bool {
     const path_permissions = [_][]const u8{
         "edit",
+        "create_folder",
+        "open_file",
+        "rename_file",
+        "copy_file",
         "read",
+        "list",
         "glob",
         "grep",
     };
@@ -1987,9 +2059,9 @@ test "session_commands handleSettings shows startup scrollback status" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"startup_scrollback\":false}");
+    try writeFixtureFile(tmp.dir, "home/.ffx/settings.json", "{\"startup_scrollback\":false}");
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
@@ -2060,7 +2132,7 @@ test "session_commands startup scrollback ignores project profile-only shadowing
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     try writeFixtureFile(
         tmp.dir,
-        "workspace/.fx.json",
+        "workspace/.ffx.json",
         "{\"startup_scrollback\":true}\n",
     );
     const home_root = try io_mod.dirRealpathAlloc(
@@ -2463,7 +2535,7 @@ test "session_commands allowlist view reports unsafe settings without returning 
     try tmp.dir.createDirPath(io_mod.getIo(), "home");
     try tmp.dir.createDirPath(io_mod.getIo(), "outside");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    tmp.dir.symLink(io_mod.getIo(), "../outside", "home/.fx", .{
+    tmp.dir.symLink(io_mod.getIo(), "../outside", "home/.ffx", .{
         .is_directory = true,
     }) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
@@ -2619,28 +2691,27 @@ test "session_commands handleAllowlist recognizes tools from the active registry
     defer home.deinit();
 
     const provider_tool = blk: {
-        var tool = builtin_tools.read_file;
-        tool.name = "provider_custom";
+        var tool = builtin_tools.memory;
+        tool.name = "provider_memory";
         break :blk tool;
     };
     var app = try FakeApp.init(std.testing.allocator, workspace_root, "test-model");
     defer app.deinit();
     app.tool_registry = .{ .tools = &.{provider_tool} };
 
-    try Commands(FakeApp).handleAllowlist(&app, "add tool provider_custom");
-    try expectTranscriptContains(&app, "● Allowlist: added tool provider_custom: \"*\"");
+    try Commands(FakeApp).handleAllowlist(&app, "add tool provider_memory");
+    try expectTranscriptContains(&app, "● Allowlist: added tool provider_memory: \"*\"");
 
     var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), settings.permission_rules.rules.len);
-    try expectRule(settings.permission_rules.rules[0], "provider_custom", "*", .allow);
+    try expectRule(settings.permission_rules.rules[0], "provider_memory", "*", .allow);
 
     app.tool_registry = .{};
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "remove tool provider_custom");
+    try Commands(FakeApp).handleAllowlist(&app, "remove tool provider_memory");
     try expectTranscriptContains(&app, "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>");
     try std.testing.expect(parseAllowlistTarget(.{}, "tool read") != null);
-    try std.testing.expect(parseAllowlistTarget(.{}, "tool memory") == null);
 }
 
 test "session_commands toggleFast reports unsupported model and redraws footer" {
@@ -2773,29 +2844,7 @@ test "session_commands selectModelFromPicker persists portable Gateway reasoning
     try std.testing.expectEqual(@as(?types.ReasoningEffort, types.ReasoningEffort.literal("low")), app.worker.synced_effort);
     try std.testing.expectEqual(@as(usize, 1), app.worker.effort_sync_count);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.last_preference_effort.?);
-    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
-}
-
-test "session_commands model selection clears fast mode when the selected model has no fast control" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
-    defer app.deinit();
-    app.fast_mode = true;
-    app.worker.synced_fast_mode = true;
-    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("max")};
-    app.setGatewayControls("zai/glm-5.3", &efforts, false);
-
-    try Commands(FakeApp).selectModelFromPicker(
-        &app,
-        "zai/glm-5.3",
-        types.ReasoningEffort.literal("max"),
-        true,
-    );
-
-    try std.testing.expectEqualStrings("zai/glm-5.3", app.selected_model.items);
-    try std.testing.expect(!app.fast_mode);
-    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
-    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
+    try std.testing.expect(app.last_preference_fast_mode == null);
 }
 
 test "session_commands selectModelFromPicker syncs queued fast mode and effort for supported models" {
@@ -2878,7 +2927,7 @@ test "session_commands user save notice uses one post-commit load after legacy c
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -2890,8 +2939,8 @@ test "session_commands user save notice uses one post-commit load after legacy c
         .{workspace_root},
     );
     defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
-    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"model\":\"project/model\"}\n");
+    try writeFixtureFile(tmp.dir, "home/.ffx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "workspace/.ffx.json", "{\"model\":\"project/model\"}\n");
 
     const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
     defer home.deinit();
@@ -2912,7 +2961,7 @@ test "session_commands durable user save survives post-commit resolver failure" 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -2924,7 +2973,7 @@ test "session_commands durable user save survives post-commit resolver failure" 
         .{workspace_root},
     );
     defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "home/.ffx/settings.json", fixture);
 
     const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
     defer home.deinit();
@@ -2946,14 +2995,14 @@ test "session_commands durable user save survives post-commit resolver failure" 
         workspace_root,
     );
     defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("user/new", settings.models.get(.gateway).?);
+    try std.testing.expectEqualStrings("user/new", settings.model.?);
 }
 
 test "session_commands durable user save survives post-commit resolver diagnostic" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -2996,7 +3045,7 @@ test "session_commands allowlist durable save survives post-commit resolver diag
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -3084,7 +3133,7 @@ test "session_commands no-op model still attempts its durable targets" {
     );
 }
 
-test "session_commands model controls remain catalog validated and clear unsupported fast state" {
+test "session_commands model controls remain catalog validated" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3105,9 +3154,9 @@ test "session_commands model controls remain catalog validated and clear unsuppo
 
     try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), false);
 
-    try std.testing.expect(!app.fast_mode);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
-    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
+    try std.testing.expect(app.fast_mode);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.fast_sync_count);
+    try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
     const unsupported_options = model_capabilities.resolveProviderOptionsForCapabilities(
         app.resolvedModelCapabilities(app.selected_model.items),
         app.effort,
@@ -3126,7 +3175,7 @@ test "session_commands model controls remain catalog validated and clear unsuppo
     try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true);
 
     try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
-    try std.testing.expectEqual(@as(usize, 2), app.worker.fast_sync_count);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
     const supported_options = model_capabilities.resolveProviderOptionsForCapabilities(
         app.resolvedModelCapabilities(app.selected_model.items),
         app.effort,

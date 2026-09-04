@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FFX_BIN } from "../evals/eval-helpers";
 import {
   assertPaneContains,
   assertSingleFooter,
@@ -49,21 +49,21 @@ async function launch(
   width: number,
   height: number,
 ): Promise<{ session: TmuxSession; tracePath: string }> {
-  const workDir = mkdtempSync(join(tmpdir(), `fx-render-stress-${run}-`));
+  const workDir = mkdtempSync(join(tmpdir(), `ffx-render-stress-${run}-`));
   workDirs.push(workDir);
   const home = join(workDir, "home");
   mkdirSync(home);
   const tracePath = join(workDir, "trace.log");
 
   const s = await TmuxSession.create({
-    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN}`,
+    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FFX_DISABLE_KEYCHAIN=1 FFX_SKIP_ONBOARDING=1 ${FFX_BIN}`,
     cwd: workDir,
     width,
     height,
     env: {
       HOME: home,
-      FX_TRACE_LOG: tracePath,
-      FX_TRACE_SCOPES: TRACE_SCOPES,
+      FFX_TRACE_LOG: tracePath,
+      FFX_TRACE_SCOPES: TRACE_SCOPES,
     },
   });
   await s.waitForComposer(10_000);
@@ -99,7 +99,7 @@ describe.skipIf(SKIP)("tui: render stress", () => {
 
         const firstPrompt = `visible_user_prompt_${run}`;
         await session.sendText(firstPrompt);
-        await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
+        await session.waitForText("Fx needs access to Vercel AI Gateway", 5_000);
 
         const tailToken = `tail_${run}_visibl`;
         await session.sendKeys(`-l '${longInput(run)}'`);
@@ -114,22 +114,21 @@ describe.skipIf(SKIP)("tui: render stress", () => {
 
         await session.sendKeys("C-u");
         await session.sendText("/help");
-        await session.waitForText("Commands 35", 5_000);
+        await session.waitForText("Commands 38", 5_000);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("Enter Open"), 5_000);
         await session.sendText("/status");
         await session.waitForText("permission_mode", 5_000);
         const unknownCommand = `/unknown-render-stress-${run} local transcript notice`;
         await session.sendLiteralText(unknownCommand);
+        await session.waitForText("no matching slash commands", 5_000);
+        await session.sendKeys("Escape");
         await session.waitForPane(
-          (pane) => composerContains(pane, unknownCommand),
+          (pane) =>
+            composerContains(pane, unknownCommand) &&
+            !pane.includes("no matching slash commands"),
           5_000,
         );
-        await Bun.sleep(100);
-        const unmatchedPane = await session.capturePane();
-        if (unmatchedPane.includes("no matching slash commands")) {
-          failures.push(`run ${run}: unmatched slash input kept an empty picker row`);
-        }
         await session.sendKeys("C-u");
         await session.waitForPane(hasEmptyComposer, 5_000);
 

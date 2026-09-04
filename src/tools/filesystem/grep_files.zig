@@ -91,11 +91,7 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
 
     const owned_pattern = try ctx.allocator.dupe(u8, pattern_value.string);
     errdefer ctx.allocator.free(owned_pattern);
-    const effective_path = if (path_string) |path|
-        if (path.len == 0) "." else path
-    else
-        ".";
-    const owned_path = try ctx.allocator.dupe(u8, effective_path);
+    const owned_path = try ctx.allocator.dupe(u8, path_string orelse ".");
     errdefer ctx.allocator.free(owned_path);
     const owned_include = if (include_string) |value| try ctx.allocator.dupe(u8, value) else null;
     errdefer if (owned_include) |include| ctx.allocator.free(include);
@@ -555,7 +551,7 @@ fn noopInputDeinit(_: *anyopaque, _: Allocator) void {}
 const grep_files_dispatch_tool = tool_dispatch.Tool{
     .name = "grep_files",
     .description = "Grep files dispatch test fixture.",
-    .model_schema = .{
+    .gateway_schema = .{
         .name = "grep_files",
         .description = "Grep files dispatch test fixture.",
     },
@@ -830,7 +826,6 @@ test "grep_files validate preserves active raw pattern and path values" {
 
 test "grep_files decodes defaults and all fields" {
     try expectDecodeInput("{\"pattern\":\"needle\"}", "needle", ".", null, false, output_cap, 0);
-    try expectDecodeInput("{\"pattern\":\"needle\",\"path\":\"\"}", "needle", ".", null, false, output_cap, 0);
     try expectDecodeInput(
         "{\"pattern\":\"needle\",\"path\":\"src\",\"include\":\"*.zig\",\"case_insensitive\":true,\"head_limit\":5,\"offset\":2}",
         "needle",
@@ -930,7 +925,7 @@ test "grep_files reports stat failures after root resolution" {
 
 test "grep_files access denial returns structured recovery" {
     const alloc = std.testing.allocator;
-    const root = try std.fmt.allocPrint(alloc, "/tmp/fx-grep-files-access-{d}", .{io_mod.nanoTimestamp()});
+    const root = try std.fmt.allocPrint(alloc, "/tmp/ffx-grep-files-access-{d}", .{io_mod.nanoTimestamp()});
     defer alloc.free(root);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), root) catch {};
     try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), root);
