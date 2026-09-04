@@ -42,6 +42,12 @@ ffx
 
 The current registry includes OpenAI, Anthropic, DeepSeek, Z.AI, Alibaba Cloud, OpenRouter, MiniMax, Zhipu, and OpenCode Go. Use `ffx login <provider>` to connect or replace a provider key. Use `/login` during an active session to reconnect or switch without discarding the conversation.
 
+Hermes Agent is not registered as a provider because its official integration
+is a client for configurable OpenAI-compatible endpoints, not a single LLM
+inference service. Use `FFX_PROVIDER_API_KEY` and `FFX_PROVIDER_BASE_URL` for a
+Hermes-compatible endpoint; the separate Hermes listing API is not an LLM
+provider.
+
 ```bash
 ffx login deepseek
 ffx
