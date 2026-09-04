@@ -220,7 +220,9 @@ pub fn Runtime(comptime App: type) type {
                 startup.stored_key_status,
                 startup.credential_onboarding_skipped,
             );
-            // Credential onboarding removed - user requested offline mode
+            if (app.auth.credentialSource() == null and !startup.credential_onboarding_skipped) {
+                app.auth.openOnboardingPicker(app.alloc);
+            }
             _ = app.auth.view();
             if (comptime @hasField(App, "terminal_input_runtime") and @hasField(App, "terminal")) {
                 // Own theme protocol bytes even under FFX_THEME; probing stays gated.

@@ -185,6 +185,14 @@ pub fn capturedInvocation(environment_value: Environment, command: []const u8) R
                 removeInteractiveFlag(&invocation);
                 invocation.append("-O");
                 invocation.append("expand_aliases");
+            } else if (std.mem.eql(u8, std.fs.path.basename(path), "zsh")) {
+                // Keep the user's login environment while skipping global
+                // zsh hooks that can write terminal-session notices into the
+                // command's captured stdout or stderr.
+                invocation.values[invocation.len] = "-d";
+                std.mem.copyBackwards([]const u8, invocation.values[2 .. invocation.len + 1], invocation.values[1..invocation.len]);
+                invocation.values[1] = "-d";
+                invocation.len += 1;
             }
             invocation.setCommand(command);
             return invocation;
@@ -398,7 +406,7 @@ test "captured profiles use exact non-PTY argv" {
     const zsh_user = try capturedInvocation(.{ .user = "/bin/zsh" }, "printf user");
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "/bin/zsh", "-l", "-i", "-c", "printf user" },
+        &.{ "/bin/zsh", "-d", "-l", "-i", "-c", "printf user" },
         zsh_user.argv(),
     );
 }

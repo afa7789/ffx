@@ -1596,7 +1596,6 @@ test "auth onboarding composes the welcome copy and setup choices" {
     try std.testing.expect(std.mem.find(u8, screen.items, "You can change this anytime with /setup.") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: ffx is experimental and defaults to auto mode. \x1b]8;id=ffx-onboarding;https://ffx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Connect a provider") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Esc to set up later · Explore all commands with /help") != null);
 
@@ -1610,7 +1609,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
 
     var selected_row = try composeAuthPickerRow(alloc, view, 8, authPickerRowCount(view), 100);
     defer selected_row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, selected_row.items, "› Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, selected_row.items, "› Connect a provider") != null);
 
     var chatgpt_row = try composeAuthPickerRow(alloc, view, 9, authPickerRowCount(view), 100);
     defer chatgpt_row.deinit(alloc);
@@ -1636,7 +1635,6 @@ test "auth onboarding composes the welcome copy and setup choices" {
         try compact_screen.appendSlice(alloc, row.items);
         try compact_screen.append(alloc, '\n');
     }
-    try std.testing.expect(std.mem.find(u8, compact_screen.items, "Sign in with Vercel") != null);
     try std.testing.expect(std.mem.find(u8, compact_screen.items, "Connect a provider") != null);
     try std.testing.expect(std.mem.find(u8, compact_screen.items, "Sign in with Codex") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Grok") != null);
@@ -1660,7 +1658,7 @@ test "auth picker composes only detected credential sources" {
 
     var sign_in = try composeAuthPickerRow(alloc, view, 1, row_count, 80);
     defer sign_in.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, sign_in.items, "Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, sign_in.items, "Connect a provider") != null);
 
     var chatgpt = try composeAuthPickerRow(alloc, view, 2, row_count, 80);
     defer chatgpt.deinit(alloc);
@@ -1672,7 +1670,7 @@ test "auth picker composes only detected credential sources" {
 
     var setup = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
     defer setup.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, setup.items, "API key") != null);
+    try std.testing.expect(std.mem.find(u8, setup.items, "Reconnect provider") != null);
 
     var switch_provider = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
     defer switch_provider.deinit(alloc);
