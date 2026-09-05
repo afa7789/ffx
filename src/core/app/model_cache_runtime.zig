@@ -34,6 +34,101 @@ const CatalogOutcome = struct {
     last_failure: ?model_catalog.FailedOutcome = null,
 };
 
+/// A catalog endpoint that participates in the aggregate model cache.
+/// `provider_name` is copied into model ids that are returned without a
+/// provider prefix, so selecting a model remains unambiguous across sources.
+pub const CatalogSource = struct {
+    provider_name: []const u8,
+    provider: model_catalog.Provider,
+    access: credentials.CatalogAccess = .{ .public_only = .no_credential },
+    endpoint: []const u8,
+};
+
+pub const MergedCatalog = struct {
+    catalog: std.ArrayList(model_catalog.ModelCatalogEntry),
+    failed_count: usize = 0,
+    last_failure: ?model_catalog.FailedOutcome = null,
+
+    pub fn deinit(self: *MergedCatalog, alloc: Allocator) void {
+        model_catalog.freeModelCatalog(alloc, &self.catalog);
+        self.* = undefined;
+    }
+};
+
+/// Fetch all configured catalog sources. One unavailable provider does not
+/// hide models returned by the other providers. The caller owns the returned
+/// catalog and must call `MergedCatalog.deinit`.
+pub fn fetchAndMergeCatalogs(alloc: Allocator, sources: []const CatalogSource) !MergedCatalog {
+    var merged: MergedCatalog = .{ .catalog = .empty };
+    errdefer merged.deinit(alloc);
+
+    for (sources) |source| {
+        const result = model_catalog.fetchWithPublicFallback(source.provider, alloc, .{
+            .access = source.access,
+            .endpoint = source.endpoint,
+            .view = .picker,
+        });
+        switch (result) {
+            .failed => |failure| {
+                merged.failed_count += 1;
+                merged.last_failure = failure;
+            },
+            .loaded => |loaded| {
+                var catalog = loaded.catalog;
+                defer model_catalog.freeModelCatalog(alloc, &catalog);
+                for (catalog.items) |*entry| {
+                    if (std.mem.indexOfScalar(u8, entry.id, '/') == null and source.provider_name.len > 0) {
+                        const qualified = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source.provider_name, entry.id });
+                        alloc.free(entry.id);
+                        entry.id = qualified;
+                    }
+                    var duplicate = false;
+                    for (merged.catalog.items) |existing| {
+                        if (std.mem.eql(u8, existing.id, entry.id)) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (duplicate) continue;
+                    const cloned = try model_catalog.cloneForCache(alloc, entry.*);
+                    merged.catalog.append(alloc, cloned) catch |err| {
+                        model_catalog.freeModelCatalogEntry(alloc, cloned);
+                        return err;
+                    };
+                }
+            },
+        }
+    }
+    return merged;
+}
+
+test "merged model catalogs preserve provider identity and tolerate partial failure" {
+    const Fake = struct {
+        fn fetch(raw: ?*anyopaque, alloc: Allocator, _: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+            const mode: *const bool = @ptrCast(@alignCast(raw.?));
+            if (mode.*) return .{ .failure = .{ .category = .transport, .retryable = true } };
+            var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+            errdefer model_catalog.freeModelCatalog(alloc, &entries);
+            try entries.append(alloc, .{
+                .id = try alloc.dupe(u8, "shared-model"),
+                .model_type = try alloc.dupe(u8, "language"),
+            });
+            return .{ .catalog = entries };
+        }
+    };
+    var failed = true;
+    var working = false;
+    const sources = [_]CatalogSource{
+        .{ .provider_name = "broken", .provider = .{ .context = &failed, .fetch_fn = Fake.fetch }, .endpoint = "/v1/models" },
+        .{ .provider_name = "local", .provider = .{ .context = &working, .fetch_fn = Fake.fetch }, .endpoint = "/v1/models" },
+    };
+    var merged = try fetchAndMergeCatalogs(std.testing.allocator, &sources);
+    defer merged.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), merged.failed_count);
+    try std.testing.expectEqual(@as(usize, 1), merged.catalog.items.len);
+    try std.testing.expectEqualStrings("local/shared-model", merged.catalog.items[0].id);
+}
+
 const OwnedCatalogAccess = struct {
     access: credentials.CatalogAccess,
 

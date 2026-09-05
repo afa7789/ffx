@@ -356,6 +356,11 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
     return cloned;
 }
 
+/// Clone an entry for a cache owned by another runtime.
+pub fn cloneForCache(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !ModelCatalogEntry {
+    return cloneModelCatalogEntry(alloc, entry);
+}
+
 pub fn compareModelCatalogEntries(_: void, a: ModelCatalogEntry, b: ModelCatalogEntry) bool {
     if (a.has_tool_use != b.has_tool_use) return a.has_tool_use;
 
