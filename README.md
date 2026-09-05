@@ -88,8 +88,7 @@ install -m 755 ./zig-out/bin/ffx "$(command -v ffx)"
 ```
 
 If the path does not exist, create its directory first or adjust the
-destination. In this development environment, the installed binary is
-`/Users/afa/bin/ffx`.
+destination. A new installation uses `~/.ffx/bin/ffx` by default.
 
 ## Usage
 
@@ -114,6 +113,7 @@ workspace. Sessions and configuration live under `~/.ffx/`.
 | `ffx logout [provider]` | Remove a provider session |
 | `ffx setup` | Configure a provider API key |
 | `ffx provider <id>` | Select the active provider |
+| `ffx provider add` | Create and save a custom provider interactively |
 | `ffx models` | List available models |
 | `ffx status` | Show configuration and runtime information |
 | `ffx doctor` | Run local health checks |
