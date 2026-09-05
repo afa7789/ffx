@@ -1688,7 +1688,7 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "ffx status --json") != null);
     try std.testing.expect(std.mem.find(u8, text, "Run `/help` inside an interactive session for slash commands.") != null);
     try std.testing.expect(std.mem.find(u8, text, "Learn more about 𝒇𝒇x:  https://ffx.sh/docs") != null);
-    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:     run `/feedback` inside 𝒇𝒇x\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:      run `/feedback` inside 𝒇𝒇x\n") != null);
     try std.testing.expect(std.mem.find(u8, text, "\n\n\nRun `ffx <command> --help`") == null);
     try std.testing.expect(std.mem.find(u8, text, "Start:") == null);
     try std.testing.expect(std.mem.find(u8, text, "  Work      ") == null);
