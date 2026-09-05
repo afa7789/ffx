@@ -354,6 +354,14 @@ pub fn Runtime(comptime App: type) type {
                         app.auth.openProviderPicker(app.alloc, provider_runtime.provider(app));
                     },
                     .automatic => try applyAutomaticCredential(app),
+                    .custom_provider => {
+                        app.auth.closePicker(app.alloc);
+                        try app.writeDomainNotice(.{
+                            .topic = "auth",
+                            .tone = .neutral,
+                            .body = "Use /provider add to register a custom provider without a login.",
+                        }, true);
+                    },
                 },
                 .team => |index| try applyTeamChoice(app, index),
             }

@@ -214,6 +214,9 @@ pub const AcquisitionAction = enum {
     /// Clears a remembered choice so resolution returns to plain precedence.
     /// Without it the only way back would be editing settings.json by hand.
     automatic,
+    /// Starts the dynamic provider registration flow. The app layer owns the
+    /// form because it also owns settings persistence and secret storage.
+    custom_provider,
 };
 
 pub const PickerStage = enum {
@@ -485,6 +488,8 @@ pub const PickerView = struct {
             },
             .provider => if (providerChoiceAt(self.available_providers, self.provider_picker_mode, index)) |provider|
                 .{ .provider = provider }
+            else if (self.provider_picker_mode == .connect and index == provider_picker_order.len - 1)
+                .{ .action = .custom_provider }
             else
                 null,
             .method => switch (index) {
@@ -539,6 +544,7 @@ pub const PickerView = struct {
                 .switch_credential => "Switch connection",
                 .switch_provider => "Switch provider",
                 .automatic => "Automatic",
+                .custom_provider => "Custom provider",
             },
             .team => |index| if (index < self.teams.len) self.teams[index].name else "",
         };
@@ -562,6 +568,7 @@ pub const PickerView = struct {
                 .switch_credential => "Use another saved connection",
                 .switch_provider => "Choose a different provider",
                 .automatic => "use normal precedence",
+                .custom_provider => "Add an endpoint and API key",
                 .change_team => "sign in first",
             },
             .team => |index| if (self.teamIsCurrent(index)) "current" else "",
@@ -587,7 +594,7 @@ pub const PickerView = struct {
 };
 
 fn providerChoiceCount(available: ProviderSet, mode: ProviderPickerMode) usize {
-    if (mode == .connect) return provider_picker_order.len - 1;
+    if (mode == .connect) return provider_picker_order.len;
     var count: usize = 0;
     for (provider_picker_order) |provider| {
         if (available.contains(provider)) count += 1;
@@ -1379,7 +1386,11 @@ pub const Runtime = struct {
                     self.provider_picker_target = provider;
                     self.closePicker(alloc);
                 },
-                .source, .action, .team => unreachable,
+                .action => |action| switch (action) {
+                    .custom_provider => self.closePicker(alloc),
+                    else => unreachable,
+                },
+                .source, .team => unreachable,
             },
             .method => switch (selected) {
                 .action => |action| switch (action) {
@@ -1401,6 +1412,7 @@ pub const Runtime = struct {
                     .setup => {},
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
+                    .custom_provider => unreachable,
                     .login, .chatgpt_login, .grok_login, .api_key => self.closePicker(alloc),
                 },
                 .team => unreachable,
@@ -2403,6 +2415,20 @@ test "connect provider picker prioritizes OpenCode OpenRouter and PPQ" {
     try std.testing.expect((Choice{ .provider = .openrouter }).eql(picker.choiceAt(1).?));
     try std.testing.expect((Choice{ .provider = .ppq }).eql(picker.choiceAt(2).?));
     try std.testing.expectEqualStrings("OpenCode", picker.choiceLabel(picker.choiceAt(0).?));
+}
+
+test "connect provider picker exposes custom provider registration" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    runtime.openConnectProviderPicker(alloc, .gateway);
+    const picker = runtime.pickerView();
+    try std.testing.expectEqual(provider_picker_order.len, picker.choiceCount());
+    const custom = picker.choiceAt(provider_picker_order.len - 1).?;
+    try std.testing.expect((Choice{ .action = .custom_provider }).eql(custom));
+    try std.testing.expectEqualStrings("Custom provider", picker.choiceLabel(custom));
+    try std.testing.expectEqualStrings("Add an endpoint and API key", picker.choiceDescription(custom));
 }
 
 test "switch provider picker contains only connected providers" {
