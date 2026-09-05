@@ -35,7 +35,9 @@ fi
 
 capture='tests/e2e/fixtures/ffx-render-bug-20260510-075848.tar.gz'
 archive_listing="$(tar -tzvf "$capture")"
-unexpected_owners="$(grep -Ev '[[:space:]]root([/]|[[:space:]]+)root[[:space:]]' <<<"$archive_listing" || true)"
+# BSD tar prints symbolic owners while GNU tar may print numeric ids even when
+# the archive records root ownership. Accept both representations.
+unexpected_owners="$(grep -Ev '[[:space:]](root|0)([/]|[[:space:]]+)(root|0)[[:space:]]' <<<"$archive_listing" || true)"
 if [[ -n "$unexpected_owners" ]]; then
   printf 'Render fixture archive metadata contains a non-root owner:\n%s\n' "$unexpected_owners" >&2
   exit 1
