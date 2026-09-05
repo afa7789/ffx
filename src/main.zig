@@ -59,6 +59,8 @@ const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
+const openai_direct = @import("gateway/openai_direct.zig");
+const provider_definition = @import("core/provider/definition.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
 const builtin_modes = @import("builtins/modes.zig");
@@ -433,9 +435,27 @@ const App = struct {
     }
 
     pub fn agentStreamProvider(self: *const Self) agent_stream_provider.Provider {
+        if (self.custom_provider_config) |*config| {
+            if (std.mem.eql(u8, provider_runtime.providerKey(self), self.custom_provider_definition.?.parsed.value.id)) {
+                return openai_direct.runtimeAgentStreamProvider(config);
+            }
+        }
         return self.subagentProviderRoutes()
             .select(self.provider_selection.selection().provider)
             .agent_stream_provider;
+    }
+
+    pub fn installCustomProvider(self: *Self, owned: *provider_definition.OwnedDefinition) void {
+        if (self.custom_provider_definition) |*old| old.deinit();
+        self.custom_provider_definition = owned.*;
+        owned.* = undefined;
+        const value = &self.custom_provider_definition.?.parsed.value;
+        self.custom_provider_config = .{
+            .base_url = value.endpoint orelse "",
+            .fallback_model = value.default_model orelse "",
+            .models_endpoint = value.models_endpoint,
+            .models = value.models,
+        };
     }
 
     pub fn fetchProviderCatalog(
@@ -495,6 +515,8 @@ const App = struct {
         if (host_target.is_wasm) host.unavailable_secret_store else native_host.secret_store,
     ),
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
+    custom_provider_definition: ?provider_definition.OwnedDefinition = null,
+    custom_provider_config: ?openai_direct.Config = null,
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
@@ -840,6 +862,9 @@ const App = struct {
         self.shell.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         self.provider_selection.deinit();
+        if (self.custom_provider_definition) |*custom| custom.deinit();
+        self.custom_provider_definition = null;
+        self.custom_provider_config = null;
         self.session_title.deinit(self.alloc);
         SessionAppRuntime.deinitPersistence(self);
         if (self.requested_resume) |*target| {
@@ -925,6 +950,14 @@ const App = struct {
 
     pub fn openSetupHub(self: *App) !void {
         try AuthAppRuntime.openSetupHub(self);
+    }
+
+    pub fn openConnectProvider(self: *App) !void {
+        try AuthAppRuntime.openConnectProvider(self);
+    }
+
+    pub fn openSwitchProvider(self: *App) !void {
+        try AuthAppRuntime.openSwitchProvider(self);
     }
 
     pub fn runLoginCommand(self: *App) !void {

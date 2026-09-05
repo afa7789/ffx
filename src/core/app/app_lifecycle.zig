@@ -3,12 +3,15 @@ const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const credentials = @import("../auth/credentials.zig");
+const grok_oauth = @import("../auth/grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
+const provider_definition = @import("../provider/definition.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -122,6 +125,8 @@ pub const StartupState = struct {
     credential_onboarding_skipped: bool = false,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
     provider: model_provider.ProviderId = .gateway,
+    provider_key: []u8 = &.{},
+    custom_provider: ?provider_definition.OwnedDefinition = null,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
     model_source: config_runtime.ModelSource = .compiled_default,
@@ -158,6 +163,8 @@ pub const StartupState = struct {
         if (self.credential) |*credential| credential.deinit(alloc);
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
+        if (self.provider_key.len > 0) alloc.free(self.provider_key);
+        if (self.custom_provider) |*value| value.deinit();
         self.permission_rules.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
@@ -398,7 +405,7 @@ const CredentialLoadMode = enum { stored, refresh_if_needed };
 
 fn loadStartupStateFromOwnedWorkspace(
     alloc: Allocator,
-    _: oauth_transport.Provider,
+    transport: oauth_transport.Provider,
     secret_store: host.SecretStore,
     owned_workspace_root: []u8,
     default_model: []const u8,
@@ -428,6 +435,12 @@ fn loadStartupStateFromOwnedWorkspace(
 
     const configured_selection = try configuredProviderSelection(default_model, settings);
     state.provider = configured_selection.provider;
+    state.provider_key = try alloc.dupe(u8, configuredProviderKey(settings));
+    if (settings.provider_key) |key| {
+        if (settings.providers.get(key)) |definition| {
+            state.custom_provider = try definition.clone(alloc);
+        }
+    }
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
     state.model_source = detailed.model_source orelse .compiled_default;
     state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
@@ -436,10 +449,45 @@ fn loadStartupStateFromOwnedWorkspace(
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
-    if (credential_mode) |_| {
-        const resolution = try credentials.resolveForProvider(alloc, secret_store, model_provider.registryId(state.provider));
-        state.credential = resolution.credential;
-        state.stored_key_status = resolution.stored_key_status;
+    if (credential_mode) |mode| {
+        if (state.custom_provider) |custom| {
+            if (custom.parsed.value.auth.kind == .api_key or custom.parsed.value.auth.kind == .none) {
+                state.credential = try credentials.resolveDirectProvider(
+                    alloc,
+                    secret_store,
+                    custom.parsed.value.id,
+                    custom.parsed.value.auth.env_var orelse "",
+                );
+            }
+        } else switch (state.provider) {
+            .gateway => {
+                const resolution = try credentials.resolveForProvider(alloc, secret_store, model_provider.registryId(state.provider));
+                state.credential = resolution.credential;
+                state.stored_key_status = resolution.stored_key_status;
+            },
+            .codex => if (try chatgpt_oauth.loadAccess(alloc, transport, if (mode == .stored) .stored else .if_needed)) |access| {
+                state.credential = .{
+                    .token = access.access_token,
+                    .source = .stored_key,
+                    .account_id = access.account_id,
+                };
+            },
+            .grok => if (try grok_oauth.loadAccess(alloc, transport, if (mode == .stored) .stored else .if_needed)) |access| {
+                state.credential = .{
+                    .token = access.access_token,
+                    .source = .stored_key,
+                    .account_id = access.account_id,
+                };
+            },
+            else => if (@import("../../builtins/providers.zig").byId(model_provider.registryId(state.provider))) |entry| {
+                state.credential = try credentials.resolveDirectProvider(
+                    alloc,
+                    secret_store,
+                    entry.id,
+                    entry.env_var,
+                );
+            },
+        }
     }
     state.permission_mode = loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
@@ -1135,13 +1183,23 @@ fn configuredProviderSelection(
     settings: *const config_runtime.Settings,
 ) !model_provider.ProviderSelection {
     const provider = settings.provider orelse .gateway;
+    if (settings.provider_key) |key| {
+        if (settings.providers.get(key)) |custom| {
+            const model = settings.model orelse custom.parsed.value.default_model orelse default_model;
+            return .{ .provider = provider, .model = model };
+        }
+    }
     const model = switch (provider) {
         .gateway => settings.model orelse default_model,
         .codex => settings.codex_model orelse return error.CodexModelNotSelected,
         .grok => settings.grok_model orelse return error.GrokModelNotSelected,
-        .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => settings.model orelse default_model,
+        .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => settings.model orelse default_model,
     };
     return .{ .provider = provider, .model = model };
+}
+
+fn configuredProviderKey(settings: *const config_runtime.Settings) []const u8 {
+    return settings.provider_key orelse model_provider.registryId(settings.provider orelse .gateway);
 }
 
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {

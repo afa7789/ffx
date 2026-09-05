@@ -258,7 +258,14 @@ pub fn Runtime(comptime App: type) type {
             var selected_model = startup.takeSelectedModel();
             defer if (selected_model.len > 0) app.alloc.free(selected_model);
             if (comptime @hasField(App, "provider_selection")) {
-                app.provider_selection.adoptOwned(startup.provider, &selected_model);
+                if (startup.provider_key.len > 0) {
+                    try app.provider_selection.adoptOwnedKey(startup.provider_key, startup.provider, &selected_model);
+                } else {
+                    app.provider_selection.adoptOwned(startup.provider, &selected_model);
+                }
+                if (startup.custom_provider) |*custom| {
+                    if (comptime @hasDecl(App, "installCustomProvider")) app.installCustomProvider(custom);
+                }
             } else {
                 try provider_runtime.replaceModel(app, selected_model);
             }

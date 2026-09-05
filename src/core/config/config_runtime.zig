@@ -8,6 +8,7 @@ const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
 const model_provider = @import("model_provider.zig");
+const provider_definition = @import("../provider/definition.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 
@@ -37,6 +38,9 @@ pub const Paths = struct {
 pub const Settings = struct {
     model: ?[]u8 = null,
     provider: ?model_provider.ProviderId = null,
+    /// Stable runtime provider id. `provider` remains populated for legacy
+    /// built-ins while custom ids use this field.
+    provider_key: ?[]u8 = null,
     codex_model: ?[]u8 = null,
     grok_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
@@ -66,9 +70,12 @@ pub const Settings = struct {
     has_permission_rules: bool = false,
     /// Per-provider API keys stored in ~/.ffx/settings.json.
     api_keys: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// User-defined runtime provider definitions keyed by stable provider id.
+    providers: std.StringHashMapUnmanaged(provider_definition.OwnedDefinition) = .empty,
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
+        if (self.provider_key) |value| alloc.free(value);
         if (self.codex_model) |value| alloc.free(value);
         if (self.grok_model) |value| alloc.free(value);
         if (self.input_appearance) |value| alloc.free(value);
@@ -80,6 +87,12 @@ pub const Settings = struct {
             alloc.free(entry.value_ptr.*);
         }
         self.api_keys.deinit(alloc);
+        var provider_it = self.providers.iterator();
+        while (provider_it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.providers.deinit(alloc);
         self.* = .{};
     }
 
@@ -1303,8 +1316,24 @@ fn parseProfileOnlyFields(
 
     if (root.object.get("provider")) |provider_value| {
         if (provider_value != .string) return error.InvalidProviderType;
-        settings.provider = model_provider.parse(provider_value.string) orelse
-            return error.InvalidProviderValue;
+        if (std.mem.trim(u8, provider_value.string, " \t\r\n").len == 0) return error.InvalidProviderValue;
+        settings.provider_key = try alloc.dupe(u8, provider_value.string);
+        settings.provider = model_provider.parse(provider_value.string);
+    }
+
+    if (root.object.get("providers")) |providers_value| {
+        if (providers_value != .object) return error.InvalidProvidersType;
+        var iterator = providers_value.object.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.* != .object) return error.InvalidProviderDefinition;
+            var owned = try provider_definition.parse_value(alloc, entry.value_ptr.*);
+            errdefer owned.deinit();
+            if (!std.mem.eql(u8, owned.parsed.value.id, entry.key_ptr.*)) return error.ProviderIdMismatch;
+            const key = try alloc.dupe(u8, entry.key_ptr.*);
+            errdefer alloc.free(key);
+            try settings.providers.put(alloc, key, owned);
+            owned = undefined;
+        }
     }
 
     if (root.object.get("codex_model")) |model_value| {
@@ -1503,6 +1532,23 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         incoming.model = null;
     }
     if (incoming.provider) |value| target.provider = value;
+    if (incoming.provider_key) |value| {
+        if (target.provider_key) |current| alloc.free(current);
+        target.provider_key = value;
+        incoming.provider_key = null;
+    }
+    var provider_it = incoming.providers.iterator();
+    while (provider_it.next()) |entry| {
+        if (target.providers.fetchRemove(entry.key_ptr.*)) |removed| {
+            alloc.free(removed.key);
+            var old = removed.value;
+            old.deinit();
+        }
+        target.providers.put(alloc, entry.key_ptr.*, entry.value_ptr.*) catch unreachable;
+        entry.key_ptr.* = undefined;
+        entry.value_ptr.* = undefined;
+    }
+    incoming.providers.clearRetainingCapacity();
     if (incoming.codex_model) |value| {
         if (target.codex_model) |current| alloc.free(current);
         target.codex_model = value;
@@ -1554,16 +1600,20 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         incoming.has_permission_rules = false;
     }
 
-    if (incoming.api_keys.count() > 0) {
-        var old_iter = target.api_keys.iterator();
-        while (old_iter.next()) |entry| {
-            alloc.free(entry.key_ptr.*);
-            alloc.free(entry.value_ptr.*);
+    // API keys are keyed by provider.  A workspace/profile override must
+    // replace only the entries it declares, not erase keys for unrelated
+    // providers loaded from the lower-precedence layer.
+    var api_it = incoming.api_keys.iterator();
+    while (api_it.next()) |entry| {
+        if (target.api_keys.fetchRemove(entry.key_ptr.*)) |removed| {
+            alloc.free(removed.key);
+            alloc.free(removed.value);
         }
-        target.api_keys.deinit(alloc);
-        target.api_keys = incoming.api_keys;
-        incoming.api_keys = .empty;
+        target.api_keys.put(alloc, entry.key_ptr.*, entry.value_ptr.*) catch unreachable;
+        entry.key_ptr.* = undefined;
+        entry.value_ptr.* = undefined;
     }
+    incoming.api_keys.clearRetainingCapacity();
 }
 
 fn parsePermissionConfig(alloc: Allocator, value: std.json.Value) !types.PermissionRuleSet {
@@ -2068,6 +2118,21 @@ test "provider settings keep independent provider models" {
     try std.testing.expectEqualStrings("gateway/model", settings.model.?);
     try std.testing.expectEqualStrings("gpt-5.4-mini", settings.codex_model.?);
     try std.testing.expectEqualStrings("grok-4.20-0309-non-reasoning", settings.grok_model.?);
+}
+
+test "custom provider definitions and textual selection survive parsing" {
+    var settings = try parseSettingsJson(
+        std.testing.allocator,
+        "{\"provider\":\"my-anthropic\",\"api_keys\":{\"my-anthropic\":\"secret\"},\"providers\":{\"my-anthropic\":{\"id\":\"my-anthropic\",\"display_name\":\"My Anthropic\",\"protocol\":\"anthropic_messages\",\"endpoint\":\"https://example.test\",\"default_model\":\"claude-test\",\"models\":[\"private-model\"],\"auth\":{\"kind\":\"api_key\",\"header\":\"x-api-key\"}}}}",
+    );
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expect(settings.provider == null);
+    try std.testing.expectEqualStrings("my-anthropic", settings.provider_key.?);
+    try std.testing.expectEqualStrings("secret", settings.apiKey("my-anthropic").?);
+    const custom = settings.providers.get("my-anthropic").?;
+    try std.testing.expectEqualStrings("my-anthropic", custom.parsed.value.id);
+    try std.testing.expectEqual(provider_definition.Protocol.anthropic_messages, custom.parsed.value.protocol);
+    try std.testing.expectEqualStrings("private-model", custom.parsed.value.models[0]);
 }
 
 test "max_agent_steps explicit zero survives serialization round trip" {
