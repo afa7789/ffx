@@ -187,6 +187,7 @@ pub const StatuslineItems = struct {
     session_title: ?[]const u8 = null,
     provider_label: ?[]const u8 = null,
     billing_mode: ?account_status.BillingMode = null,
+    credential_source: ?types.CredentialSource = null,
     local_cost: f64 = 0,
     local_tokens: u64 = 0,
     balance_state: account_status.BalanceState = .unknown,
@@ -386,6 +387,12 @@ fn appendAccountStatus(out: []u8, end: *usize, statusline: StatuslineItems) void
         .subscription => std.fmt.bufPrint(&buf, "{s} {s}", .{ provider, billing.label() }) catch return,
     };
     appendStatusSegment(out, end, segment);
+    if (statusline.credential_source) |source| {
+        appendStatusSegment(out, end, switch (source) {
+            .env_var => "key: env",
+            .stored_key => "key: keychain",
+        });
+    }
     switch (statusline.balance_state) {
         .warning => appendStatusSegment(out, end, "low"),
         .exhausted => appendStatusSegment(out, end, "exhausted"),
@@ -964,6 +971,17 @@ test "buildHintLine reports an explicit low balance state" {
         .balance_state = .warning,
     }, 120, &buf);
     try std.testing.expectEqualStrings("ask · deepseek-chat · DeepSeek PAYG spent $0.04 · low", line);
+}
+
+test "buildHintLine identifies credential origin without exposing the key" {
+    var buf: [256]u8 = undefined;
+    const line = buildHintLine(false, false, true, "openai/gpt-4o", .ask, 0, null, false, false, .auto, false, .{
+        .provider_label = "OpenAI",
+        .billing_mode = .payg,
+        .credential_source = .stored_key,
+    }, 120, &buf);
+    try std.testing.expectEqualStrings("ask · gpt-4o · OpenAI PAYG spent $0.00 · key: keychain", line);
+    try std.testing.expect(std.mem.find(u8, line, "secret") == null);
 }
 
 test "buildHintLine shows token plan usage and clips it at narrow widths" {

@@ -1234,6 +1234,10 @@ pub fn Runtime(comptime App: type) type {
                 const provider = provider_runtime.provider(app);
                 items.provider_label = model_provider.label(provider);
                 items.billing_mode = account_status.billingMode(provider);
+                items.credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
+                    app.auth.credentialSource()
+                else
+                    null;
                 items.local_cost = app.session.usage.totalCost();
                 items.local_tokens = app.session.usage.totalTokens();
             }

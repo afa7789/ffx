@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_provider = @import("../config/model_provider.zig");
+const types = @import("../shared/types.zig");
 
 /// The commercial model used by a provider. This is intentionally separate
 /// from observed local usage: a provider may not expose its remote balance.
@@ -27,6 +28,15 @@ pub const BalanceState = enum {
     warning,
     exhausted,
 };
+
+/// Describes where the active credential was loaded from without exposing its
+/// value. This is safe to show in status lines and diagnostics.
+pub fn credentialSourceLabel(source: ?types.CredentialSource) []const u8 {
+    return switch (source orelse return "none") {
+        .env_var => "environment variable",
+        .stored_key => "keychain",
+    };
+}
 
 pub const FailureKind = enum {
     authentication,
@@ -96,4 +106,10 @@ test "http status classification does not infer exhaustion from unknown response
 
 test "unknown balance is explicit" {
     try std.testing.expectEqualStrings("Unknown", balanceLabel(.unknown));
+}
+
+test "credential source label is redacted and actionable" {
+    try std.testing.expectEqualStrings("environment variable", credentialSourceLabel(.env_var));
+    try std.testing.expectEqualStrings("keychain", credentialSourceLabel(.stored_key));
+    try std.testing.expectEqualStrings("none", credentialSourceLabel(null));
 }

@@ -1611,6 +1611,21 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandShowCredits(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            const active_provider = if (comptime @hasField(App, "provider_selection"))
+                provider_runtime.provider(app)
+            else
+                .gateway;
+            if (active_provider != .gateway) {
+                // Direct providers do not share the Gateway credits endpoint.
+                // Keep the message explicit so local spend is not mistaken for
+                // the provider's remote account balance.
+                try app.writeDomainNotice(.{
+                    .topic = "credits",
+                    .tone = .neutral,
+                    .body = "Remote balance unavailable for this provider; ffx reports local session spend only.",
+                }, true);
+                return;
+            }
             var snapshot = app.creditsProvider().fetch(app.alloc, .{
                 .credential = app.auth.apiKey(),
                 .credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
