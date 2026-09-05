@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
@@ -146,11 +147,11 @@ pub fn catalogAccessForCredentialAndAccount(
 pub const stored_key_backend_label = if (builtin.os.tag == .macos) "macOS Keychain" else "profile file";
 
 pub const missing_credential_message = "Fx needs access to a model provider. Run ffx login, or ffx setup to use an API key, or set FFX_PROVIDER_API_KEY + FFX_PROVIDER_BASE_URL, or set AI_GATEWAY_API_KEY.";
-pub const missing_interactive_credential_message = "Fx needs access to a model provider. Run /login, or open /setup to paste an API key, or set FFX_PROVIDER_API_KEY + FFX_PROVIDER_BASE_URL.";
+pub const missing_interactive_credential_message = "Fx needs access to a model provider. Open /setup, or set FFX_PROVIDER_API_KEY + FFX_PROVIDER_BASE_URL.";
 pub const missing_chatgpt_credential_message = "ffx needs a Codex subscription login for this model. Run ffx login codex.";
-pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login and choose Sign in with Codex.";
+pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Open /setup and choose Sign in with Codex.";
 pub const missing_grok_credential_message = "ffx needs a Grok subscription login for this model. Run ffx login grok.";
-pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login and choose Sign in with Grok.";
+pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Open /setup and choose Sign in with Grok.";
 pub const unreadable_store_message = "Fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FFX_TRACE_LOG for the failing step, or set FFX_PROVIDER_API_KEY.";
 
 pub const Credential = struct {
@@ -244,6 +245,60 @@ pub fn resolveForProvider(
     if (try loadSource(alloc, secret_store, .env_var)) |credential| return .{ .credential = credential };
 
     return .{};
+}
+
+/// Resolves only the credential owned by one direct provider. Unlike the
+/// legacy resolver, this never falls back to an AI Gateway key or the generic
+/// provider key, so connection discovery cannot report false matches.
+pub fn resolveDirectProvider(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+    provider: []const u8,
+    env_var: []const u8,
+) !?Credential {
+    if (try loadEnvCredential(alloc, env_var, .env_var)) |credential| return credential;
+    var settings = readStoredSettings(alloc, provider);
+    defer settings.deinit(alloc);
+    if (loadProviderStoredKey(alloc, secret_store, provider, settings.api_key)) |credential| {
+        return credential;
+    }
+    if (std.mem.eql(u8, provider, "opencode")) {
+        var legacy = readStoredSettings(alloc, "opencode-go");
+        defer legacy.deinit(alloc);
+        if (loadProviderStoredKey(alloc, secret_store, "opencode-go", legacy.api_key)) |credential| {
+            return credential;
+        }
+    }
+    return null;
+}
+
+pub fn directProviderExists(
+    alloc: std.mem.Allocator,
+    secret_store: host.SecretStore,
+    provider: []const u8,
+    env_var: []const u8,
+) !bool {
+    var credential = (try resolveDirectProvider(alloc, secret_store, provider, env_var)) orelse return false;
+    credential.deinit(alloc);
+    return true;
+}
+
+/// Stores one provider key in Keychain when available, with the profile
+/// `api_keys` map as the portable fallback.
+pub fn storeDirectProviderKey(alloc: std.mem.Allocator, provider: []const u8, key: []const u8) !void {
+    if (native_keychain.isAvailable() and !native_keychain.isDisabled()) {
+        native_keychain.saveApiKey(alloc, provider, key) catch |err| switch (err) {
+            error.UnsupportedPlatform => {},
+            else => return err,
+        };
+        return;
+    }
+
+    var api_keys: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer api_keys.deinit(alloc);
+    try api_keys.put(alloc, provider, key);
+    var outcome = try config_runtime.setUserPreferences(alloc, .{ .api_keys = api_keys });
+    outcome.deinit(alloc);
 }
 
 pub fn loadSource(
@@ -424,11 +479,10 @@ test "missing credential messages use surface commands in preferred order" {
     try std.testing.expect(cli_login < cli_setup);
     try std.testing.expect(cli_setup < cli_env);
 
-    const tui_login = std.mem.find(u8, missing_interactive_credential_message, "/login").?;
     const tui_setup = std.mem.find(u8, missing_interactive_credential_message, "/setup").?;
-    try std.testing.expect(tui_login < tui_setup);
     const tui_direct = std.mem.find(u8, missing_interactive_credential_message, "FFX_PROVIDER_API_KEY").?;
     try std.testing.expect(tui_setup < tui_direct);
+    try std.testing.expect(std.mem.find(u8, missing_interactive_credential_message, "/login") == null);
 }
 
 test "catalog access isolates public and authenticated provider credentials" {
@@ -590,6 +644,21 @@ test "source-specific credential loading" {
 
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .env_var));
     try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .stored_key)));
+}
+
+test "direct provider environment credential takes precedence without reading stores" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "CUSTOM_PROVIDER_KEY", "custom-env-key" },
+        .{ "FFX_PROVIDER_API_KEY", "foreign-key" },
+    });
+    defer env.deinit();
+    var fixture = SecretStoreFixture{ .value = "stored-key" };
+    var credential = (try resolveDirectProvider(alloc, fixture.provider(), "custom", "CUSTOM_PROVIDER_KEY")).?;
+    defer credential.deinit(alloc);
+    try std.testing.expectEqualStrings("custom-env-key", credential.token);
+    try std.testing.expectEqual(Source.env_var, credential.source);
+    try std.testing.expectEqual(@as(usize, 0), fixture.load_calls);
 }
 
 test "a disabled stored key is reported as never attempted, not as absent" {
