@@ -174,7 +174,7 @@ pub fn buildInputLineForRow(input: []const u8, cursor: usize, line_index: usize,
 pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
-        "{s}𝒇x{s}{s} v{s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}𝒇𝒇x{s}{s} v{s} · Run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, main.version },
     );
 }
@@ -419,7 +419,7 @@ pub fn buildHintLine(
 
     var end: usize = 0;
     if (!awaiting_permission and !has_api_key) {
-        appendStatusSegment(out, &end, "run /login");
+        appendStatusSegment(out, &end, "run /setup");
     }
     if (!awaiting_permission and queued_count > 0) {
         var queued_buf: [32]u8 = undefined;
@@ -888,7 +888,7 @@ test "welcomeMessage shows version and help hint" {
     const message = try welcomeMessage(std.testing.allocator);
     defer std.testing.allocator.free(message);
 
-    try std.testing.expect(std.mem.find(u8, message, "𝒇x") != null);
+    try std.testing.expect(std.mem.find(u8, message, "𝒇𝒇x") != null);
     try std.testing.expect(std.mem.find(u8, message, main.version) != null);
     try std.testing.expect(std.mem.find(u8, message, "/help") != null);
 }
@@ -900,7 +900,7 @@ test "welcomeMessage keeps only the app name bright" {
 
     const expected = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{s}𝒇x{s}{s} v{s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}𝒇𝒇x{s}{s} v{s} · Run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, main.version },
     );
     defer std.testing.allocator.free(expected);
@@ -1078,7 +1078,7 @@ test "buildHintLine keeps system labels and dot separators" {
     }, 256, &buf);
     const expected = try std.fmt.allocPrint(
         std.testing.allocator,
-        "run /login · queued 2 · {s}auto{s} · opus 4.8 · low · ⚡︎ · Context: 43k/1000k 4%",
+        "run /setup · queued 2 · {s}auto{s} · opus 4.8 · low · ⚡︎ · Context: 43k/1000k 4%",
         .{ permission_auto_style, statusline_style },
     );
     defer std.testing.allocator.free(expected);

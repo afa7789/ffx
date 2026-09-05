@@ -199,6 +199,11 @@ pub const StartupState = struct {
         return credential.gatewayTeam();
     }
 
+    pub fn credentialRequired(self: *const StartupState) bool {
+        if (self.custom_provider) |custom| return custom.parsed.value.auth.kind != .none;
+        return true;
+    }
+
     pub fn takeCredential(self: *StartupState) ?credentials.Credential {
         const value = self.credential;
         self.credential = null;
@@ -451,7 +456,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     if (credential_mode) |mode| {
         if (state.custom_provider) |custom| {
-            if (custom.parsed.value.auth.kind == .api_key or custom.parsed.value.auth.kind == .none) {
+            if (custom.parsed.value.auth.kind == .api_key) {
                 state.credential = try credentials.resolveDirectProvider(
                     alloc,
                     secret_store,

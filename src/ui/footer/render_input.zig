@@ -54,7 +54,15 @@ pub const ModelMenuProjection = struct {
     query: []const u8 = "",
 
     pub fn providerFilter(self: ModelMenuProjection) model_cache_runtime.ModelProviderFilter {
-        return @enumFromInt(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1));
+        return model_cache_runtime.availableProviderFilterAt(self.items, self.provider_index);
+    }
+
+    pub fn providerFilterCount(self: ModelMenuProjection) usize {
+        return model_cache_runtime.availableProviderFilterCount(self.items);
+    }
+
+    pub fn providerFilterAt(self: ModelMenuProjection, index: usize) model_cache_runtime.ModelProviderFilter {
+        return model_cache_runtime.availableProviderFilterAt(self.items, index);
     }
 
     pub fn filteredItemCount(self: ModelMenuProjection) usize {

@@ -3917,7 +3917,7 @@ test "welcome logo stays pinned while middle transcript rows overflow" {
     try h.flush();
 
     try expectGridContains(&h, "Run /help for commands");
-    try expectGridContains(&h, "𝒇x v");
+    try expectGridContains(&h, "𝒇𝒇x v");
     try expectGridNotContains(&h, "content line 0");
     try expectGridContains(&h, "content line 44");
 }
@@ -3946,7 +3946,7 @@ test "welcome logo stays pinned during footer-reserved overflow" {
 
     try std.testing.expect(h.shell.last_visible_transcript_split_active);
     try std.testing.expect(h.shell.last_visible_transcript_split_suffix_start_line > h.shell.last_visible_transcript_split_prefix_lines);
-    try expectGridContains(&h, "𝒇x v");
+    try expectGridContains(&h, "𝒇𝒇x v");
     try expectGridContains(&h, "Run /help for commands");
     try expectGridNotContains(&h, "content line 0");
     try expectGridContains(&h, "content line 44");
@@ -4598,7 +4598,7 @@ test "entry-bound shimmer resolves inside pinned welcome tail selection" {
     try h.flush();
 
     const status_row = try findRowContaining(&h, "tail status line");
-    try expectGridContains(&h, "𝒇x v");
+    try expectGridContains(&h, "𝒇𝒇x v");
 
     var ctx = defaultFooterContext(&input);
     setToolActivity(&ctx, status_id, "Reading pinned tail");
@@ -5627,7 +5627,7 @@ test "long transcript picker filtering keeps footer anchored and close releases 
     try h.shell.writeTranscript(
         alloc,
         &h.metrics,
-        "❯ /login\n\n",
+        "❯ /setup\n\n",
         true,
     );
     h.frame_redraw = true;
@@ -5753,7 +5753,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 38 · Type to filter");
+    try expectGridContains(&h, "Commands 39 · Type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -5774,7 +5774,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 38");
+    try expectGridNotContains(&h, "Commands 39");
     try expectGridNotContains(&h, "↑↓ Navigate");
 }
 

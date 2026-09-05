@@ -124,12 +124,12 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
     defer row.deinit(alloc);
     try appendHeaderTitle(alloc, &row, projection.filteredItemCount());
 
-    const tab_count = model_cache_runtime.model_provider_filter_count;
+    const tab_count = projection.providerFilterCount();
     const active_index = @min(projection.provider_index, tab_count - 1);
     const title_width = display_width.visibleWidthIgnoringAnsi(row.items);
-    if (title_width + 2 + providerTabWidth(active_index, active_index) > width) {
+    if (title_width + 2 + providerTabWidth(projection, active_index, active_index) > width) {
         try row.appendSlice(alloc, "  ");
-        try appendProviderTabAt(alloc, &row, active_index, active_index);
+        try appendProviderTabAt(alloc, &row, projection, active_index, active_index);
         return cloneClippedRow(alloc, row.items, width);
     }
 
@@ -137,11 +137,11 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
     var end = active_index + 1;
     while (true) {
         var expanded = false;
-        if (end < tab_count and title_width + 2 + providerRangeWidth(start, end + 1, active_index) <= width) {
+        if (end < tab_count and title_width + 2 + providerRangeWidth(projection, start, end + 1, active_index) <= width) {
             end += 1;
             expanded = true;
         }
-        if (start > 0 and title_width + 2 + providerRangeWidth(start - 1, end, active_index) <= width) {
+        if (start > 0 and title_width + 2 + providerRangeWidth(projection, start - 1, end, active_index) <= width) {
             start -= 1;
             expanded = true;
         }
@@ -155,7 +155,7 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
     }
     for (start..end) |index| {
         if (index > start) try row.appendSlice(alloc, "  ");
-        try appendProviderTabAt(alloc, &row, index, active_index);
+        try appendProviderTabAt(alloc, &row, projection, index, active_index);
     }
     if (end < tab_count) {
         try row.appendSlice(alloc, "  ");
@@ -183,10 +183,11 @@ fn appendProviderTab(alloc: Allocator, row: *std.ArrayList(u8), label: []const u
 fn appendProviderTabAt(
     alloc: Allocator,
     row: *std.ArrayList(u8),
+    projection: ModelMenuProjection,
     index: usize,
     active_index: usize,
 ) !void {
-    try appendProviderTab(alloc, row, providerTabLabel(index), index == active_index);
+    try appendProviderTab(alloc, row, providerTabLabel(projection.providerFilterAt(index)), index == active_index);
 }
 
 fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void {
@@ -195,8 +196,7 @@ fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void
     try row.appendSlice(alloc, ui_render.reset_style);
 }
 
-fn providerTabLabel(index: usize) []const u8 {
-    const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
+fn providerTabLabel(filter: model_cache_runtime.ModelProviderFilter) []const u8 {
     return switch (filter) {
         .all => "All",
         .anthropic => "Anthropic",
@@ -207,12 +207,13 @@ fn providerTabLabel(index: usize) []const u8 {
     };
 }
 
-fn providerTabWidth(index: usize, active_index: usize) usize {
+fn providerTabWidth(projection: ModelMenuProjection, index: usize, active_index: usize) usize {
     const active_padding: usize = if (index == active_index) 2 else 0;
-    return display_width.visibleWidth(providerTabLabel(index)) + active_padding;
+    return display_width.visibleWidth(providerTabLabel(projection.providerFilterAt(index))) + active_padding;
 }
 
 fn providerRangeWidth(
+    projection: ModelMenuProjection,
     start: usize,
     end: usize,
     active_index: usize,
@@ -220,9 +221,9 @@ fn providerRangeWidth(
     var width: usize = if (start > 0) 3 else 0;
     for (start..end) |index| {
         if (index > start) width += 2;
-        width += providerTabWidth(index, active_index);
+        width += providerTabWidth(projection, index, active_index);
     }
-    if (end < model_cache_runtime.model_provider_filter_count) width += 3;
+    if (end < projection.providerFilterCount()) width += 3;
     return width;
 }
 
@@ -535,7 +536,7 @@ test "model menu status follows provenance and retryable failure precedence" {
     }
 }
 
-test "model menu fixed provider tabs fit a typical terminal width" {
+test "model menu hides provider tabs with zero models" {
     const alloc = std.testing.allocator;
     const projection: ModelMenuProjection = .{
         .active = true,
@@ -545,11 +546,11 @@ test "model menu fixed provider tabs fit a typical terminal width" {
     var header = try composeModelMenuRow(alloc, projection, 0, 60, 1);
     defer header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, header.items, "[All]") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "xAI") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Z.AI") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Others") != null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Anthropic") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "OpenAI") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "xAI") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Z.AI") == null);
+    try std.testing.expect(std.mem.find(u8, header.items, "Others") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "…") == null);
     try std.testing.expect(std.mem.find(u8, header.items, "Provider ") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(header.items) <= 60);
@@ -557,9 +558,17 @@ test "model menu fixed provider tabs fit a typical terminal width" {
 
 test "model menu header groups secondary providers under Others" {
     const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{ .id = @constCast("anthropic/a"), .provider = "anthropic", .capabilities = .{} },
+        .{ .id = @constCast("openai/a"), .provider = "openai", .capabilities = .{} },
+        .{ .id = @constCast("xai/a"), .provider = "xai", .capabilities = .{} },
+        .{ .id = @constCast("zai/a"), .provider = "zai", .capabilities = .{} },
+        .{ .id = @constCast("deepseek/a"), .provider = "deepseek", .capabilities = .{} },
+    };
     const projection: ModelMenuProjection = .{
         .active = true,
         .load_state = .ready,
+        .items = &items,
     };
 
     var header = try composeModelMenuRow(alloc, projection, 0, 120, 1);

@@ -371,6 +371,14 @@ Do not document intended behavior as if it already exists.
 
 Releases use a two-workflow pipeline. The maintainer controls the changelog voice and format.
 
+### Version rule (this fork)
+
+The fork tracks upstream `vercel-labs/fx`: on every sync, take their version verbatim from
+`src/main.zig` (`pub const version`). Never invent an independent version number ahead of upstream.
+The npm package version always equals this fork's `src/main.zig` version — `scripts/prepare-publish.mjs`
+stamps `package.json` automatically via the `prepack` hook, so no version is ever edited by hand on the
+npm side. When upstream bumps, sync first, then publish.
+
 ### Automated flow (preferred)
 
 1. Go to **Actions > Prepare Release** on GitHub

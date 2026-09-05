@@ -1318,6 +1318,30 @@ pub const Root = struct {
     ) !ResumeViewAdmission {
         var writable = try self.openWritableSessionDir(alloc, session_id, 0);
         errdefer writable.deinit(alloc);
+
+        // Resume-view admission normally only reads the current watermark,
+        // but a process can have stopped after publishing a native creation
+        // marker and before removing its authority intent. Repair that small
+        // creation window while the session lock is held so a stale
+        // `authority.pending.json` does not make the cached resume path fail.
+        // Legacy migrations remain fenced: they require the full writable
+        // resume path to validate and repair their rollback boundary.
+        if (try entryExists(&writable.dir, authority_intent_file)) {
+            var intent = try loadAuthorityIntent(alloc, &writable.dir);
+            defer intent.deinit(alloc);
+            if (intent.kind != .session_create) {
+                return error.SessionAuthorityBoundaryUnavailable;
+            }
+            var commit_lock = acquireLockWithDeadline(
+                &writable.dir,
+                commit_lock_file,
+                true,
+                0,
+            ) catch |err| return mapCommitLockError(err);
+            defer commit_lock.release();
+            var marker = try resolveAuthorityIntent(alloc, &writable, .{});
+            marker.deinit(alloc);
+        }
         const position = try loadCurrentPositionReference(alloc, &writable.dir, session_id);
         return .{
             .writable = writable,
@@ -5677,6 +5701,29 @@ test "authority creation resolves an exact proposed marker and canonical pair" {
         state.id,
         "authority.json",
     ));
+    try std.testing.expect(!(try temp.root.entryExistsForTest(
+        alloc,
+        state.id,
+        "authority.pending.json",
+    )));
+}
+
+test "resume view admission repairs a stale native creation intent" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var state = try testState(alloc, "session-authority-admission", 10);
+    defer state.deinit(alloc);
+    var failure = BoundaryFailure{ .target = .after_authority_marker_rename };
+
+    try std.testing.expectError(
+        error.SessionStartIndeterminate,
+        temp.root.startWritableSession(alloc, state, .{ .test_controls = failure.test_controls() }),
+    );
+
+    var admission = try temp.root.admitResumeView(alloc, state.id);
+    defer admission.deinit(alloc);
+    try std.testing.expectEqualStrings(state.id, admission.sessionId());
     try std.testing.expect(!(try temp.root.entryExistsForTest(
         alloc,
         state.id,

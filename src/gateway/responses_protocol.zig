@@ -129,7 +129,7 @@ fn writeComma(writer: *std.Io.Writer, first: *bool) !void {
 pub fn writeTools(
     writer: *std.Io.Writer,
     alloc: std.mem.Allocator,
-    tools: stream_provider.ToolSelection,
+    tools: anytype,
 ) !usize {
     var count: usize = 0;
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -388,7 +388,7 @@ pub const Reducer = struct {
         alloc: std.mem.Allocator,
         cancel_flag: *std.atomic.Value(bool),
         limits: StreamLimits,
-    ) !types.ModelCompletion {
+    ) !types.GatewayCompletion {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (!self.terminal_seen) return error.StreamIncomplete;
 
@@ -531,23 +531,12 @@ fn finishReason(
 fn parseUsage(response: std.json.ObjectMap) types.Usage {
     const value = response.get("usage") orelse return .{};
     if (value != .object) return .{};
-    const input_details = value.object.get("input_tokens_details");
-    const output_details = value.object.get("output_tokens_details");
     return .{
+        .cache_read_tokens = nestedUnsignedField(value.object.get("input_tokens_details"), "cached_tokens"),
+        .cache_write_tokens = nestedUnsignedField(value.object.get("input_tokens_details"), "cache_write_tokens"),
+        .reasoning_tokens = nestedUnsignedField(value.object.get("output_tokens_details"), "reasoning_tokens"),
         .input_tokens = unsignedField(value.object, "input_tokens"),
         .output_tokens = unsignedField(value.object, "output_tokens"),
-        .cache_read_tokens = nestedUnsignedField(
-            input_details,
-            "cached_tokens",
-        ),
-        .cache_write_tokens = nestedUnsignedField(
-            input_details,
-            "cache_write_tokens",
-        ),
-        .reasoning_tokens = nestedUnsignedField(
-            output_details,
-            "reasoning_tokens",
-        ),
     };
 }
 
@@ -565,7 +554,7 @@ pub fn buildSubscriptionBilling(
     model: []const u8,
     created_at_ms: i64,
     usage: types.Usage,
-) !?types.ProviderBilling {
+) !?types.GatewayBilling {
     if (provider == .gateway or created_at_ms < 0) return null;
     const input_tokens = usage.input_tokens orelse return null;
     const output_tokens = usage.output_tokens orelse return null;
@@ -662,64 +651,15 @@ fn containsName(names: []const []const u8, expected: []const u8) bool {
     return false;
 }
 
-test "Responses tools serialize typed static and dynamic functions once" {
-    const Tool = @import("../core/tooling/tool_dispatch.zig").Tool;
-    const Static = struct {
-        fn decode(_: @import("../core/tooling/tool_dispatch.zig").DispatchContext, _: []const u8) @import("../core/tooling/tool_dispatch.zig").DispatchError!@import("../core/tooling/tool_dispatch.zig").DecodeResult {
-            return error.InvalidToolArguments;
-        }
-        fn call(_: @import("../core/tooling/tool_dispatch.zig").DispatchContext, _: @import("../core/tooling/tool_dispatch.zig").ToolInput) @import("../core/tooling/tool_dispatch.zig").DispatchError!@import("../core/tooling/tool_dispatch.zig").ToolResult {
-            return error.InvalidToolArguments;
-        }
-        fn readsOnly(_: @import("../core/tooling/tool_dispatch.zig").ToolInput) bool {
-            return true;
-        }
-        fn irreversible(_: @import("../core/tooling/tool_dispatch.zig").ToolInput) bool {
-            return false;
-        }
-    };
-    const registered = [_]Tool{.{
-        .name = "read_file",
-        .description = "Read a file.",
-        .model_schema = .{
-            .name = "read_file",
-            .description = "Read a file.",
-            .input_schema = .{
-                .properties = &.{.{ .name = "path", .json_type = .string }},
-                .required = &.{"path"},
-            },
-        },
-        .decode = Static.decode,
-        .call = Static.call,
-        .reads_only_fn = Static.readsOnly,
-        .irreversible_fn = Static.irreversible,
-    }};
-    var dynamic_schema = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}",
-        .{},
-    );
-    defer dynamic_schema.deinit();
-
+test "Responses function tool schema serializes bounded input" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try std.testing.expectEqual(@as(usize, 2), try writeTools(
-        &out.writer,
-        std.testing.allocator,
-        .{
-            .registry = .{ .tools = &registered },
-            .advertised_names = &.{"read_file"},
-            .advertised_functions = &.{registered[0].model_schema},
-            .selected_dynamic = &.{.{
-                .name = "mcp_search",
-                .description = "Search.",
-                .input_schema = dynamic_schema.value,
-            }},
-        },
-    ));
+    try writeFunctionTool(&out.writer, std.testing.allocator, "read_file", "Read a file.", .{ .static = .{
+        .properties = &.{.{ .name = "path", .json_type = .string }},
+        .required = &.{"path"},
+    } });
     try std.testing.expect(std.mem.find(u8, out.written(), "\"name\":\"read_file\"") != null);
-    try std.testing.expect(std.mem.find(u8, out.written(), "\"name\":\"mcp_search\"") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"parameters\"") != null);
 }
 
 test "Responses usage projection retains optional cached and reasoning detail" {

@@ -34,11 +34,12 @@ pub fn agentStream(provider: model_provider.ProviderId) stream_provider.Provider
         // separate future module.
         .minimax => directStream("minimax"),
         .openrouter => directStream("openrouter"),
+        .ppq => directStream("ppq"),
         .zhipu => directStream("zhipu"),
         .deepseek => directStream("deepseek"),
         .anthropic => directStream("anthropic"),
         .openai => directStream("openai"),
-        .opencode_go => directStream("opencode-go"),
+        .opencode_go => directStream("opencode"),
         .zai => directStream("zai"),
         .alibaba_cloud => directStream("alibaba-cloud"),
     };
@@ -63,11 +64,12 @@ pub fn modelCatalog(provider: model_provider.ProviderId) model_catalog.Provider 
         // absent.
         .minimax => directCatalog("minimax"),
         .openrouter => directCatalog("openrouter"),
+        .ppq => directCatalog("ppq"),
         .zhipu => directCatalog("zhipu"),
         .deepseek => directCatalog("deepseek"),
         .anthropic => directCatalog("anthropic"),
         .openai => directCatalog("openai"),
-        .opencode_go => directCatalog("opencode-go"),
+        .opencode_go => directCatalog("opencode"),
         .zai => directCatalog("zai"),
         .alibaba_cloud => directCatalog("alibaba-cloud"),
     };
@@ -89,7 +91,7 @@ fn directCatalog(comptime id: []const u8) model_catalog.Provider {
 /// modalities return an empty list here and keep their catalog-driven
 /// decision. Do not add ids you have not verified accept image input.
 fn visionModels(comptime id: []const u8) []const []const u8 {
-    return if (std.mem.eql(u8, id, "opencode-go"))
+    return if (std.mem.eql(u8, id, "opencode"))
         &[_][]const u8{
             "mimo-v2.5",
             "mimo-v2.5-free",
@@ -116,11 +118,12 @@ pub fn cliModelCatalog(provider: model_provider.ProviderId) gateway_provider.Cli
         .grok => xai_grok_models.cli_model_catalog_provider,
         .minimax => directCliCatalog("minimax"),
         .openrouter => directCliCatalog("openrouter"),
+        .ppq => directCliCatalog("ppq"),
         .zhipu => directCliCatalog("zhipu"),
         .deepseek => directCliCatalog("deepseek"),
         .anthropic => directCliCatalog("anthropic"),
         .openai => directCliCatalog("openai"),
-        .opencode_go => directCliCatalog("opencode-go"),
+        .opencode_go => directCliCatalog("opencode"),
         .zai => directCliCatalog("zai"),
         .alibaba_cloud => directCliCatalog("alibaba-cloud"),
     };
@@ -227,6 +230,14 @@ pub const providers = [_]Provider{
         .env_var = "OPENROUTER_API_KEY",
     },
     .{
+        .id = "ppq",
+        .display_name = "PPQ",
+        .default_base_url = "https://api.ppq.ai/v1",
+        .default_model = "claude-sonnet-4.6",
+        .env_var = "PPQ_API_KEY",
+        .models_endpoint = "/models",
+    },
+    .{
         // Zhipu is the vendor behind the GLM family. The official endpoint
         // is OpenAI-compatible at /api/paas/v4. Auth is via the Zhipu API
         // console (separate from openai/anthropic).
@@ -244,11 +255,12 @@ pub const providers = [_]Provider{
         .env_var = "DEEPSEEK_API_KEY",
     },
     .{
-        // opencode-go is the opencode token-plan gateway (same subscription
-        // used by opencode itself). OpenAI-compatible endpoint.
-        .id = "opencode-go",
-        .display_name = "Opencode Go (token plan)",
-        .default_base_url = "https://opencode.ai/zen/go/v1",
+        // OpenCode Zen exposes an OpenAI-compatible endpoint for its shared
+        // model catalog. Existing opencode-go keys are loaded as a migration
+        // fallback by the credential runtime.
+        .id = "opencode",
+        .display_name = "OpenCode",
+        .default_base_url = "https://opencode.ai/zen/v1",
         .default_model = "deepseek-v4-flash-vision-exp",
         .env_var = "OPENCODE_API_KEY",
     },

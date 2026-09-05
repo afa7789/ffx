@@ -369,7 +369,7 @@ pub fn streamProviderFor(
             @import("../core/agent/stream_provider.zig").unavailable_provider,
         .grok => state.cfg.grok_agent_stream orelse
             @import("../core/agent/stream_provider.zig").unavailable_provider,
-        .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.agentStream(provider),
+        .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.agentStream(provider),
     };
 }
 
@@ -381,7 +381,7 @@ pub fn catalogProviderFor(
         .gateway => state.cfg.gateway_provider.model_catalog,
         .codex => state.cfg.codex_model_catalog,
         .grok => state.cfg.grok_model_catalog,
-        .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.modelCatalog(provider),
+        .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.modelCatalog(provider),
     };
 }
 

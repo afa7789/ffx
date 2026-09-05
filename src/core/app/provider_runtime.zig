@@ -78,8 +78,8 @@ pub const Runtime = struct {
         const owned_key = try self.alloc.dupe(u8, target_key);
         errdefer self.alloc.free(owned_key);
         self.adoptOwned(target_provider, owned_model);
-        try self.active_provider_key.appendSlice(self.alloc, owned_key);
-        self.alloc.free(owned_key);
+        self.active_provider_key.deinit(self.alloc);
+        self.active_provider_key = .fromOwnedSlice(owned_key);
     }
 };
 
@@ -178,4 +178,15 @@ test "provider runtime preserves textual custom id while changing its model" {
     try runtime.replaceModel("another-model");
     try std.testing.expectEqualStrings("my-provider", runtime.providerKey());
     try std.testing.expectEqualStrings("another-model", runtime.selection().model);
+}
+
+test "provider runtime replaces custom identity sharing the legacy projection" {
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var first = try std.testing.allocator.dupe(u8, "first-model");
+    try runtime.adoptOwnedKey("first", .gateway, &first);
+    var second = try std.testing.allocator.dupe(u8, "second-model");
+    try runtime.adoptOwnedKey("second", .gateway, &second);
+    try std.testing.expectEqualStrings("second", runtime.providerKey());
+    try std.testing.expectEqualStrings("second-model", runtime.selection().model);
 }

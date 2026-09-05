@@ -44,7 +44,7 @@ ffx login openai
 ffx
 ```
 
-The current registry includes OpenAI, Anthropic, DeepSeek, Z.AI, Alibaba Cloud, OpenRouter, MiniMax, Zhipu, and OpenCode Go. Use `ffx login <provider>` to connect or replace a provider key. Use `/login` during an active session to reconnect or switch without discarding the conversation.
+The current registry includes OpenCode, OpenRouter, PPQ, DeepSeek, OpenAI, Anthropic, MiniMax, Zhipu, Z.AI, and Alibaba Cloud. Use `ffx login <provider>` to connect or replace a provider key. During an active session, use `/setup` to manage providers, `/connect-provider` to add a key, and `/switch-provider` to select an existing connection.
 
 Hermes Agent is not registered as a provider because its official integration
 is a client for configurable OpenAI-compatible endpoints, not a single LLM
@@ -57,7 +57,7 @@ ffx login deepseek
 ffx
 ```
 
-The footer shows the active provider, its billing mode, and local session usage, for example `OpenAI PAYG spent $1.23` or `Opencode Go TOKEN PLAN used 18k`. This is local observed usage, not a remote balance. When a provider does not expose its balance, ffx reports it as unknown instead of claiming that the plan is exhausted.
+The footer shows the active provider, its billing mode, and local session usage, for example `OpenAI PAYG spent $1.23` or `OpenCode PAYG used 18k`. This is local observed usage, not a remote balance. When a provider does not expose its balance, ffx reports it as unknown instead of claiming that the plan is exhausted.
 
 To configure a key interactively:
 

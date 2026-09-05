@@ -248,7 +248,7 @@ const AcpContext = struct {
                 .gateway => self.state.cfg.permission_reviewer_provider,
                 .codex => self.state.cfg.codex_permission_reviewer_provider,
                 .grok => self.state.cfg.grok_permission_reviewer_provider,
-                .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => self.state.cfg.permission_reviewer_provider,
+                .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => self.state.cfg.permission_reviewer_provider,
             },
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,

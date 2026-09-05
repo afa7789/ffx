@@ -7,6 +7,7 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("context_limits.zig");
 const input_appearance = @import("input_appearance.zig");
 const model_provider = @import("model_provider.zig");
+const provider_definition = @import("../provider/definition.zig");
 const presentation_mode = @import("presentation_mode.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -89,6 +90,8 @@ pub const WorkspaceDirectoryMutation = struct {
 pub const UserSettingsPatch = struct {
     model: ?[]const u8 = null,
     provider: ?model_provider.ProviderId = null,
+    provider_key: ?[]const u8 = null,
+    model_preferences: std.StringHashMapUnmanaged([]const u8) = .empty,
     codex_model: ?[]const u8 = null,
     grok_model: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
@@ -112,12 +115,18 @@ pub const UserSettingsPatch = struct {
     /// Per-provider API keys. Each entry sets one provider's key; entries not
     /// in the map leave the existing key untouched.
     api_keys: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Runtime provider definitions keyed by stable id. Definitions contain
+    /// no secrets; API keys remain in api_keys or the native keychain.
+    providers: std.StringHashMapUnmanaged(provider_definition.OwnedDefinition) = .empty,
+    clear_provider: ?[]const u8 = null,
     /// Removes one provider's key from the `api_keys` map.
     clear_api_key: ?[]const u8 = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model == null and
             self.provider == null and
+            self.provider_key == null and
+            self.model_preferences.count() == 0 and
             self.codex_model == null and
             self.grok_model == null and
             self.permission_mode == null and
@@ -137,6 +146,8 @@ pub const UserSettingsPatch = struct {
             self.notification_attention_required == null and
             self.notification_max == null and
             self.api_keys.count() == 0 and
+            self.providers.count() == 0 and
+            self.clear_provider == null and
             self.clear_api_key == null;
     }
 };
@@ -868,9 +879,21 @@ pub fn validateModel(model: []const u8) !void {
 }
 
 fn validateUserPatch(patch: UserSettingsPatch) !void {
+    if (patch.provider_key) |id| try provider_definition.validate_id(id);
+    if (patch.clear_provider) |id| try provider_definition.validate_id(id);
+    var preferences = patch.model_preferences.iterator();
+    while (preferences.next()) |entry| {
+        try provider_definition.validate_id(entry.key_ptr.*);
+        try validateModel(entry.value_ptr.*);
+    }
     if (patch.model) |model| try validateModel(model);
     if (patch.input_appearance) |appearance| try validateInputAppearance(appearance);
     if (patch.maxxing_mode) |mode| try validateMaxxingMode(mode);
+    var providers = patch.providers.iterator();
+    while (providers.next()) |entry| {
+        try entry.value_ptr.parsed.value.validate();
+        if (!std.mem.eql(u8, entry.key_ptr.*, entry.value_ptr.parsed.value.id)) return error.ProviderIdMismatch;
+    }
 }
 
 fn validAdditionalDirectoryPath(path: []const u8) bool {
@@ -994,6 +1017,16 @@ fn applyUserPatchToRoot(
     var application = PatchApplication{};
     if (patch.model) |value| application.changed = try putString(arena, &root.object, "model", value) or application.changed;
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", model_provider.registryId(value)) or application.changed;
+    if (patch.provider_key) |value| application.changed = try putString(arena, &root.object, "provider", value) or application.changed;
+    if (patch.model_preferences.count() > 0) {
+        if (root.object.get("model_preferences")) |value| {
+            if (value != .object) return error.InvalidSettingsFormat;
+        } else try root.object.put(arena, "model_preferences", .{ .object = .empty });
+        var preferences = patch.model_preferences.iterator();
+        while (preferences.next()) |entry| {
+            application.changed = try putString(arena, &root.object.getPtr("model_preferences").?.object, entry.key_ptr.*, entry.value_ptr.*) or application.changed;
+        }
+    }
     if (patch.codex_model) |value| application.changed = try putString(arena, &root.object, "codex_model", value) or application.changed;
     if (patch.grok_model) |value| application.changed = try putString(arena, &root.object, "grok_model", value) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
@@ -1077,8 +1110,43 @@ fn applyUserPatchToRoot(
         }
     }
 
+    if (patch.providers.count() > 0) {
+        var providers_obj = if (root.object.getPtr("providers")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "providers", .{ .object = .empty });
+            break :blk root.object.getPtr("providers").?;
+        };
+        var provider_it = patch.providers.iterator();
+        while (provider_it.next()) |entry| {
+            var encoded = std.Io.Writer.Allocating.init(arena);
+            defer encoded.deinit();
+            try std.json.Stringify.value(entry.value_ptr.parsed.value, .{}, &encoded.writer);
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, encoded.written(), .{});
+            application.changed = try putValue(arena, &providers_obj.object, entry.key_ptr.*, parsed) or application.changed;
+        }
+    }
+    if (patch.clear_provider) |provider| {
+        if (root.object.getPtr("providers")) |providers_value| {
+            if (providers_value.* != .object) return error.InvalidSettingsFormat;
+            if (providers_value.object.contains(provider)) {
+                _ = providers_value.object.orderedRemove(provider);
+                application.changed = true;
+            }
+        }
+    }
+
     try cleanupLegacyWorkspacePreferences(arena, root, patch, &application);
     return application;
+}
+
+fn putValue(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !bool {
+    if (object.get(key)) |current| {
+        if (std.meta.eql(current, value)) return false;
+    }
+    try object.put(arena, key, value);
+    return true;
 }
 
 fn cleanupLegacyWorkspacePreferences(
@@ -1687,9 +1755,8 @@ fn validateKnownSettingsObject(
         try validateModel(value.string);
     }
     if (object.get("provider")) |value| {
-        if (value != .string or model_provider.parse(value.string) == null) {
-            return error.InvalidSettingsFormat;
-        }
+        if (value != .string) return error.InvalidSettingsFormat;
+        if (model_provider.parse(value.string) == null) provider_definition.validate_id(value.string) catch return error.InvalidSettingsFormat;
     }
     if (object.get("codex_model")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;
@@ -1790,6 +1857,15 @@ fn validateKnownSettingsObject(
             }
         } else if (!tolerate_non_object_user_containers) {
             return error.InvalidSettingsFormat;
+        }
+    }
+    if (object.get("model_preferences")) |value| {
+        if (value != .object) return error.InvalidSettingsFormat;
+        var preferences = value.object.iterator();
+        while (preferences.next()) |entry| {
+            provider_definition.validate_id(entry.key_ptr.*) catch return error.InvalidSettingsFormat;
+            if (entry.value_ptr.* != .string) return error.InvalidSettingsFormat;
+            validateModel(entry.value_ptr.string) catch return error.InvalidSettingsFormat;
         }
     }
     if (object.get("api_keys")) |value| {
@@ -3814,4 +3890,39 @@ test "workspace directory add compacts saved aliases before applying effective c
     defer alloc.free(retained_identity);
     try std.testing.expectEqualStrings(shared, retained_identity);
     try std.testing.expectEqualStrings(added, directories[1].string);
+}
+
+test "dynamic provider selection and preferences preserve unknown settings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"future\":{\"keep\":true},\"provider\":\"custom\",\"model_preferences\":{\"other\":\"retained\"}}", .{});
+    var patch: UserSettingsPatch = .{ .provider_key = "new-custom" };
+    try patch.model_preferences.put(alloc, "new-custom", "private-model");
+    try validateUserPatch(patch);
+    const application = try applyUserPatchToRoot(alloc, &root, patch);
+    try std.testing.expect(application.changed);
+    try validateKnownSettingsObject(root.object, false);
+    try std.testing.expectEqualStrings("new-custom", root.object.get("provider").?.string);
+    try std.testing.expect(root.object.get("future").?.object.get("keep").?.bool);
+    try std.testing.expectEqualStrings("retained", root.object.get("model_preferences").?.object.get("other").?.string);
+    try std.testing.expectEqualStrings("private-model", root.object.get("model_preferences").?.object.get("new-custom").?.string);
+}
+
+test "dynamic provider edits and removal retain credentials and unrelated definitions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"api_keys\":{\"custom\":\"secret\"},\"providers\":{\"untouched\":{\"future\":true}}}", .{});
+    var custom = try provider_definition.parse(alloc, "{\"id\":\"custom\",\"display_name\":\"Custom\",\"protocol\":\"openai_responses\",\"endpoint\":\"https://example.test\"}");
+    defer custom.deinit();
+    var patch: UserSettingsPatch = .{};
+    try patch.providers.put(alloc, "custom", custom);
+    try validateUserPatch(patch);
+    try std.testing.expect((try applyUserPatchToRoot(alloc, &root, patch)).changed);
+    try std.testing.expectEqualStrings("openai_responses", root.object.get("providers").?.object.get("custom").?.object.get("protocol").?.string);
+    try std.testing.expect((try applyUserPatchToRoot(alloc, &root, .{ .clear_provider = "custom" })).changed);
+    try std.testing.expect(!root.object.get("providers").?.object.contains("custom"));
+    try std.testing.expect(root.object.get("providers").?.object.get("untouched").?.object.get("future").?.bool);
+    try std.testing.expectEqualStrings("secret", root.object.get("api_keys").?.object.get("custom").?.string);
 }

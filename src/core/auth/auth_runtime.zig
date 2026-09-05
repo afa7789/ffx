@@ -6,6 +6,7 @@ const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
+const oauth_session = @import("oauth_session.zig");
 const model_provider = @import("../config/model_provider.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
@@ -16,6 +17,89 @@ const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 pub const SourceSet = std.EnumSet(credentials.Source);
+pub const ProviderSet = std.EnumSet(model_provider.ProviderId);
+
+pub const ProviderPickerMode = enum {
+    connect,
+    switch_existing,
+};
+
+pub const SignInProvider = enum {
+    vercel,
+    codex,
+    grok,
+};
+
+/// The provider-specific OAuth modules implement the protocol, while the
+/// picker consumes this small common acquisition contract. Adding another
+/// OAuth provider only requires an adapter entry here; picker state and input
+/// handling remain provider agnostic.
+pub const OAuthAdapter = struct {
+    provider: SignInProvider,
+    provider_id: model_provider.ProviderId,
+    start: *const fn (*login_flow.SignInRuntime, Allocator, oauth_transport.Provider) anyerror!bool,
+    source_exists: *const fn (Allocator) anyerror!bool,
+};
+
+fn startVercelOAuth(
+    runtime: *login_flow.SignInRuntime,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+) !bool {
+    return runtime.start(alloc, transport);
+}
+
+fn startCodexOAuth(
+    runtime: *login_flow.SignInRuntime,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+) !bool {
+    return chatgpt_oauth.startSignIn(runtime, alloc, transport);
+}
+
+fn startGrokOAuth(
+    runtime: *login_flow.SignInRuntime,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+) !bool {
+    return grok_oauth.startSignIn(runtime, alloc, transport);
+}
+
+fn vercelSourceExists(alloc: Allocator) !bool {
+    var mutation = (try oauth_session.beginExistingMutation()) orelse return false;
+    defer mutation.deinit();
+    _ = alloc;
+    return true;
+}
+
+const oauth_adapters = [_]OAuthAdapter{
+    .{ .provider = .vercel, .provider_id = .gateway, .start = startVercelOAuth, .source_exists = vercelSourceExists },
+    .{ .provider = .codex, .provider_id = .codex, .start = startCodexOAuth, .source_exists = chatgpt_oauth.sourceExists },
+    .{ .provider = .grok, .provider_id = .grok, .start = startGrokOAuth, .source_exists = grok_oauth.sourceExists },
+};
+
+pub fn oauthAdapter(provider: SignInProvider) ?*const OAuthAdapter {
+    for (&oauth_adapters) |*adapter| {
+        if (adapter.provider == provider) return adapter;
+    }
+    return null;
+}
+
+const provider_picker_order = [_]model_provider.ProviderId{
+    .opencode_go,
+    .openrouter,
+    .ppq,
+    .codex,
+    .deepseek,
+    .grok,
+    .openai,
+    .anthropic,
+    .minimax,
+    .zhipu,
+    .zai,
+    .alibaba_cloud,
+    .gateway,
+};
 
 pub const CredentialRefreshMode = enum {
     if_needed,
@@ -122,6 +206,7 @@ pub const AcquisitionAction = enum {
     login,
     chatgpt_login,
     grok_login,
+    api_key,
     setup,
     change_team,
     switch_credential,
@@ -134,6 +219,7 @@ pub const AcquisitionAction = enum {
 pub const PickerStage = enum {
     root,
     provider,
+    method,
     sign_in,
     api_key,
     change_team,
@@ -151,7 +237,10 @@ pub const ApiKeySaveStart = enum {
 
 pub const ApiKeySaveResult = union(enum) {
     empty,
-    saved: bool,
+    saved: struct {
+        changed: bool,
+        provider: model_provider.ProviderId,
+    },
     gateway_refused,
     gateway_unavailable,
     store_failed,
@@ -183,15 +272,18 @@ const ApiKeySaveDeps = struct {
     validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     store: StoredKeyStoreFn = storeUnavailableSecret,
     loader: CredentialLoaderFn = loadCredentialSource,
+    validate_gateway: bool = true,
 };
 
 /// The whole save sequence with no runtime state, so outcome behaviour can be
 /// tested synchronously while the worker owns only threading.
 fn performApiKeySave(alloc: Allocator, key: []const u8, deps: ApiKeySaveDeps) ApiKeySaveOutcome {
-    switch (deps.validator.validate(alloc, key)) {
-        .accepted => {},
-        .refused => return .gateway_refused,
-        .unavailable => return .gateway_unavailable,
+    if (deps.validate_gateway) {
+        switch (deps.validator.validate(alloc, key)) {
+            .accepted => {},
+            .refused => return .gateway_refused,
+            .unavailable => return .gateway_unavailable,
+        }
     }
     deps.store(deps.ctx, alloc, key) catch |err| {
         debug_trace.logf("auth", "api key save failed step=store err={s}", .{@errorName(err)});
@@ -341,6 +433,9 @@ pub const PickerView = struct {
     selected_choice: ?Choice,
     active_source: ?credentials.Source,
     active_provider: model_provider.ProviderId = .gateway,
+    available_providers: ProviderSet = .empty,
+    provider_picker_mode: ProviderPickerMode = .switch_existing,
+    provider_picker_target: model_provider.ProviderId = .gateway,
     include_skip: bool,
     stage: PickerStage = .root,
     fx_login_session_available: bool = false,
@@ -348,7 +443,8 @@ pub const PickerView = struct {
     current_team: ?[]const u8 = null,
     team_query: []const u8 = &.{},
     sign_in: login_flow.SignInSnapshot = .{},
-    sign_in_source: credentials.Source = .stored_key,
+    sign_in_provider: SignInProvider = .vercel,
+    api_key_provider: model_provider.ProviderId = .gateway,
     api_key_mask_count: usize = 0,
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
@@ -357,13 +453,9 @@ pub const PickerView = struct {
 
     pub fn choiceCount(self: PickerView) usize {
         return switch (self.stage) {
-            .root => if (self.include_skip)
-                if (comptime host_target.is_wasm) 2 else 4
-            else if (comptime host_target.is_wasm)
-                4
-            else
-                7,
-            .provider => if (comptime host_target.is_wasm) 2 else 3,
+            .root => if (comptime host_target.is_wasm) 2 else 4,
+            .provider => providerChoiceCount(self.available_providers, self.provider_picker_mode),
+            .method => 2,
             .sign_in, .api_key => 0,
             .change_team => blk: {
                 var count: usize = 0;
@@ -378,42 +470,26 @@ pub const PickerView = struct {
 
     pub fn choiceAt(self: PickerView, index: usize) ?Choice {
         return switch (self.stage) {
-            .root => if (self.include_skip)
-                if (comptime host_target.is_wasm)
-                    switch (index) {
-                        0 => .{ .action = .login },
-                        1 => .{ .action = .setup },
-                        else => null,
-                    }
-                else switch (index) {
-                    0 => .{ .action = .login },
-                    1 => .{ .action = .chatgpt_login },
-                    2 => .{ .action = .grok_login },
-                    3 => .{ .action = .setup },
-                    else => null,
-                }
-            else if (comptime host_target.is_wasm)
+            .root => if (comptime host_target.is_wasm)
                 switch (index) {
-                    0 => .{ .action = .login },
-                    1 => .{ .action = .setup },
-                    2 => .{ .action = .change_team },
-                    3 => .{ .action = .switch_credential },
+                    0 => .{ .action = .setup },
+                    1 => .{ .action = .switch_provider },
                     else => null,
                 }
             else switch (index) {
-                0 => .{ .action = .login },
+                0 => .{ .action = .setup },
                 1 => .{ .action = .chatgpt_login },
                 2 => .{ .action = .grok_login },
-                3 => .{ .action = .setup },
-                4 => .{ .action = .switch_provider },
-                5 => .{ .action = .change_team },
-                6 => .{ .action = .switch_credential },
+                3 => .{ .action = .switch_provider },
                 else => null,
             },
-            .provider => switch (index) {
-                0 => .{ .provider = .gateway },
-                1 => .{ .provider = .codex },
-                2 => if (comptime host_target.is_wasm) null else .{ .provider = .grok },
+            .provider => if (providerChoiceAt(self.available_providers, self.provider_picker_mode, index)) |provider|
+                .{ .provider = provider }
+            else
+                null,
+            .method => switch (index) {
+                0 => .{ .action = .chatgpt_login },
+                1 => .{ .action = .api_key },
                 else => null,
             },
             .sign_in, .api_key => null,
@@ -457,7 +533,8 @@ pub const PickerView = struct {
                 .login => "Connect a provider",
                 .chatgpt_login => "Sign in with Codex",
                 .grok_login => "Sign in with Grok",
-                .setup => if (self.include_skip) "Connect a provider" else "Reconnect provider",
+                .api_key => "API key",
+                .setup => "Add an API key",
                 .change_team => "Change team",
                 .switch_credential => "Switch connection",
                 .switch_provider => "Switch provider",
@@ -469,13 +546,19 @@ pub const PickerView = struct {
 
     pub fn choiceDescription(self: PickerView, choice: Choice) []const u8 {
         return switch (choice) {
-            .provider => |provider| if (provider == self.active_provider) "current" else "available",
+            .provider => |provider| if (provider == self.active_provider)
+                "current"
+            else if (self.available_providers.contains(provider))
+                "connected"
+            else
+                "",
             .source => |source| if (self.active_source == source) "current" else "available",
             .action => |action| switch (action) {
-                .login => "Choose a provider and connect it",
-                .chatgpt_login => "",
-                .grok_login => if (self.available_sources.contains(.stored_key)) "connected" else "",
-                .setup => "Replace the current provider key",
+                .login => "",
+                .chatgpt_login => if (self.available_providers.contains(.codex)) "connected" else "",
+                .grok_login => if (self.available_providers.contains(.grok)) "connected" else "",
+                .api_key => "",
+                .setup => "",
                 .switch_credential => "Use another saved connection",
                 .switch_provider => "Choose a different provider",
                 .automatic => "use normal precedence",
@@ -489,7 +572,8 @@ pub const PickerView = struct {
         return switch (choice) {
             .action => |action| (action != .change_team) and
                 (action != .chatgpt_login or !host_target.is_wasm) and
-                (action != .grok_login or !host_target.is_wasm),
+                (action != .grok_login or !host_target.is_wasm) and
+                (action != .api_key or !host_target.is_wasm),
             .provider, .source, .team => true,
         };
     }
@@ -501,6 +585,26 @@ pub const PickerView = struct {
         return std.mem.eql(u8, current, team.id) or std.mem.eql(u8, current, team.slug);
     }
 };
+
+fn providerChoiceCount(available: ProviderSet, mode: ProviderPickerMode) usize {
+    if (mode == .connect) return provider_picker_order.len - 1;
+    var count: usize = 0;
+    for (provider_picker_order) |provider| {
+        if (available.contains(provider)) count += 1;
+    }
+    return count;
+}
+
+fn providerChoiceAt(available: ProviderSet, mode: ProviderPickerMode, index: usize) ?model_provider.ProviderId {
+    var visible: usize = 0;
+    for (provider_picker_order) |provider| {
+        if (mode == .connect and provider == .gateway) continue;
+        if (mode == .switch_existing and !available.contains(provider)) continue;
+        if (visible == index) return provider;
+        visible += 1;
+    }
+    return null;
+}
 
 fn teamMatchesQuery(team: login_flow.Team, query: []const u8) bool {
     return text_utils.containsIgnoreCase(team.name, query) or
@@ -666,6 +770,7 @@ pub const Runtime = struct {
     selected_credential: ?credentials.Credential = null,
     credential_refresh_failure_source: ?credentials.Source = null,
     source_inventory: SourceSet = .empty,
+    provider_inventory: ProviderSet = .empty,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
     onboarding_skipped: bool = false,
     picker_active: bool = false,
@@ -673,13 +778,17 @@ pub const Runtime = struct {
     picker_include_skip: bool = false,
     picker_stage: PickerStage = .root,
     provider_picker_active: model_provider.ProviderId = .gateway,
+    provider_picker_mode: ProviderPickerMode = .switch_existing,
+    provider_picker_target: model_provider.ProviderId = .gateway,
     fx_login_session_available: bool = false,
     team_selection: ?login_flow.TeamSelection = null,
     team_query: std.ArrayList(u8) = .empty,
     sign_in_flow: login_flow.SignInRuntime = .{},
-    sign_in_source: credentials.Source = .stored_key,
+    sign_in_provider: SignInProvider = .vercel,
     sign_in_returns_to_root: bool = false,
     api_key_input: std.ArrayList(u8) = .empty,
+    api_key_provider: model_provider.ProviderId = .gateway,
+    api_key_save_provider: model_provider.ProviderId = .gateway,
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
 
@@ -834,6 +943,14 @@ pub const Runtime = struct {
         _ = self;
     }
 
+    pub fn setProviderInventory(self: *Self, providers: ProviderSet) void {
+        self.provider_inventory = providers;
+    }
+
+    pub fn providerPickerMode(self: *const Self) ProviderPickerMode {
+        return self.provider_picker_mode;
+    }
+
     fn refreshSourceInventoryWithProbe(
         self: *Self,
         alloc: Allocator,
@@ -873,13 +990,17 @@ pub const Runtime = struct {
             .selected_choice = self.picker_selection,
             .active_source = self.credentialSource(),
             .active_provider = self.provider_picker_active,
+            .available_providers = self.provider_inventory,
+            .provider_picker_mode = self.provider_picker_mode,
+            .provider_picker_target = self.provider_picker_target,
             .include_skip = self.picker_include_skip,
             .stage = self.picker_stage,
             .teams = if (self.team_selection) |*selection| selection.teams.items else &.{},
             .current_team = if (self.team_selection) |*selection| selection.currentTeam() else null,
             .team_query = self.team_query.items,
             .sign_in = self.sign_in_flow.snapshot(),
-            .sign_in_source = self.sign_in_source,
+            .sign_in_provider = self.sign_in_provider,
+            .api_key_provider = self.api_key_provider,
             .api_key_mask_count = @min(self.api_key_input.items.len, max_api_key_mask_glyphs),
         };
     }
@@ -914,6 +1035,23 @@ pub const Runtime = struct {
         alloc: Allocator,
         active_provider: model_provider.ProviderId,
     ) void {
+        self.openProviderPickerWithMode(alloc, active_provider, .switch_existing);
+    }
+
+    pub fn openConnectProviderPicker(
+        self: *Self,
+        alloc: Allocator,
+        active_provider: model_provider.ProviderId,
+    ) void {
+        self.openProviderPickerWithMode(alloc, active_provider, .connect);
+    }
+
+    fn openProviderPickerWithMode(
+        self: *Self,
+        alloc: Allocator,
+        active_provider: model_provider.ProviderId,
+        mode: ProviderPickerMode,
+    ) void {
         self.exitSignInStage(alloc);
         self.exitApiKeyStage(alloc, .screen_replacement);
         self.clearTeamSelection(alloc);
@@ -921,7 +1059,20 @@ pub const Runtime = struct {
         self.picker_include_skip = false;
         self.picker_stage = .provider;
         self.provider_picker_active = active_provider;
-        self.picker_selection = .{ .provider = active_provider };
+        self.provider_picker_mode = mode;
+        self.picker_selection = if (mode == .switch_existing and self.provider_inventory.contains(active_provider))
+            .{ .provider = active_provider }
+        else
+            self.pickerView().choiceAt(0);
+    }
+
+    pub fn openCodexMethodPicker(self: *Self, alloc: Allocator) void {
+        self.exitSignInStage(alloc);
+        self.exitApiKeyStage(alloc, .screen_replacement);
+        self.picker_active = true;
+        self.picker_stage = .method;
+        self.provider_picker_target = .codex;
+        self.picker_selection = self.pickerView().choiceAt(0);
     }
 
     pub fn teamPickerActive(self: *const Self) bool {
@@ -966,14 +1117,23 @@ pub const Runtime = struct {
     }
 
     pub fn openApiKeyPicker(self: *Self, alloc: Allocator) void {
-        self.openApiKeyPickerWithParent(alloc, false);
+        self.openApiKeyPickerWithParent(alloc, false, .gateway);
     }
 
     pub fn openApiKeyPickerFromRoot(self: *Self, alloc: Allocator) void {
-        self.openApiKeyPickerWithParent(alloc, true);
+        self.openApiKeyPickerWithParent(alloc, true, .gateway);
     }
 
-    fn openApiKeyPickerWithParent(self: *Self, alloc: Allocator, returns_to_root: bool) void {
+    pub fn openProviderApiKeyPicker(self: *Self, alloc: Allocator, provider: model_provider.ProviderId) void {
+        self.openApiKeyPickerWithParent(alloc, true, provider);
+    }
+
+    fn openApiKeyPickerWithParent(
+        self: *Self,
+        alloc: Allocator,
+        returns_to_root: bool,
+        provider: model_provider.ProviderId,
+    ) void {
         self.exitSignInStage(alloc);
         self.exitApiKeyStage(alloc, .screen_replacement);
         self.clearTeamSelection(alloc);
@@ -981,54 +1141,53 @@ pub const Runtime = struct {
         self.picker_stage = .api_key;
         self.picker_selection = null;
         self.api_key_returns_to_root = returns_to_root;
+        self.api_key_provider = provider;
     }
 
     pub fn openSignInPicker(self: *Self, alloc: Allocator) !bool {
-        return self.openSignInPickerWithParent(alloc, false, .stored_key);
+        return self.openSignInPickerWithParent(alloc, false, .vercel);
     }
 
     pub fn openSignInPickerFromRoot(self: *Self, alloc: Allocator) !bool {
-        return self.openSignInPickerWithParent(alloc, true, .stored_key);
+        return self.openSignInPickerWithParent(alloc, true, .vercel);
     }
 
     pub fn openChatGptSignInPickerFromRoot(self: *Self, alloc: Allocator) !bool {
         if (comptime host_target.is_wasm) return error.ChatGptOAuthUnavailable;
-        return self.openSignInPickerWithParent(alloc, true, .stored_key);
+        return self.openSignInPickerWithParent(alloc, true, .codex);
     }
 
     pub fn openChatGptSignInPickerForProviderSwitch(self: *Self, alloc: Allocator) !bool {
         if (comptime host_target.is_wasm) return error.ChatGptOAuthUnavailable;
-        return self.openSignInPickerWithParent(alloc, false, .stored_key);
+        return self.openSignInPickerWithParent(alloc, false, .codex);
     }
 
     pub fn openGrokSignInPickerFromRoot(self: *Self, alloc: Allocator) !bool {
         if (comptime host_target.is_wasm) return error.GrokOAuthUnavailable;
-        return self.openSignInPickerWithParent(alloc, true, .stored_key);
+        return self.openSignInPickerWithParent(alloc, true, .grok);
     }
 
     pub fn openGrokSignInPickerForProviderSwitch(self: *Self, alloc: Allocator) !bool {
         if (comptime host_target.is_wasm) return error.GrokOAuthUnavailable;
-        return self.openSignInPickerWithParent(alloc, false, .stored_key);
+        return self.openSignInPickerWithParent(alloc, false, .grok);
     }
 
     fn openSignInPickerWithParent(
         self: *Self,
         alloc: Allocator,
         returns_to_root: bool,
-        source: credentials.Source,
+        provider: SignInProvider,
     ) !bool {
         self.exitSignInStage(alloc);
-        const started = switch (source) {
-            .stored_key => try self.sign_in_flow.start(alloc, self.oauth_transport),
-            .env_var => return error.InvalidSignInSource,
-        };
+        const adapter = oauthAdapter(provider) orelse return false;
+        const started = try (adapter.start)(&self.sign_in_flow, alloc, self.oauth_transport);
         if (!started) return false;
         self.exitApiKeyStage(alloc, .screen_replacement);
         self.clearTeamSelection(alloc);
         self.picker_active = true;
         self.picker_stage = .sign_in;
         self.picker_selection = null;
-        self.sign_in_source = source;
+        self.sign_in_provider = provider;
         self.sign_in_returns_to_root = returns_to_root;
         return true;
     }
@@ -1079,12 +1238,21 @@ pub const Runtime = struct {
     /// store write can block for seconds on a locked keychain, and the gateway
     /// check is a network round trip; neither may run on the event loop.
     pub fn beginApiKeySave(self: *Self, alloc: Allocator) ApiKeySaveStart {
-        return self.beginApiKeySaveWithDeps(alloc, .{
-            .ctx = self,
-            .validator = self.api_key_validator,
-            .store = storeRuntimeSecret,
-            .loader = loadRuntimeCredentialSource,
-        });
+        if (!self.api_key_save.isSaving()) self.api_key_save_provider = self.api_key_provider;
+        return if (self.api_key_provider == .gateway)
+            self.beginApiKeySaveWithDeps(alloc, .{
+                .ctx = self,
+                .validator = self.api_key_validator,
+                .store = storeRuntimeSecret,
+                .loader = loadRuntimeCredentialSource,
+            })
+        else
+            self.beginApiKeySaveWithDeps(alloc, .{
+                .ctx = self,
+                .store = storeRuntimeProviderSecret,
+                .loader = loadRuntimeProviderCredential,
+                .validate_gateway = false,
+            });
     }
 
     fn beginApiKeySaveWithDeps(self: *Self, alloc: Allocator, deps: ApiKeySaveDeps) ApiKeySaveStart {
@@ -1120,7 +1288,14 @@ pub const Runtime = struct {
                 var owned = credential.*;
                 outcome = .reload_failed;
                 defer owned.deinit(alloc);
-                break :blk .{ .saved = self.adoptCredential(alloc, &owned) };
+                const changed = if (self.api_key_save_provider == .gateway)
+                    self.adoptCredential(alloc, &owned)
+                else
+                    false;
+                break :blk .{ .saved = .{
+                    .changed = changed,
+                    .provider = self.api_key_save_provider,
+                } };
             },
         };
     }
@@ -1134,7 +1309,12 @@ pub const Runtime = struct {
         }
         if (stage == .provider) {
             self.picker_stage = .root;
-            self.picker_selection = .{ .action = .switch_provider };
+            self.picker_selection = .{ .action = if (self.provider_picker_mode == .connect) .setup else .switch_provider };
+            return true;
+        }
+        if (stage == .method) {
+            self.openProviderPickerWithMode(alloc, self.provider_picker_active, .connect);
+            self.picker_selection = .{ .provider = self.provider_picker_target };
             return true;
         }
 
@@ -1164,9 +1344,12 @@ pub const Runtime = struct {
         self.clearTeamSelection(alloc);
         self.picker_stage = .root;
         self.picker_selection = .{ .action = switch (stage) {
-            .root => unreachable,
-            .provider => unreachable,
-            .sign_in => .login,
+            .root, .provider, .method => unreachable,
+            .sign_in => switch (self.sign_in_provider) {
+                .vercel => .login,
+                .codex => .chatgpt_login,
+                .grok => .grok_login,
+            },
             .api_key => .setup,
             .change_team => .change_team,
             .switch_credential => .switch_credential,
@@ -1192,8 +1375,18 @@ pub const Runtime = struct {
         switch (self.picker_stage) {
             .sign_in, .api_key => unreachable,
             .provider => switch (selected) {
-                .provider => self.closePicker(alloc),
+                .provider => |provider| {
+                    self.provider_picker_target = provider;
+                    self.closePicker(alloc);
+                },
                 .source, .action, .team => unreachable,
+            },
+            .method => switch (selected) {
+                .action => |action| switch (action) {
+                    .chatgpt_login, .api_key => self.closePicker(alloc),
+                    else => unreachable,
+                },
+                .provider, .source, .team => unreachable,
             },
             .root => switch (selected) {
                 .provider => unreachable,
@@ -1208,7 +1401,7 @@ pub const Runtime = struct {
                     .setup => {},
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
-                    .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
+                    .login, .chatgpt_login, .grok_login, .api_key => self.closePicker(alloc),
                 },
                 .team => unreachable,
             },
@@ -1456,6 +1649,38 @@ fn loadRuntimeCredentialSource(raw: ?*anyopaque, alloc: Allocator, source: crede
 fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
     return self.secret_store.store(alloc, value);
+}
+
+fn storeRuntimeProviderSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
+    const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    return credentials.storeDirectProviderKey(
+        alloc,
+        model_provider.registryId(self.api_key_save_provider),
+        value,
+    );
+}
+
+fn loadRuntimeProviderCredential(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    _: credentials.Source,
+) !?credentials.Credential {
+    const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    const provider_id = model_provider.registryId(self.api_key_save_provider);
+    const env_var = switch (self.api_key_save_provider) {
+        .minimax => "MINIMAX_API_KEY",
+        .openrouter => "OPENROUTER_API_KEY",
+        .ppq => "PPQ_API_KEY",
+        .zhipu => "ZHIPU_API_KEY",
+        .deepseek => "DEEPSEEK_API_KEY",
+        .anthropic => "ANTHROPIC_API_KEY",
+        .openai => "OPENAI_API_KEY",
+        .opencode_go => "OPENCODE_API_KEY",
+        .zai => "ZAI_API_KEY",
+        .alibaba_cloud => "DASHSCOPE_API_KEY",
+        .gateway, .codex, .grok => return null,
+    };
+    return credentials.resolveDirectProvider(alloc, self.secret_store, provider_id, env_var);
 }
 
 fn storeUnavailableSecret(_: ?*anyopaque, _: Allocator, _: []const u8) !void {
@@ -2132,7 +2357,7 @@ test "logout reconciliation adopts a newer concurrent stored key" {
     try std.testing.expect(runtime.source_inventory.contains(.stored_key));
 }
 
-test "auth picker root starts on sign in and keeps sources in the switch stage" {
+test "auth picker root starts on adding a provider" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -2146,10 +2371,10 @@ test "auth picker root starts on sign in and keeps sources in the switch stage" 
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.active);
-    try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
-    try std.testing.expectEqual(@as(usize, 7), picker.choiceCount());
-    try std.testing.expectEqualStrings("Switch provider", picker.choiceLabel(picker.choiceAt(4).?));
-    try std.testing.expect(picker.choiceAt(7) == null);
+    try std.testing.expect((Choice{ .action = .setup }).eql(picker.selected_choice.?));
+    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
+    try std.testing.expectEqualStrings("Switch provider", picker.choiceLabel(picker.choiceAt(3).?));
+    try std.testing.expect(picker.choiceAt(4) == null);
 }
 
 test "credential switcher lists only gateway credential sources" {
@@ -2166,7 +2391,38 @@ test "credential switcher lists only gateway credential sources" {
     try std.testing.expect((Choice{ .action = .automatic }).eql(picker.choiceAt(1).?));
 }
 
-test "auth picker navigation wraps across the seven hub actions" {
+test "connect provider picker prioritizes OpenCode OpenRouter and PPQ" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    runtime.openConnectProviderPicker(alloc, .gateway);
+    const picker = runtime.pickerView();
+    try std.testing.expectEqual(ProviderPickerMode.connect, picker.provider_picker_mode);
+    try std.testing.expect((Choice{ .provider = .opencode_go }).eql(picker.choiceAt(0).?));
+    try std.testing.expect((Choice{ .provider = .openrouter }).eql(picker.choiceAt(1).?));
+    try std.testing.expect((Choice{ .provider = .ppq }).eql(picker.choiceAt(2).?));
+    try std.testing.expectEqualStrings("OpenCode", picker.choiceLabel(picker.choiceAt(0).?));
+}
+
+test "switch provider picker contains only connected providers" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.setProviderInventory(ProviderSet.initMany(&.{ .opencode_go, .ppq, .codex }));
+
+    runtime.openProviderPicker(alloc, .ppq);
+    const picker = runtime.pickerView();
+    try std.testing.expectEqual(ProviderPickerMode.switch_existing, picker.provider_picker_mode);
+    try std.testing.expectEqual(@as(usize, 3), picker.choiceCount());
+    try std.testing.expect((Choice{ .provider = .opencode_go }).eql(picker.choiceAt(0).?));
+    try std.testing.expect((Choice{ .provider = .ppq }).eql(picker.choiceAt(1).?));
+    try std.testing.expect((Choice{ .provider = .codex }).eql(picker.choiceAt(2).?));
+    try std.testing.expect((Choice{ .provider = .ppq }).eql(picker.selected_choice.?));
+    try std.testing.expect(picker.choiceAt(3) == null);
+}
+
+test "auth picker navigation wraps across the concise setup actions" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     runtime.source_inventory = SourceSet.initMany(&.{ .env_var, .stored_key });
@@ -2177,17 +2433,11 @@ test "auth picker navigation wraps across the seven hub actions" {
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .grok_login }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
-    try std.testing.expect((Choice{ .action = .setup }).eql(runtime.pickerView().selected_choice.?));
-    try std.testing.expect(runtime.movePicker(1));
     try std.testing.expectEqualStrings("Switch provider", runtime.pickerView().choiceLabel(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
-    try std.testing.expect((Choice{ .action = .change_team }).eql(runtime.pickerView().selected_choice.?));
-    try std.testing.expect(runtime.movePicker(1));
-    try std.testing.expect((Choice{ .action = .switch_credential }).eql(runtime.pickerView().selected_choice.?));
-    try std.testing.expect(runtime.movePicker(1));
-    try std.testing.expect((Choice{ .action = .login }).eql(runtime.pickerView().selected_choice.?));
+    try std.testing.expect((Choice{ .action = .setup }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(-1));
-    try std.testing.expect((Choice{ .action = .switch_credential }).eql(runtime.pickerView().selected_choice.?));
+    try std.testing.expect((Choice{ .action = .switch_provider }).eql(runtime.pickerView().selected_choice.?));
 }
 
 test "auth picker selection closes before returning its typed choice" {
@@ -2198,8 +2448,8 @@ test "auth picker selection closes before returning its typed choice" {
     try std.testing.expect(runtime.takePickerChoice(alloc) == null);
     runtime.openPicker(alloc);
 
-    try std.testing.expect((Choice{ .action = .login }).eql(runtime.takePickerChoice(alloc).?));
-    try std.testing.expect(!runtime.pickerView().active);
+    try std.testing.expect((Choice{ .action = .setup }).eql(runtime.takePickerChoice(alloc).?));
+    try std.testing.expect(runtime.pickerView().active);
 }
 
 test "auth picker without credentials exposes acquisition actions" {
@@ -2209,10 +2459,9 @@ test "auth picker without credentials exposes acquisition actions" {
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.active_source == null);
-    try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
+    try std.testing.expect((Choice{ .action = .setup }).eql(picker.selected_choice.?));
     try std.testing.expectEqual(@as(usize, 0), picker.available_sources.count());
-    try std.testing.expectEqual(@as(usize, 7), picker.choiceCount());
-    try std.testing.expect(!picker.choiceEnabled(.{ .action = .change_team }));
+    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
     try std.testing.expectEqualStrings("missing", picker.activeSourceLabel());
 }
 
@@ -2224,11 +2473,11 @@ test "auth onboarding picker exposes the setup paths" {
     const picker = runtime.pickerView();
     try std.testing.expect(picker.include_skip);
     try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
-    try std.testing.expect((Choice{ .action = .login }).eql(picker.choiceAt(0).?));
+    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(0).?));
     try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(picker.choiceAt(1).?));
     try std.testing.expect((Choice{ .action = .grok_login }).eql(picker.choiceAt(2).?));
-    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(3).?));
-    try std.testing.expectEqualStrings("Connect a provider", picker.choiceLabel(picker.choiceAt(3).?));
+    try std.testing.expect((Choice{ .action = .switch_provider }).eql(picker.choiceAt(3).?));
+    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(0).?));
     try std.testing.expect(picker.choiceAt(4) == null);
 }
 
@@ -2564,7 +2813,7 @@ test "api key stage zeroes its allocation on every exit path" {
         defer outcome.deinit(alloc);
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
-            .loaded => .{ .saved = true },
+            .loaded => .{ .saved = .{ .changed = true, .provider = .gateway } },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -2593,7 +2842,7 @@ test "api key stage zeroes its allocation on every exit path" {
         defer outcome.deinit(alloc);
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
-            .loaded => .{ .saved = true },
+            .loaded => .{ .saved = .{ .changed = true, .provider = .gateway } },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -2622,7 +2871,7 @@ test "api key stage zeroes its allocation on every exit path" {
         defer outcome.deinit(alloc);
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
-            .loaded => .{ .saved = true },
+            .loaded => .{ .saved = .{ .changed = true, .provider = .gateway } },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -2651,7 +2900,7 @@ test "api key stage zeroes its allocation on every exit path" {
         defer outcome.deinit(alloc);
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
-            .loaded => .{ .saved = true },
+            .loaded => .{ .saved = .{ .changed = true, .provider = .gateway } },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -2680,7 +2929,7 @@ test "api key stage zeroes its allocation on every exit path" {
         defer outcome.deinit(alloc);
         runtime.exitApiKeyStage(alloc, .saved);
         const result: ApiKeySaveResult = switch (outcome) {
-            .loaded => .{ .saved = true },
+            .loaded => .{ .saved = .{ .changed = true, .provider = .gateway } },
             .gateway_refused => .gateway_refused,
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
@@ -2712,4 +2961,16 @@ test "api key stage zeroes its allocation on every exit path" {
         runtime.deinit(alloc);
         try expectApiKeyAllocationCleared(&runtime, &backing, sentinel);
     }
+}
+
+test "oauth adapters expose a shared acquisition contract" {
+    const codex = oauthAdapter(.codex) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SignInProvider.codex, codex.provider);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider_id);
+    try std.testing.expect(@intFromPtr(codex.start) != 0);
+    try std.testing.expect(@intFromPtr(codex.source_exists) != 0);
+
+    const grok = oauthAdapter(.grok) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider_id);
+    try std.testing.expect(oauthAdapter(.vercel) != null);
 }

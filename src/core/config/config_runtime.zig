@@ -41,6 +41,7 @@ pub const Settings = struct {
     /// Stable runtime provider id. `provider` remains populated for legacy
     /// built-ins while custom ids use this field.
     provider_key: ?[]u8 = null,
+    model_preferences: std.StringHashMapUnmanaged([]const u8) = .empty,
     codex_model: ?[]u8 = null,
     grok_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
@@ -87,6 +88,12 @@ pub const Settings = struct {
             alloc.free(entry.value_ptr.*);
         }
         self.api_keys.deinit(alloc);
+        var preferences = self.model_preferences.iterator();
+        while (preferences.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            alloc.free(entry.value_ptr.*);
+        }
+        self.model_preferences.deinit(alloc);
         var provider_it = self.providers.iterator();
         while (provider_it.next()) |entry| {
             alloc.free(entry.key_ptr.*);
@@ -581,6 +588,9 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
     inline for (&.{
         "model",
         "provider",
+        "providers",
+        "api_keys",
+        "model_preferences",
         "codex_model",
         "grok_model",
         "effort",
@@ -627,7 +637,7 @@ fn appendIgnoredProjectProfileSettingDiagnostics(
 
 fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) void {
     if (settings.model != null) sources.model = source;
-    if (settings.provider != null) sources.provider = source;
+    if (settings.provider_key != null or settings.provider != null) sources.provider = source;
     if (settings.codex_model != null) sources.codex_model = source;
     if (settings.grok_model != null) sources.grok_model = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
@@ -1316,9 +1326,25 @@ fn parseProfileOnlyFields(
 
     if (root.object.get("provider")) |provider_value| {
         if (provider_value != .string) return error.InvalidProviderType;
-        if (std.mem.trim(u8, provider_value.string, " \t\r\n").len == 0) return error.InvalidProviderValue;
+        if (model_provider.parse(provider_value.string) == null) try provider_definition.validate_id(provider_value.string);
         settings.provider_key = try alloc.dupe(u8, provider_value.string);
         settings.provider = model_provider.parse(provider_value.string);
+    }
+
+    if (root.object.get("model_preferences")) |preferences| {
+        if (preferences != .object) return error.InvalidModelPreferences;
+        var iterator = preferences.object.iterator();
+        while (iterator.next()) |entry| {
+            try provider_definition.validate_id(entry.key_ptr.*);
+            if (entry.value_ptr.* != .string) return error.InvalidModelPreferences;
+            const model = entry.value_ptr.string;
+            settings_store.validateModel(model) catch return error.InvalidModelPreferences;
+            const key = try alloc.dupe(u8, entry.key_ptr.*);
+            errdefer alloc.free(key);
+            const value = try alloc.dupe(u8, model);
+            errdefer alloc.free(value);
+            try settings.model_preferences.put(alloc, key, value);
+        }
     }
 
     if (root.object.get("providers")) |providers_value| {
@@ -1533,6 +1559,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     }
     if (incoming.provider) |value| target.provider = value;
     if (incoming.provider_key) |value| {
+        target.provider = incoming.provider;
         if (target.provider_key) |current| alloc.free(current);
         target.provider_key = value;
         incoming.provider_key = null;
@@ -1549,6 +1576,15 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         entry.value_ptr.* = undefined;
     }
     incoming.providers.clearRetainingCapacity();
+    var preferences = incoming.model_preferences.iterator();
+    while (preferences.next()) |entry| {
+        if (target.model_preferences.fetchRemove(entry.key_ptr.*)) |removed| {
+            alloc.free(removed.key);
+            alloc.free(removed.value);
+        }
+        target.model_preferences.put(alloc, entry.key_ptr.*, entry.value_ptr.*) catch unreachable;
+    }
+    incoming.model_preferences.clearRetainingCapacity();
     if (incoming.codex_model) |value| {
         if (target.codex_model) |current| alloc.free(current);
         target.codex_model = value;
@@ -3700,4 +3736,20 @@ test "malformed or duplicate additional directories do not discard sibling setti
         }
         try std.testing.expect(found_diagnostic);
     }
+}
+
+test "dynamic provider preferences merge per id and clear stale legacy selection" {
+    const alloc = std.testing.allocator;
+    var global = try parseSettingsJson(alloc, "{\"provider\":\"codex\",\"model_preferences\":{\"codex\":\"old\",\"custom\":\"global\"}}");
+    defer global.deinit(alloc);
+    var workspace = try parseSettingsJson(alloc, "{\"provider\":\"custom\",\"model_preferences\":{\"custom\":\"workspace\"}}");
+    defer workspace.deinit(alloc);
+    mergeSettings(&global, &workspace, alloc);
+    try std.testing.expect(global.provider == null);
+    try std.testing.expectEqualStrings("custom", global.provider_key.?);
+    try std.testing.expectEqualStrings("workspace", global.model_preferences.get("custom").?);
+    try std.testing.expectEqualStrings("old", global.model_preferences.get("codex").?);
+    try std.testing.expect(isProfileOnlySettingKey("providers"));
+    try std.testing.expect(isProfileOnlySettingKey("api_keys"));
+    try std.testing.expect(isProfileOnlySettingKey("model_preferences"));
 }

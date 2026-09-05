@@ -451,6 +451,9 @@ const App = struct {
         owned.* = undefined;
         const value = &self.custom_provider_definition.?.parsed.value;
         self.custom_provider_config = .{
+            .protocol = value.protocol,
+            .auth_required = value.auth.kind != .none,
+            .auth_header = value.auth.header,
             .base_url = value.endpoint orelse "",
             .fallback_model = value.default_model orelse "",
             .models_endpoint = value.models_endpoint,

@@ -40,9 +40,10 @@ pub const SlashKind = enum {
     continue_recovery,
     rename_session,
     help,
-    login,
     logout,
     setup,
+    connect_provider,
+    switch_provider,
     status,
     background,
     background_stop,
@@ -279,7 +280,7 @@ pub fn renderTopLevelHelpWithStyle(alloc: Allocator, registry: TopLevelRegistry,
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    try writeStyled(&out.writer, style, .brand, "𝒇x");
+    try writeStyled(&out.writer, style, .brand, "𝒇𝒇x");
     try out.writer.writeByte(' ');
     try writeStyleStart(&out.writer, style, .muted);
     try out.writer.writeByte('v');
@@ -1657,8 +1658,8 @@ test "rendered top-level help is a complete CLI navigation page" {
     const text = try testTopLevelHelpText(std.testing.allocator);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.startsWith(u8, text, "𝒇x v9.8.7\nFast, native coding agent for the terminal."));
-    try std.testing.expect(std.mem.find(u8, text, "𝒇x starts an interactive session by default.") != null);
+    try std.testing.expect(std.mem.startsWith(u8, text, "𝒇𝒇x v9.8.7\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.find(u8, text, "𝒇𝒇x starts an interactive session by default.") != null);
     try std.testing.expect(std.mem.find(u8, text, "ffx <command> [...flags] [...args]") != null);
     try std.testing.expect(std.mem.find(u8, text, "Commands:") != null);
     try std.testing.expect(std.mem.find(u8, text, "ask <prompt>") != null);
@@ -1686,8 +1687,8 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "session resume [last|id]") != null);
     try std.testing.expect(std.mem.find(u8, text, "ffx status --json") != null);
     try std.testing.expect(std.mem.find(u8, text, "Run `/help` inside an interactive session for slash commands.") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Learn more about 𝒇x:  https://ffx.sh/docs") != null);
-    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:     run `/feedback` inside 𝒇x\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Learn more about 𝒇𝒇x:  https://ffx.sh/docs") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:     run `/feedback` inside 𝒇𝒇x\n") != null);
     try std.testing.expect(std.mem.find(u8, text, "\n\n\nRun `ffx <command> --help`") == null);
     try std.testing.expect(std.mem.find(u8, text, "Start:") == null);
     try std.testing.expect(std.mem.find(u8, text, "  Work      ") == null);
@@ -1705,12 +1706,12 @@ test "terminal top-level help adds styling without changing visible content" {
     defer std.testing.allocator.free(stripped);
 
     try std.testing.expect(std.mem.find(u8, plain, "\x1b[") == null);
-    try std.testing.expect(std.mem.startsWith(u8, terminal, "\x1b[1m𝒇x\x1b[0m"));
+    try std.testing.expect(std.mem.startsWith(u8, terminal, "\x1b[1m𝒇𝒇x\x1b[0m"));
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[1mUsage:\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mask <prompt>\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;243mFast, native coding agent") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[4mhttps://ffx.sh/docs\x1b[0m") != null);
-    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mrun `/feedback` inside 𝒇x\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mrun `/feedback` inside 𝒇𝒇x\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;252m") == null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;245m") == null);
     try std.testing.expectEqualStrings(plain, stripped);
@@ -1730,7 +1731,7 @@ test "top-level help renders flags as compact aligned rows" {
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
     try std.testing.expect(lineContainsBoth(wide, "--resume-last", "Resume the latest workspace session"));
     try std.testing.expect(std.mem.find(u8, wide, "Record terminal output\n\n  --context-limit") == null);
-    try std.testing.expect(std.mem.find(u8, wide, "Print the 𝒇x version and exit\n\nExamples:") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "Print the 𝒇𝒇x version and exit\n\nExamples:") != null);
     try expectAllLinesFit(narrow, 60);
 
     var lines = std.mem.splitScalar(u8, wide, '\n');
@@ -1859,7 +1860,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 38), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 39), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 4), helpCatalogCount(registry, "appearance"));

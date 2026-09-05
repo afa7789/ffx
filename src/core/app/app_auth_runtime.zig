@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin_providers = @import("../../builtins/providers.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -29,6 +30,7 @@ const ProviderSwitchDecision = enum {
 const ProviderSwitchIntent = enum {
     manual,
     post_oauth,
+    saved_key,
 };
 
 const ProviderSwitchFacts = struct {
@@ -70,6 +72,31 @@ fn selectCatalogModel(
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        fn refreshProviderInventory(app: *App) !void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "secretStore") or
+                !@hasDecl(@TypeOf(app.auth), "setProviderInventory")) return;
+            var providers: auth_runtime.ProviderSet = .empty;
+            for (builtin_providers.providers) |entry| {
+                const provider = model_provider.parse(entry.id) orelse continue;
+                if (try credentials.directProviderExists(
+                    app.alloc,
+                    app.auth.secretStore(),
+                    entry.id,
+                    entry.env_var,
+                )) providers.insert(provider);
+            }
+            for ([_]auth_runtime.SignInProvider{ .vercel, .codex, .grok }) |oauth_provider| {
+                const adapter = auth_runtime.oauthAdapter(oauth_provider) orelse continue;
+                if (try (adapter.source_exists)(app.alloc)) {
+                    if (adapter.provider_id != .gateway) providers.insert(adapter.provider_id);
+                }
+            }
+            if (provider_runtime.provider(app) == .gateway and app.auth.credentialSource() != null) {
+                providers.insert(.gateway);
+            }
+            app.auth.setProviderInventory(providers);
+        }
+
         fn ensurePromptCredential(app: *App) !bool {
             if (app.auth.credentialSource() != null) return true;
 
@@ -222,8 +249,22 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            try app.auth.refreshSourceInventory(app.alloc);
+            try refreshProviderInventory(app);
             app.auth.openPicker(app.alloc);
+            app.shell.render_requests.request(.footer);
+        }
+
+        pub fn openConnectProvider(app: *App) !void {
+            if (comptime !runtime_profile.allows(App, .native_auth)) return;
+            try refreshProviderInventory(app);
+            app.auth.openConnectProviderPicker(app.alloc, provider_runtime.provider(app));
+            app.shell.render_requests.request(.footer);
+        }
+
+        pub fn openSwitchProvider(app: *App) !void {
+            if (comptime !runtime_profile.allows(App, .native_auth)) return;
+            try refreshProviderInventory(app);
+            app.auth.openProviderPicker(app.alloc, provider_runtime.provider(app));
             app.shell.render_requests.request(.footer);
         }
 
@@ -272,12 +313,28 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             switch (choice) {
-                .provider => |provider| try switchProvider(app, provider, true, .manual),
+                .provider => |provider| {
+                    if (app.auth.providerPickerMode() == .switch_existing) {
+                        try switchProvider(app, provider, false, .manual);
+                    } else switch (provider) {
+                        .codex => app.auth.openCodexMethodPicker(app.alloc),
+                        .grok => try beginGrokSignIn(app),
+                        .gateway => unreachable,
+                        else => {
+                            prepareApiKeyInputBoundary(app);
+                            app.auth.openProviderApiKeyPicker(app.alloc, provider);
+                        },
+                    }
+                },
                 .source => |source| try applySourceChoice(app, source),
                 .action => |action| switch (action) {
                     .login => try beginSignIn(app, true),
                     .chatgpt_login => try beginChatGptSignIn(app),
                     .grok_login => try beginGrokSignIn(app),
+                    .api_key => {
+                        prepareApiKeyInputBoundary(app);
+                        app.auth.openProviderApiKeyPicker(app.alloc, .openai);
+                    },
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -287,12 +344,15 @@ pub fn Runtime(comptime App: type) type {
                             }, true);
                             return;
                         }
-                        prepareApiKeyInputBoundary(app);
-                        app.auth.openApiKeyPickerFromRoot(app.alloc);
+                        try refreshProviderInventory(app);
+                        app.auth.openConnectProviderPicker(app.alloc, provider_runtime.provider(app));
                     },
                     .change_team => try beginTeamPicker(app),
                     .switch_credential => app.auth.openSwitchCredentialPicker(app.alloc),
-                    .switch_provider => app.auth.openProviderPicker(app.alloc, provider_runtime.provider(app)),
+                    .switch_provider => {
+                        try refreshProviderInventory(app);
+                        app.auth.openProviderPicker(app.alloc, provider_runtime.provider(app));
+                    },
                     .automatic => try applyAutomaticCredential(app),
                 },
                 .team => |index| try applyTeamChoice(app, index),
@@ -340,18 +400,18 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn collectSignInFacts(app: *App) !void {
             if (comptime !oauthAuthEnabled(App)) return;
-            const sign_in_source: credentials.Source = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView"))
-                app.auth.pickerView().sign_in_source
+            const sign_in_provider: auth_runtime.SignInProvider = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView"))
+                app.auth.pickerView().sign_in_provider
             else
-                .stored_key;
+                .vercel;
             app.auth.pulseSignIn(app.alloc);
             switch (app.auth.pollSignInTransition(app.alloc)) {
                 .none => {},
                 .cancelled => app.shell.render_requests.request(.footer),
                 .failed => |err| {
-                    debug_trace.logf("auth", "login failed source={t} err={s}", .{ sign_in_source, @errorName(err) });
+                    debug_trace.logf("auth", "login failed provider={t} err={s}", .{ sign_in_provider, @errorName(err) });
                     _ = app.auth.popPickerStage(app.alloc);
-                    try writeLoginError(app, sign_in_source, err);
+                    try writeLoginError(app, sign_in_provider, err);
                 },
                 .succeeded => |completed| {
                     var owned = completed;
@@ -470,8 +530,14 @@ pub fn Runtime(comptime App: type) type {
         fn applyApiKeySaveResult(app: *App, result: auth_runtime.ApiKeySaveResult) !void {
             switch (result) {
                 .empty => return,
-                .saved => |changed| {
-                    applyCredentialChange(app, changed);
+                .saved => |saved| {
+                    applyCredentialChange(app, saved.changed);
+                    if (saved.provider != .gateway) {
+                        try refreshProviderInventory(app);
+                        app.auth.closePicker(app.alloc);
+                        try switchProvider(app, saved.provider, false, .saved_key);
+                        return;
+                    }
                     rememberCredentialSource(app, .stored_key);
                     const body = try std.fmt.allocPrint(
                         app.alloc,
@@ -625,7 +691,7 @@ pub fn Runtime(comptime App: type) type {
             const started = app.auth.openChatGptSignInPickerFromRoot(app.alloc);
             if (started catch |err| {
                 debug_trace.logf("auth", "ChatGPT login failed err={s}", .{@errorName(err)});
-                try writeLoginError(app, .stored_key, err);
+                try writeLoginError(app, .codex, err);
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
@@ -656,7 +722,7 @@ pub fn Runtime(comptime App: type) type {
             const started = app.auth.openGrokSignInPickerFromRoot(app.alloc);
             if (started catch |err| {
                 debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
-                try writeLoginError(app, .stored_key, err);
+                try writeLoginError(app, .grok, err);
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
@@ -669,7 +735,7 @@ pub fn Runtime(comptime App: type) type {
             const started = app.auth.openChatGptSignInPickerForProviderSwitch(app.alloc);
             if (started catch |err| {
                 debug_trace.logf("auth", "Codex login failed err={s}", .{@errorName(err)});
-                try writeLoginError(app, .stored_key, err);
+                try writeLoginError(app, .codex, err);
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
@@ -682,12 +748,58 @@ pub fn Runtime(comptime App: type) type {
             const started = app.auth.openGrokSignInPickerForProviderSwitch(app.alloc);
             if (started catch |err| {
                 debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
-                try writeLoginError(app, .stored_key, err);
+                try writeLoginError(app, .grok, err);
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
                 if (io_mod.getenv("FFX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
             }
+        }
+
+        fn resolveProviderCredential(
+            app: *App,
+            target: model_provider.ProviderId,
+        ) !?credentials.Credential {
+            return switch (target) {
+                .gateway => (try credentials.resolveForProvider(
+                    app.alloc,
+                    app.auth.secretStore(),
+                    model_provider.registryId(target),
+                )).credential,
+                .codex => if (try chatgpt_oauth.loadAccess(
+                    app.alloc,
+                    app.auth.oauthTransport(),
+                    .if_needed,
+                )) |access_value| blk: {
+                    const access = access_value;
+                    break :blk .{
+                        .token = access.access_token,
+                        .source = .stored_key,
+                        .account_id = access.account_id,
+                    };
+                } else null,
+                .grok => if (try grok_oauth.loadAccess(
+                    app.alloc,
+                    app.auth.oauthTransport(),
+                    .if_needed,
+                )) |access_value| blk: {
+                    const access = access_value;
+                    break :blk .{
+                        .token = access.access_token,
+                        .source = .stored_key,
+                        .account_id = access.account_id,
+                    };
+                } else null,
+                else => if (builtin_providers.byId(model_provider.registryId(target))) |entry|
+                    try credentials.resolveDirectProvider(
+                        app.alloc,
+                        app.auth.secretStore(),
+                        entry.id,
+                        entry.env_var,
+                    )
+                else
+                    null,
+            };
         }
 
         fn switchProvider(
@@ -718,7 +830,17 @@ pub fn Runtime(comptime App: type) type {
 
             const current = provider_runtime.provider(app);
             const active_source = app.auth.credentialSource();
-            const target_credential_ready = if (active_source) |source|
+            // Re-resolve direct API-key providers even when they are already
+            // selected. The key may have been rotated in settings or the
+            // environment while ffx was running, and the old credential must
+            // not make the switch path short-circuit with "Already using".
+            const direct_key_needs_reload = current == target and switch (target) {
+                .gateway, .codex, .grok => false,
+                else => true,
+            };
+            const target_credential_ready = if (direct_key_needs_reload)
+                false
+            else if (active_source) |source|
                 model_provider.authorizesCredential(target, source)
             else
                 false;
@@ -756,11 +878,7 @@ pub fn Runtime(comptime App: type) type {
             }
             try app.flushBeforeBlockingExternalWork();
 
-            const resolution = credentials.resolveForProvider(
-                app.alloc,
-                app.auth.secretStore(),
-                model_provider.registryId(target),
-            ) catch |err| {
+            var credential = (resolveProviderCredential(app, target) catch |err| {
                 debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -772,8 +890,7 @@ pub fn Runtime(comptime App: type) type {
                     ),
                 }, true);
                 return;
-            };
-            var credential = resolution.credential orelse {
+            }) orelse {
                 if (target == .codex and allow_login) {
                     try beginCodexSignInForProviderSwitch(app);
                     return;
@@ -1036,7 +1153,7 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.openSignInPicker(app.alloc);
             if (started catch |err| {
                 debug_trace.logf("auth", "login failed err={s}", .{@errorName(err)});
-                try writeLoginError(app, .stored_key, err);
+                try writeLoginError(app, .vercel, err);
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
@@ -1160,24 +1277,24 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn writeLoginError(app: *App, source: credentials.Source, err: anyerror) !void {
-            const notice: types.SemanticNotice = if (source == .stored_key)
-                switch (err) {
+        fn writeLoginError(app: *App, provider: auth_runtime.SignInProvider, err: anyerror) !void {
+            const notice: types.SemanticNotice = switch (provider) {
+                .codex => switch (err) {
                     error.ChatGptAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Codex sign-in was denied. The current credential is unchanged." },
-                    error.ChatGptLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Codex sign-in expired. The current credential is unchanged; run /login to try again." },
+                    error.ChatGptLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Codex sign-in expired. Open /setup to try again." },
                     else => .{ .topic = "auth", .tone = .@"error", .body = "Codex sign-in failed. The current credential is unchanged." },
-                }
-            else if (source == .stored_key)
-                switch (err) {
+                },
+                .grok => switch (err) {
                     error.GrokAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in was denied. The current credential is unchanged." },
-                    error.GrokLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Grok sign-in expired. The current credential is unchanged; run /login to try again." },
+                    error.GrokLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Grok sign-in expired. Open /setup to try again." },
                     else => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in failed. The current credential is unchanged." },
-                }
-            else switch (err) {
-                error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "ffx login is not configured yet. The current credential is unchanged." },
-                error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
-                error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
-                else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed. The current credential is unchanged." },
+                },
+                .vercel => switch (err) {
+                    error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in is not configured." },
+                    error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied." },
+                    error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired." },
+                    else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed." },
+                },
             };
             try writeAuthNotice(app, notice);
         }
@@ -1823,7 +1940,7 @@ test "successful API key save persists even when the live credential is unchange
     defer app.deinit();
     app.auth.active_source = .stored_key;
 
-    try Runtime(TestApp).applyApiKeySaveResult(&app, .{ .saved = false });
+    try Runtime(TestApp).applyApiKeySaveResult(&app, .{ .saved = .{ .changed = false, .provider = .gateway } });
 
     try std.testing.expectEqual(credentials.Source.stored_key, app.auth.active_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.preference_write_count);
@@ -1835,7 +1952,7 @@ test "successful API key save remembers the newly active stored key" {
     defer app.deinit();
     app.auth.active_source = .stored_key;
 
-    try Runtime(TestApp).applyApiKeySaveResult(&app, .{ .saved = true });
+    try Runtime(TestApp).applyApiKeySaveResult(&app, .{ .saved = .{ .changed = true, .provider = .gateway } });
 
     try std.testing.expectEqual(credentials.Source.stored_key, app.auth.active_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.preference_write_count);

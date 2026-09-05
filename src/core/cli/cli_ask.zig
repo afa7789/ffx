@@ -27,6 +27,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
+const openai_direct = @import("../../gateway/openai_direct.zig");
+const provider_definition = @import("../provider/definition.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
@@ -534,6 +536,9 @@ const AskContext = struct {
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
     provider: model_provider.ProviderId = .gateway,
+    provider_key: []const u8 = "",
+    custom_provider_definition: ?provider_definition.OwnedDefinition = null,
+    custom_provider_config: ?openai_direct.Config = null,
     model_catalog_access: credentials.CatalogAccess = .{ .public_only = .no_credential },
     model: []const u8 = "",
     agent_step_limit: usize = 0,
@@ -702,6 +707,8 @@ const AskContext = struct {
     }
 
     fn deinit(self: *AskContext) void {
+        if (self.custom_provider_definition) |*definition| definition.deinit();
+        self.custom_provider_definition = null;
         if (self.subagent_host) |subagent_host| subagent_host.deinit();
         self.subagent_host = null;
         self.terminal_client.deinit();
@@ -1068,7 +1075,7 @@ const AskContext = struct {
             .gateway => self.cfg.permission_reviewer_provider,
             .codex => self.cfg.codex_permission_reviewer_provider,
             .grok => self.cfg.grok_permission_reviewer_provider,
-            .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => self.cfg.permission_reviewer_provider,
+            .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => self.cfg.permission_reviewer_provider,
         } orelse
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
@@ -1083,11 +1090,15 @@ const AskContext = struct {
     }
 
     fn agentStreamProvider(self: *const AskContext) agent_stream_provider.Provider {
+        if (self.custom_provider_config) |*config| {
+            if (std.mem.eql(u8, self.provider_key, self.custom_provider_definition.?.parsed.value.id))
+                return openai_direct.runtimeAgentStreamProvider(config);
+        }
         return switch (self.provider) {
             .gateway => self.cfg.gateway_provider.agent_stream,
             .codex => self.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
             .grok => self.cfg.grok_agent_stream orelse agent_stream_provider.unavailable_provider,
-            .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.agentStream(self.provider),
+            .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.agentStream(self.provider),
         };
     }
 
@@ -1469,7 +1480,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     );
     try checkHeadlessCancellation(options.deps);
 
-    if (!options.continue_recovery and options.resume_target == null and startup.credential == null) {
+    if (!options.continue_recovery and options.resume_target == null and startup.credential == null and startup.credentialRequired()) {
         return missingCredentialResult(alloc, options, startup.provider);
     }
 
@@ -1477,6 +1488,21 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
+    ctx.provider_key = startup.provider_key;
+    if (startup.custom_provider) |custom| {
+        ctx.custom_provider_definition = custom;
+        startup.custom_provider = null;
+        const value = &ctx.custom_provider_definition.?.parsed.value;
+        ctx.custom_provider_config = .{
+            .protocol = value.protocol,
+            .auth_required = value.auth.kind != .none,
+            .auth_header = value.auth.header,
+            .base_url = value.endpoint orelse "",
+            .fallback_model = value.default_model orelse cfg.default_model,
+            .models_endpoint = value.models_endpoint,
+            .models = value.models,
+        };
+    }
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
         ctx.session.attachProfileUsagePublisher(alloc);
@@ -2056,7 +2082,7 @@ fn selectModelCatalog(
         .gateway => gateway,
         .codex => codex,
         .grok => grok,
-        .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.modelCatalog(provider),
+        .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.modelCatalog(provider),
     };
 }
 

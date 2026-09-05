@@ -47,7 +47,7 @@ pub const ProviderRoutes = struct {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
-            .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => .{
+            .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => .{
                 // Direct providers stream through the OpenAI-compatible
                 // builtin implementation; permission review stays on the
                 // gateway reviewer, matching the interactive ask path.

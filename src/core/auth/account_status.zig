@@ -48,7 +48,6 @@ pub fn billingMode(provider: model_provider.ProviderId) BillingMode {
     return switch (provider) {
         .gateway => .api_plan,
         .codex, .grok => .subscription,
-        .opencode_go => .token_plan,
         else => .payg,
     };
 }
@@ -80,10 +79,10 @@ test "billing modes have stable product labels" {
     try std.testing.expectEqualStrings("BYOK", BillingMode.byok.label());
 }
 
-test "provider billing mode distinguishes subscription and token plans" {
+test "provider billing mode distinguishes subscriptions and API usage" {
     try std.testing.expectEqual(BillingMode.api_plan, billingMode(.gateway));
     try std.testing.expectEqual(BillingMode.subscription, billingMode(.codex));
-    try std.testing.expectEqual(BillingMode.token_plan, billingMode(.opencode_go));
+    try std.testing.expectEqual(BillingMode.payg, billingMode(.opencode_go));
     try std.testing.expectEqual(BillingMode.payg, billingMode(.deepseek));
 }
 

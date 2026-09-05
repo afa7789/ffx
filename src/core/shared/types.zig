@@ -877,6 +877,9 @@ pub const ChatMessage = struct {
 };
 
 pub const Usage = struct {
+    cache_read_tokens: ?u64 = null,
+    cache_write_tokens: ?u64 = null,
+    reasoning_tokens: ?u64 = null,
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,
 };

@@ -127,7 +127,7 @@ pub fn collect(
             .gateway => detailed.settings.model,
             .codex => detailed.settings.codex_model,
             .grok => detailed.settings.grok_model,
-            .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => detailed.settings.model,
+            .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => detailed.settings.model,
         },
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,

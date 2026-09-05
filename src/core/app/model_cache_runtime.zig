@@ -112,6 +112,27 @@ pub const ModelProviderFilter = enum {
 };
 
 pub const model_provider_filter_count = std.meta.fields(ModelProviderFilter).len;
+const provider_filters = [_]ModelProviderFilter{ .anthropic, .openai, .xai, .zai, .others };
+
+pub fn availableProviderFilterCount(items: []const ModelMenuItem) usize {
+    var count: usize = 1;
+    for (provider_filters) |filter| {
+        if (modelMenuFilteredItemCount(items, filter, "") > 0) count += 1;
+    }
+    return count;
+}
+
+pub fn availableProviderFilterAt(items: []const ModelMenuItem, visible_index: usize) ModelProviderFilter {
+    const wanted = @min(visible_index, availableProviderFilterCount(items) - 1);
+    if (wanted == 0) return .all;
+    var visible: usize = 1;
+    for (provider_filters) |filter| {
+        if (modelMenuFilteredItemCount(items, filter, "") == 0) continue;
+        if (visible == wanted) return filter;
+        visible += 1;
+    }
+    return .all;
+}
 
 pub const ModelMenuItem = struct {
     id: []u8,
@@ -152,7 +173,7 @@ pub const ModelMenu = struct {
     }
 
     pub fn providerFilter(self: *const ModelMenu) ModelProviderFilter {
-        return @enumFromInt(@min(self.provider_index, model_provider_filter_count - 1));
+        return availableProviderFilterAt(self.items.items, self.provider_index);
     }
 
     pub fn filteredItemCount(self: *const ModelMenu) usize {
@@ -183,7 +204,7 @@ pub const ModelMenu = struct {
 
     pub fn moveProvider(self: *ModelMenu, delta: i32) bool {
         if (!self.active or self.load_state != .ready) return false;
-        const filter_count = model_provider_filter_count;
+        const filter_count = availableProviderFilterCount(self.items.items);
         if (filter_count <= 1) return false;
 
         var next = @as(i32, @intCast(self.provider_index)) + delta;
@@ -236,6 +257,18 @@ pub fn modelMenuItemAt(
         current += 1;
     }
     return null;
+}
+
+test "model provider filters omit categories with zero models" {
+    const items = [_]ModelMenuItem{
+        .{ .id = @constCast("openai/gpt-test"), .provider = "openai", .capabilities = .{} },
+        .{ .id = @constCast("deepseek/chat-test"), .provider = "deepseek", .capabilities = .{} },
+    };
+
+    try std.testing.expectEqual(@as(usize, 3), availableProviderFilterCount(&items));
+    try std.testing.expectEqual(ModelProviderFilter.all, availableProviderFilterAt(&items, 0));
+    try std.testing.expectEqual(ModelProviderFilter.openai, availableProviderFilterAt(&items, 1));
+    try std.testing.expectEqual(ModelProviderFilter.others, availableProviderFilterAt(&items, 2));
 }
 
 fn modelMenuItemMatches(

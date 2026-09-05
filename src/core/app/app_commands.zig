@@ -320,9 +320,10 @@ pub fn Handlers(comptime App: type) type {
                 .resume_session = commandResumeSession,
                 .continue_recovery = commandContinueRecovery,
                 .show_help = commandShowHelp,
-                .login = commandLogin,
                 .logout = commandLogout,
                 .setup = commandSetup,
+                .connect_provider = commandConnectProvider,
+                .switch_provider = commandSwitchProvider,
                 .show_status = commandShowStatus,
                 .show_background = commandShowBackground,
                 .stop_background = commandStopBackground,
@@ -552,19 +553,6 @@ pub fn Handlers(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn commandLogin(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasDecl(App, "runLoginCommand")) {
-                try app.runLoginCommand();
-            } else {
-                try app.writeDomainNotice(.{
-                    .topic = "auth",
-                    .tone = .@"error",
-                    .body = "login is not available in this runtime",
-                }, true);
-            }
-        }
-
         fn commandLogout(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "runLogoutCommand")) {
@@ -587,6 +575,32 @@ pub fn Handlers(comptime App: type) type {
                     .topic = "setup",
                     .tone = .@"error",
                     .body = "setup is not available in this runtime",
+                }, true);
+            }
+        }
+
+        fn commandConnectProvider(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "openConnectProvider")) {
+                try app.openConnectProvider();
+            } else {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "Provider connections are not available in this runtime.",
+                }, true);
+            }
+        }
+
+        fn commandSwitchProvider(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "openSwitchProvider")) {
+                try app.openSwitchProvider();
+            } else {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "Provider switching is not available in this runtime.",
                 }, true);
             }
         }
@@ -633,13 +647,6 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandShowModels(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            // Direct provider active: print its live catalogue as a
-            // notice instead of opening the Vercel-only ModelMenu.
-            // The auth-using branch is skipped in tests whose fake app
-            // has no auth field.
-            if (comptime @hasField(App, "auth")) {
-                if (session_commands.Commands(App).handleDirectProviderModels(app)) return;
-            }
             app.ensureModelCache();
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
             closeHelpMenuIfPresent(app);

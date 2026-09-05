@@ -235,7 +235,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .upgrade,
         .token = "upgrade",
         .usage = "upgrade [--channel <stable|dev>] [--json]",
-        .summary = "Upgrade 𝒇x on the selected release channel",
+        .summary = "Upgrade 𝒇𝒇x on the selected release channel",
         .options = &.{
             .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
             json_option,
@@ -355,7 +355,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "-v, --version",
-        .description = "Print the 𝒇x version and exit",
+        .description = "Print the 𝒇𝒇x version and exit",
     },
 };
 
@@ -372,14 +372,14 @@ pub const top_level_notes = [_][]const u8{
 };
 
 pub const top_level_resources = [_]TopLevelResource{
-    .{ .label = "Learn more about 𝒇x:", .value = "https://ffx.sh/docs", .link = true },
-    .{ .label = "Report a problem:", .value = "run `/feedback` inside 𝒇x" },
+    .{ .label = "Learn more about 𝒇𝒇x:", .value = "https://ffx.sh/docs", .link = true },
+    .{ .label = "Report a problem:", .value = "run `/feedback` inside 𝒇𝒇x" },
 };
 
 pub const top_level_registry = TopLevelRegistry{
     .specs = top_level_specs[0..],
     .description = "Fast, native coding agent for the terminal.",
-    .interactive_hint = "𝒇x starts an interactive session by default. Use `ffx ask` to run one noninteractive request.",
+    .interactive_hint = "𝒇𝒇x starts an interactive session by default. Use `ffx ask` to run one noninteractive request.",
     .help_groups = top_level_help_groups[0..],
     .flags = top_level_flags[0..],
     .examples = top_level_examples[0..],
@@ -419,9 +419,10 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
     .{ .kind = .continue_recovery, .command = "/continue", .help_entry = "/continue", .completion_description = "continue a paused model response", .presentation_category = .session, .requires_prompt_credential = true },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
-    .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "connect or reconnect a provider", .presentation_category = .account },
     .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [<provider>]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
-    .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "manage accounts and AI Gateway access", .presentation_category = .account },
+    .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "manage model providers", .presentation_category = .account },
+    .{ .kind = .connect_provider, .command = "/connect-provider", .help_entry = "/connect-provider", .completion_description = "connect a model provider", .presentation_category = .account },
+    .{ .kind = .switch_provider, .command = "/switch-provider", .help_entry = "/switch-provider", .completion_description = "switch to a connected provider", .presentation_category = .account },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{"/cost"}, .help_entry = "/usage (/cost)", .completion_description = "show local ffx tokens, models, and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration", .presentation_category = .general, .show_in_welcome = true },
@@ -524,9 +525,10 @@ test "built-in slash commands register exact active order" {
         "/resume",
         "/continue",
         "/rename",
-        "/login",
         "/logout",
         "/setup",
+        "/connect-provider",
+        "/switch-provider",
         "/stats",
         "/usage",
         "/status",

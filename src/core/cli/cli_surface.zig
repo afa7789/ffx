@@ -694,11 +694,7 @@ fn activateProviderSelection(
     };
     defer settings.deinit(alloc);
 
-    var resolution = try credentials.resolveForProvider(
-        alloc,
-        cfg.secret_store,
-        model_provider.registryId(target),
-    );
+    var resolution = try resolveCredentialForTarget(alloc, cfg, target);
     defer if (resolution.credential) |*credential| credential.deinit(alloc);
 
     const already_selected = (settings.provider orelse .gateway) == target;
@@ -720,11 +716,7 @@ fn activateProviderSelection(
             return false;
         };
         performed_login = .codex;
-        resolution = try credentials.resolveForProvider(
-            alloc,
-            cfg.secret_store,
-            @tagName(target),
-        );
+        resolution = try resolveCredentialForTarget(alloc, cfg, target);
     }
     if (resolution.credential == null and target == .grok and caller == .provider_command) {
         grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
@@ -733,11 +725,7 @@ fn activateProviderSelection(
             return false;
         };
         performed_login = .grok;
-        resolution = try credentials.resolveForProvider(
-            alloc,
-            cfg.secret_store,
-            @tagName(target),
-        );
+        resolution = try resolveCredentialForTarget(alloc, cfg, target);
     }
 
     const credential = if (resolution.credential) |*value| value else {
@@ -764,7 +752,7 @@ fn activateProviderSelection(
             return false;
         },
         .gateway => cfg.gateway_provider.model_catalog,
-        .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.modelCatalog(target),
+        .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.modelCatalog(target),
     };
     const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
         .access = credentials.catalogAccessAt(credential.*),
@@ -790,7 +778,7 @@ fn activateProviderSelection(
         .gateway => settings.model,
         .codex => settings.codex_model,
         .grok => settings.grok_model,
-        .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => settings.model,
+        .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => settings.model,
     };
     const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
         try writeProviderActivationError(alloc, deps, caller, "target model catalog is empty");
@@ -800,7 +788,7 @@ fn activateProviderSelection(
         .gateway => .{ .provider = target, .model = selected_model },
         .codex => .{ .provider = target, .codex_model = selected_model },
         .grok => .{ .provider = target, .grok_model = selected_model },
-        .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => .{ .provider = target, .model = selected_model },
+        .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => .{ .provider = target, .model = selected_model },
     });
     defer attempt.deinit(alloc);
     switch (attempt) {
@@ -817,6 +805,38 @@ fn activateProviderSelection(
         else => unreachable,
     };
     return true;
+}
+
+fn resolveCredentialForTarget(
+    alloc: Allocator,
+    cfg: Config,
+    target: model_provider.ProviderId,
+) !credentials.Resolution {
+    return switch (target) {
+        .gateway => credentials.resolveForProvider(alloc, cfg.secret_store, model_provider.registryId(target)),
+        .codex => .{ .credential = if (try chatgpt_oauth.loadAccess(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            .if_needed,
+        )) |access| .{
+            .token = access.access_token,
+            .source = .stored_key,
+            .account_id = access.account_id,
+        } else null },
+        .grok => .{ .credential = if (try grok_oauth.loadAccess(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            .if_needed,
+        )) |access| .{
+            .token = access.access_token,
+            .source = .stored_key,
+            .account_id = access.account_id,
+        } else null },
+        else => .{ .credential = if (builtin_providers.byId(model_provider.registryId(target))) |entry|
+            try credentials.resolveDirectProvider(alloc, cfg.secret_store, entry.id, entry.env_var)
+        else
+            null },
+    };
 }
 
 fn readLoginApiKeyLine(alloc: Allocator) ![]u8 {
@@ -1055,7 +1075,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: ffx login [codex|grok|minimax|openrouter|zhipu|deepseek|anthropic|openai|zai|alibaba-cloud|opencode-go]\n");
+                try writeStderr(deps, "usage: ffx login [codex|grok|opencode|openrouter|ppq|deepseek|openai|anthropic|minimax|zhipu|zai|alibaba-cloud]\n");
                 return .handled_failure;
             };
             switch (login_provider) {
@@ -1099,7 +1119,7 @@ fn runNonInteractiveWithDeps(
         },
         .logout => |rest| {
             const login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: ffx logout [codex|grok|minimax|openrouter|zhipu|deepseek|anthropic|openai|zai|alibaba-cloud|opencode-go]\n");
+                try writeStderr(deps, "usage: ffx logout [codex|grok|opencode|openrouter|ppq|deepseek|openai|anthropic|minimax|zhipu|zai|alibaba-cloud]\n");
                 return .handled_failure;
             };
             if (login_provider == .direct) {
@@ -1157,7 +1177,7 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: ffx provider <codex|grok|minimax|openrouter|zhipu|deepseek|anthropic|openai|zai|alibaba-cloud|opencode-go>\n");
+                try writeStderr(deps, "usage: ffx provider <codex|grok|opencode|openrouter|ppq|deepseek|openai|anthropic|minimax|zhipu|zai|alibaba-cloud>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
@@ -1254,7 +1274,7 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 },
                 .gateway => cfg.gateway_provider.cli_model_catalog,
-                .minimax, .openrouter, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.cliModelCatalog(startup.provider),
+                .minimax, .openrouter, .ppq, .zhipu, .deepseek, .anthropic, .openai, .opencode_go, .zai, .alibaba_cloud => builtin_providers.cliModelCatalog(startup.provider),
             };
             const loaded = switch (catalog_provider.fetch(alloc, .{
                 .access = catalog_access,
@@ -4243,7 +4263,7 @@ test "runIfRequested help writes top-level help" {
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("help")}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇𝒇x v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
@@ -4575,7 +4595,7 @@ test "runNoConfigIfRequested handles help without config" {
         testCommandCatalog(),
         capture.deps(),
     ));
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇𝒇x v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 
     try std.testing.expect(!try runNoConfigIfRequestedWithDeps(
@@ -4869,7 +4889,7 @@ test "runIfRequested unknown command writes header and help" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("wat")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "ffx: unknown subcommand: wat\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "ffx: unknown subcommand: wat\n\n𝒇𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested bare version subcommand remains unknown" {
@@ -4880,7 +4900,7 @@ test "runIfRequested bare version subcommand remains unknown" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("version")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "ffx: unknown subcommand: version\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "ffx: unknown subcommand: version\n\n𝒇𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested model fetch failure is handled" {

@@ -3970,8 +3970,8 @@ test "app_input_runtime auth picker delegates typed acquisition actions" {
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
-    try std.testing.expect(!app.auth.pickerView().active);
-    try std.testing.expectEqual(auth_runtime.AcquisitionAction.login, app.selected_auth_action.?);
+    try std.testing.expect(app.auth.pickerView().active);
+    try std.testing.expectEqual(auth_runtime.AcquisitionAction.setup, app.selected_auth_action.?);
 }
 
 test "app_input_runtime Escape closes auth picker without arming composer clear" {
@@ -4000,26 +4000,19 @@ test "app_input_runtime onboarding Escape skips setup for the session" {
     try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
 }
 
-test "app_input_runtime auth stage Escape pops before closing the picker" {
+test "app_input_runtime provider stage Escape returns to setup" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    app.auth.source_inventory = auth_runtime.SourceSet.initOne(.stored_key);
     app.auth.openPicker(alloc);
-
-    for (0..6) |_| _ = app.auth.movePicker(1);
-    try std.testing.expect((auth_runtime.Choice{ .action = .switch_credential }).eql(
-        app.auth.pickerView().selected_choice.?,
-    ));
-
-    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
-    try std.testing.expectEqual(auth_runtime.PickerStage.switch_credential, app.auth.pickerView().stage);
+    app.auth.openConnectProviderPicker(alloc, .gateway);
+    try std.testing.expectEqual(auth_runtime.PickerStage.provider, app.auth.pickerView().stage);
     try std.testing.expect(app.auth.pickerView().active);
 
     try Runtime(RoutingFakeApp).resolveEscape(&app, false, 1);
     try std.testing.expectEqual(auth_runtime.PickerStage.root, app.auth.pickerView().stage);
     try std.testing.expect(app.auth.pickerView().active);
-    try std.testing.expect((auth_runtime.Choice{ .action = .switch_credential }).eql(
+    try std.testing.expect((auth_runtime.Choice{ .action = .setup }).eql(
         app.auth.pickerView().selected_choice.?,
     ));
 
@@ -4028,15 +4021,14 @@ test "app_input_runtime auth stage Escape pops before closing the picker" {
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
-test "app_input_runtime disabled change team action stays silent" {
+test "app_input_runtime switch provider action remains typed" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    app.auth.source_inventory = auth_runtime.SourceSet.initOne(.stored_key);
     app.auth.openPicker(alloc);
 
-    for (0..5) |_| _ = app.auth.movePicker(1);
-    try std.testing.expect((auth_runtime.Choice{ .action = .change_team }).eql(
+    for (0..3) |_| _ = app.auth.movePicker(1);
+    try std.testing.expect((auth_runtime.Choice{ .action = .switch_provider }).eql(
         app.auth.pickerView().selected_choice.?,
     ));
 
@@ -4044,7 +4036,7 @@ test "app_input_runtime disabled change team action stays silent" {
 
     try std.testing.expect(app.auth.pickerView().active);
     try std.testing.expectEqual(auth_runtime.PickerStage.root, app.auth.pickerView().stage);
-    try std.testing.expect(app.selected_auth_action == null);
+    try std.testing.expectEqual(auth_runtime.AcquisitionAction.switch_provider, app.selected_auth_action.?);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
@@ -7692,7 +7684,7 @@ fn openRoutingAuthPicker(app: *RoutingFakeApp) !void {
     app.auth.source_inventory.insert(.env_var);
     app.auth.openPicker(app.alloc);
     try std.testing.expect(app.auth.movePicker(1));
-    try std.testing.expectEqual(@as(usize, 7), app.auth.pickerView().choiceCount());
+    try std.testing.expectEqual(@as(usize, 4), app.auth.pickerView().choiceCount());
     try std.testing.expectEqual(@as(usize, 1), app.auth.pickerView().selectedIndex());
 }
 

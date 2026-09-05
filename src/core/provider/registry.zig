@@ -48,12 +48,69 @@ pub const Registry = struct {
         errdefer candidate.deinit();
         const id = candidate.parsed.value.id;
         if (self.lookup(id) != null) return error.DuplicateProviderId;
-        for (candidate.parsed.value.aliases) |alias| {
-            if (self.lookup(alias) != null) return error.DuplicateProviderAlias;
+        for (self.entries.items) |*entry| {
+            if (conflicts(&candidate.parsed.value, entry.def())) return error.DuplicateProviderAlias;
         }
         const order = self.entries.items.len;
         try self.entries.append(self.alloc, .{ .value = candidate, .builtin = builtin, .order = order });
         candidate = undefined;
+    }
+
+    /// Consumes owned on success and failure. Replaces an exact id, preserving
+    /// native adapters and their credential identities across profile overrides.
+    pub fn merge(self: *Registry, owned: definition.OwnedDefinition) !void {
+        var candidate = owned;
+        var consumed = false;
+        errdefer if (!consumed) candidate.deinit();
+        const incoming = &candidate.parsed.value;
+        for (self.entries.items) |*entry| {
+            const existing = entry.def();
+            if (!std.mem.eql(u8, existing.id, incoming.id)) continue;
+            if (entry.builtin and (existing.protocol == .native or existing.auth.kind == .oauth or existing.auth.kind == .oauth_native)) {
+                if (existing.protocol != incoming.protocol or
+                    !optional_equal(existing.adapter, incoming.adapter) or
+                    !try self.auth_equal(existing.auth, incoming.auth) or
+                    !optional_equal(existing.endpoint, incoming.endpoint)) return error.ImmutableNativeProvider;
+            }
+            for (self.entries.items) |*other| {
+                if (other == entry) continue;
+                if (conflicts(incoming, other.def())) return error.DuplicateProviderAlias;
+            }
+            entry.value.deinit();
+            entry.value = candidate;
+            return;
+        }
+        // add consumes even on failure; relinquish this scope's ownership first.
+        const transferred = candidate;
+        consumed = true;
+        self.add(transferred, false) catch |err| return err;
+    }
+
+    fn auth_equal(self: *const Registry, a: definition.Auth, b: definition.Auth) !bool {
+        var left = std.Io.Writer.Allocating.init(self.alloc);
+        defer left.deinit();
+        var right = std.Io.Writer.Allocating.init(self.alloc);
+        defer right.deinit();
+        try std.json.Stringify.value(a, .{}, &left.writer);
+        try std.json.Stringify.value(b, .{}, &right.writer);
+        return std.mem.eql(u8, left.written(), right.written());
+    }
+
+    fn optional_equal(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a) |left| return if (b) |right| std.mem.eql(u8, left, right) else false;
+        return b == null;
+    }
+
+    fn matches(value: *const definition.Definition, query: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(value.id, query) or std.ascii.eqlIgnoreCase(value.display_name, query)) return true;
+        for (value.aliases) |alias| if (std.ascii.eqlIgnoreCase(alias, query)) return true;
+        return false;
+    }
+
+    fn conflicts(a: *const definition.Definition, b: *const definition.Definition) bool {
+        if (matches(b, a.id) or matches(b, a.display_name)) return true;
+        for (a.aliases) |alias| if (matches(b, alias)) return true;
+        return false;
     }
 
     pub fn addJson(self: *Registry, json: []const u8, builtin: bool) !void {
@@ -113,4 +170,16 @@ test "runtime registry rejects duplicate ids and aliases" {
     try registry.addJson("{\"id\":\"one\",\"display_name\":\"One\",\"protocol\":\"openai_chat_completions\",\"endpoint\":\"https://one.example\",\"aliases\":[\"shared\"]}", true);
     try std.testing.expectError(error.DuplicateProviderId, registry.addJson("{\"id\":\"one\",\"display_name\":\"Other\",\"protocol\":\"openai_chat_completions\",\"endpoint\":\"https://two.example\"}", false));
     try std.testing.expectError(error.DuplicateProviderAlias, registry.addJson("{\"id\":\"two\",\"display_name\":\"Two\",\"protocol\":\"openai_chat_completions\",\"endpoint\":\"https://two.example\",\"aliases\":[\"shared\"]}", false));
+}
+
+test "runtime registry merges overrides and protects native identity" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.addJson("{\"id\":\"native\",\"display_name\":\"Native\",\"protocol\":\"native\",\"adapter\":\"codex\",\"auth\":{\"kind\":\"oauth_native\",\"adapter\":\"codex\"}}", true);
+    try std.testing.expectError(error.ImmutableNativeProvider, registry.merge(try definition.parse(std.testing.allocator, "{\"id\":\"native\",\"display_name\":\"Native\",\"protocol\":\"openai_responses\",\"endpoint\":\"https://other.test\"}")));
+    try registry.merge(try definition.parse(std.testing.allocator, "{\"id\":\"custom\",\"display_name\":\"Custom\",\"protocol\":\"openai_responses\",\"endpoint\":\"https://first.test\"}"));
+    try registry.merge(try definition.parse(std.testing.allocator, "{\"id\":\"custom\",\"display_name\":\"Custom\",\"protocol\":\"openai_responses\",\"endpoint\":\"https://second.test\"}"));
+    try std.testing.expectEqualStrings("https://second.test", registry.lookup("custom").?.def().endpoint.?);
+    try std.testing.expectEqual(@as(usize, 2), registry.count());
+    try std.testing.expectError(error.DuplicateProviderAlias, registry.merge(try definition.parse(std.testing.allocator, "{\"id\":\"other\",\"display_name\":\"Custom\",\"protocol\":\"openai_responses\",\"endpoint\":\"https://other.test\"}")));
 }

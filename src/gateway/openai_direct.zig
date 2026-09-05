@@ -17,6 +17,9 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 
+const wire = @import("dynamic_protocols.zig");
+const definition = @import("../core/provider/definition.zig");
+
 const Allocator = std.mem.Allocator;
 
 const max_error_body_bytes: usize = 1024 * 1024;
@@ -29,6 +32,11 @@ const fetch_timeout_ms: i64 = 30_000;
 /// Per-provider configuration. Static factories retain comptime configs;
 /// runtime factories borrow configs owned by the caller.
 pub const Config = struct {
+    protocol: definition.Protocol = .openai_chat_completions,
+    auth_required: bool = true,
+    auth_header: ?[]const u8 = null,
+    extra_headers: []const std.http.Header = &.{},
+    timeout_ms: u32 = 60_000,
     /// Default upstream base URL, e.g. "https://api.openai.com" or
     /// "https://openrouter.ai/api/v1". Version-suffixed bases are kept as-is.
     base_url: []const u8,
@@ -128,7 +136,14 @@ pub fn buildRequest(
     alloc: Allocator,
     request: stream_provider.BuildRequest,
 ) ![]u8 {
-    _ = ctx;
+    if (ctx != null) {
+        switch (configFrom(ctx).protocol) {
+            .openai_responses => return wire.build_responses(alloc, request),
+            .anthropic_messages => return wire.build_anthropic(alloc, request),
+            .native => return error.NativeAdapterRequired,
+            .openai_chat_completions => {},
+        }
+    }
     try validateModel(request.model);
     if (request.budget) |budget| {
         if (budget.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
@@ -369,19 +384,18 @@ const OpenedRequest = struct {
 const OpenRequestOperation = struct {
     client: *std.http.Client,
     uri: std.Uri,
-    auth_header: []const u8,
+    auth_header: ?[]const u8,
+    extra_headers: []const std.http.Header,
 
     pub fn run(self: *@This()) !OpenedRequest {
         return .{ .request = try self.client.request(.POST, self.uri, .{
             .headers = .{
                 .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = self.auth_header },
+                .authorization = if (self.auth_header) |value| .{ .override = value } else .omit,
                 .accept_encoding = .omit,
                 .user_agent = .{ .override = gateway_client.user_agent },
             },
-            .extra_headers = &.{
-                .{ .name = "accept", .value = "text/event-stream" },
-            },
+            .extra_headers = self.extra_headers,
             .keep_alive = false,
             .redirect_behavior = .unhandled,
         }) };
@@ -394,21 +408,37 @@ fn streamCompletionCore(
     request: stream_provider.Request,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    if (request.api_key.len == 0) return error.OpenAIDirectCredentialRequired;
+    if (config.auth_required and request.api_key.len == 0) return error.OpenAIDirectCredentialRequired;
     try validateModel(request.model);
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
     defer secret.zeroAndFree(alloc, auth_header);
 
-    const request_endpoint = try chatCompletionsUrl(alloc, config.base_url);
+    const request_endpoint = try protocol_url(alloc, config);
     defer alloc.free(request_endpoint);
     const uri = try std.Uri.parse(request_endpoint);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer headers.deinit(alloc);
+    try headers.appendSlice(alloc, config.extra_headers);
+    const header_name = config.auth_header orelse if (config.protocol == .anthropic_messages) "x-api-key" else "authorization";
+    const bearer = std.ascii.eqlIgnoreCase(header_name, "authorization");
+    if (!bearer and request.api_key.len > 0) try headers.append(alloc, .{ .name = header_name, .value = request.api_key });
+    if (config.protocol == .anthropic_messages) {
+        var has_version = false;
+        for (headers.items) |header| if (std.ascii.eqlIgnoreCase(header.name, "anthropic-version")) {
+            has_version = true;
+            break;
+        };
+        if (!has_version) try headers.append(alloc, .{ .name = "anthropic-version", .value = "2023-06-01" });
+    }
+    try headers.append(alloc, .{ .name = "accept", .value = "text/event-stream" });
     var open_operation = OpenRequestOperation{
         .client = &client,
         .uri = uri,
-        .auth_header = auth_header,
+        .auth_header = if (bearer and request.api_key.len > 0) auth_header else null,
+        .extra_headers = headers.items,
     };
     const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
@@ -464,7 +494,8 @@ fn streamCompletionCore(
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    const completion = try consumeSse(
+    request.attempt_evidence.provider_admitted = true;
+    const completion = if (config.protocol != .openai_chat_completions) try wire.consume_sse(config.protocol, alloc, reader, request) else try consumeSse(
         alloc,
         reader,
         request.callback_ctx,
@@ -481,6 +512,19 @@ fn streamCompletionCore(
         .generation_origin = config.base_url,
         .ownership = .owned,
     };
+}
+
+/// Returns caller-owned URL for the explicitly configured protocol.
+pub fn protocol_url(alloc: Allocator, config: *const Config) ![]u8 {
+    const suffix: []const u8 = switch (config.protocol) {
+        .openai_chat_completions => "/chat/completions",
+        .openai_responses => "/responses",
+        .anthropic_messages => "/messages",
+        .native => return error.NativeAdapterRequired,
+    };
+    const base = trimTrailingSlashes(config.base_url);
+    if (std.mem.endsWith(u8, base, suffix)) return alloc.dupe(u8, base);
+    return std.mem.concat(alloc, u8, &.{ base, if (hasVersionSegment(base)) "" else "/v1", suffix });
 }
 
 const ToolAccumulator = struct {

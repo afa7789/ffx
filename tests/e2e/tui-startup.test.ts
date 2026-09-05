@@ -245,7 +245,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(stderrPath, "");
 
       const version = execFileSync(FFX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `𝒇𝒇x v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -386,10 +386,9 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       const setup = await session.waitForPane(
         (pane) =>
           pane.includes("Setup") &&
-          pane.includes("Sign in with Vercel") &&
+          pane.includes("Add an API key") &&
           pane.includes("Sign in with Codex") &&
           pane.includes("Sign in with Grok") &&
-          pane.includes("API key") &&
           pane.includes("Switch provider"),
         TIMEOUT,
       );
@@ -417,7 +416,8 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       session = await TmuxSession.create({ env });
 
       const initial = await session.waitForText("Welcome to ffx", TIMEOUT);
-      expect(initial).toContain("Sign in with Vercel");
+      expect(initial).not.toContain("Sign in with Vercel");
+      expect(initial).toContain("Sign in with Codex");
       expect(initial).toContain("Add an API key");
       expect(initial).toContain("Esc to set up later");
       expect(initial).not.toContain("Change team");
@@ -426,7 +426,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
 
       await session.sendKeys("Escape");
       const skipped = await session.waitForPane(
-        (pane) => !pane.includes("Welcome to ffx") && !pane.includes("Sign in with Vercel"),
+        (pane) => !pane.includes("Welcome to ffx") && !pane.includes("Sign in with Codex"),
         TIMEOUT,
       );
       expect(skipped).not.toContain("Add an API key");
@@ -434,7 +434,8 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       await session.kill();
       session = await TmuxSession.create({ env });
       const restarted = await session.waitForText("Welcome to ffx", TIMEOUT);
-      expect(restarted).toContain("Sign in with Vercel");
+      expect(restarted).not.toContain("Sign in with Vercel");
+      expect(restarted).toContain("Sign in with Codex");
       expect(restarted).toContain("Add an API key");
     },
     60_000,
