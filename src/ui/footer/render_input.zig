@@ -83,7 +83,10 @@ pub const ModelMenuProjection = struct {
         const provider = self.providerNameAt(self.provider_index);
         var count: usize = 0;
         for (self.items) |item| {
-            if (!std.mem.eql(u8, provider, "All") and !std.ascii.eqlIgnoreCase(item.provider, provider)) continue;
+            const matches_provider = std.mem.eql(u8, provider, "All") or
+                (std.ascii.eqlIgnoreCase(provider, "Others") and item.provider.len == 0) or
+                std.ascii.eqlIgnoreCase(item.provider, provider);
+            if (!matches_provider) continue;
             const q = std.mem.trim(u8, self.query, " \t\r\n");
             if (q.len == 0 or text_utils.containsIgnoreCase(item.id, q) or text_utils.containsIgnoreCase(item.provider, q)) count += 1;
         }
@@ -94,7 +97,10 @@ pub const ModelMenuProjection = struct {
         const provider = self.providerNameAt(self.provider_index);
         var current: usize = 0;
         for (self.items) |*item| {
-            if (!std.mem.eql(u8, provider, "All") and !std.ascii.eqlIgnoreCase(item.provider, provider)) continue;
+            const matches_provider = std.mem.eql(u8, provider, "All") or
+                (std.ascii.eqlIgnoreCase(provider, "Others") and item.provider.len == 0) or
+                std.ascii.eqlIgnoreCase(item.provider, provider);
+            if (!matches_provider) continue;
             const q = std.mem.trim(u8, self.query, " \t\r\n");
             if (q.len != 0 and !text_utils.containsIgnoreCase(item.id, q) and !text_utils.containsIgnoreCase(item.provider, q)) continue;
             if (current == display_index) return item;

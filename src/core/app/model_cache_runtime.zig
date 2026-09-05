@@ -375,7 +375,11 @@ fn modelMenuFilteredItemCountByName(items: []const ModelMenuItem, provider: []co
     if (std.mem.eql(u8, provider, "All")) return modelMenuFilteredItemCount(items, .all, query);
     var count: usize = 0;
     for (items) |item| {
-        if (std.ascii.eqlIgnoreCase(item.provider, provider) and modelQueryMatches(item, query)) count += 1;
+        const matches_provider = if (std.ascii.eqlIgnoreCase(provider, "Others"))
+            item.provider.len == 0
+        else
+            std.ascii.eqlIgnoreCase(item.provider, provider);
+        if (matches_provider and modelQueryMatches(item, query)) count += 1;
     }
     return count;
 }
@@ -383,7 +387,13 @@ fn modelMenuFilteredItemCountByName(items: []const ModelMenuItem, provider: []co
 fn modelMenuItemAtByName(items: []const ModelMenuItem, provider: []const u8, query: []const u8, display_index: usize) ?*const ModelMenuItem {
     var current: usize = 0;
     for (items) |*item| {
-        if (!std.mem.eql(u8, provider, "All") and !std.ascii.eqlIgnoreCase(item.provider, provider)) continue;
+        const matches_provider = if (std.mem.eql(u8, provider, "All"))
+            true
+        else if (std.ascii.eqlIgnoreCase(provider, "Others"))
+            item.provider.len == 0
+        else
+            std.ascii.eqlIgnoreCase(item.provider, provider);
+        if (!matches_provider) continue;
         if (!modelQueryMatches(item.*, query)) continue;
         if (current == display_index) return item;
         current += 1;
@@ -948,8 +958,12 @@ fn hydrateMenuSnapshot(
     }
 
     try providers.append(alloc, "All");
+    var has_other_models = false;
     for (items.items) |item| {
-        if (item.provider.len == 0) continue;
+        if (item.provider.len == 0) {
+            has_other_models = true;
+            continue;
+        }
         var exists = false;
         for (providers.items[1..]) |name| if (std.mem.eql(u8, name, item.provider)) {
             exists = true;
@@ -957,6 +971,7 @@ fn hydrateMenuSnapshot(
         };
         if (!exists) try providers.append(alloc, item.provider);
     }
+    if (has_other_models) try providers.append(alloc, "Others");
     // Stable alphabetical provider tabs make repeated refreshes predictable.
     if (providers.items.len > 2) std.mem.sort([]const u8, providers.items[1..], {}, struct {
         fn lessThan(_: void, left: []const u8, right: []const u8) bool {
