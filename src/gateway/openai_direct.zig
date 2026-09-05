@@ -1,5 +1,5 @@
 //! Direct OpenAI-compatible streaming providers (minimax, openrouter, zhipu,
-//! deepseek, anthropic, openai). One implementation parameterized by a static
+//! deepseek, anthropic, openai). One implementation parameterized by a borrowed
 //! (base_url, fallback_model) config; the API key comes through the normal
 //! credential resolution (env var or stored key), never hardcoded.
 //!
@@ -26,15 +26,19 @@ const connect_timeout_ms: i64 = 30_000;
 const max_catalog_bytes: usize = 4 * 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;
 
-/// Static per-provider configuration baked in at comptime by
-/// `builtins/providers.zig`. Pointers to configs stay valid for the life of
-/// the process, satisfying the Provider.context lifetime contract.
+/// Per-provider configuration. Static factories retain comptime configs;
+/// runtime factories borrow configs owned by the caller.
 pub const Config = struct {
     /// Default upstream base URL, e.g. "https://api.openai.com" or
     /// "https://openrouter.ai/api/v1". Version-suffixed bases are kept as-is.
     base_url: []const u8,
     /// Catalog fallback when the upstream /models endpoint fails.
     fallback_model: []const u8,
+    /// Relative catalog path. Null disables remote discovery. The default
+    /// keeps the version-segment convention used by built-in providers.
+    models_endpoint: ?[]const u8 = "/models",
+    /// Explicit model IDs, including private models absent from discovery.
+    models: []const []const u8 = &.{},
     /// Model ids this provider exposes that are vision-capable. Some
     /// OpenAI-compatible endpoints (notably opencode zen) publish model ids
     /// without any modality metadata in /v1/models, so the shared parser
@@ -80,8 +84,14 @@ fn hasVersionSegment(base_url: []const u8) bool {
 
 /// Builds a static-context stream provider for one direct provider.
 pub fn agentStreamProvider(comptime config: Config) stream_provider.Provider {
+    return runtimeAgentStreamProvider(&config);
+}
+
+/// Borrows config and all its slices; they must remain stable until every
+/// request and stream using the returned provider has finished.
+pub fn runtimeAgentStreamProvider(config: *const Config) stream_provider.Provider {
     return .{
-        .context = @ptrCast(@constCast(&config)),
+        .context = @ptrCast(@constCast(config)),
         .build_fn = buildRequest,
         .stream_fn = streamCompletion,
     };
@@ -91,8 +101,13 @@ pub fn agentStreamProvider(comptime config: Config) stream_provider.Provider {
 /// back to the configured `fallback_model` whenever the live /models fetch
 /// fails for any reason, so the picker always has at least one option.
 pub fn modelCatalogProvider(comptime config: Config) model_catalog.Provider {
+    return runtimeModelCatalogProvider(&config);
+}
+
+/// Borrows config and all its slices until every catalog fetch has returned.
+pub fn runtimeModelCatalogProvider(config: *const Config) model_catalog.Provider {
     return .{
-        .context = @ptrCast(@constCast(&config)),
+        .context = @ptrCast(@constCast(config)),
         .fetch_fn = fetchCatalog,
     };
 }
@@ -842,10 +857,18 @@ fn fetchCatalog(
     input: model_catalog.FetchInput,
 ) Allocator.Error!model_catalog.ProviderResult {
     const config = configFrom(ctx);
+    if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) {
+        return .{ .failure = .{ .category = .cancellation } };
+    };
+    const endpoint = config.models_endpoint orelse
+        return .{ .catalog = try localCatalog(alloc, config) };
     const credential = input.access.authorizationCredential() orelse
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
 
-    const request_url = try modelsUrl(alloc, config.base_url);
+    const request_url = if (std.mem.eql(u8, endpoint, "/models"))
+        try modelsUrl(alloc, config.base_url)
+    else
+        try std.mem.concat(alloc, u8, &.{ trimTrailingSlashes(config.base_url), endpoint });
     defer alloc.free(request_url);
 
     var fallback_cancel = std.atomic.Value(bool).init(false);
@@ -869,21 +892,41 @@ fn fetchCatalog(
         if (err == error.Cancelled) {
             return .{ .failure = .{ .category = .cancellation } };
         }
-        return .{ .catalog = try fallbackCatalog(alloc, config.fallback_model, config.vision_models) };
+        return .{ .catalog = try localCatalog(alloc, config) };
     };
     defer response.deinit(alloc);
     if (response.status != .ok) {
-        return .{ .catalog = try fallbackCatalog(alloc, config.fallback_model, config.vision_models) };
+        return .{ .catalog = try localCatalog(alloc, config) };
     }
     var catalog = parseCatalog(alloc, response.body, config.vision_models) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .catalog = try fallbackCatalog(alloc, config.fallback_model, config.vision_models) };
+        return .{ .catalog = try localCatalog(alloc, config) };
     };
     if (catalog.items.len == 0) {
         model_catalog.freeModelCatalog(alloc, &catalog);
-        return .{ .catalog = try fallbackCatalog(alloc, config.fallback_model, config.vision_models) };
+        return .{ .catalog = try localCatalog(alloc, config) };
     }
+    errdefer model_catalog.freeModelCatalog(alloc, &catalog);
+    for (config.models) |id| try appendModel(alloc, &catalog, id, config.vision_models);
     return .{ .catalog = catalog };
+}
+
+fn localCatalog(alloc: Allocator, config: *const Config) Allocator.Error!std.ArrayList(model_catalog.ModelCatalogEntry) {
+    var catalog = try fallbackCatalog(alloc, config.fallback_model, config.vision_models);
+    errdefer model_catalog.freeModelCatalog(alloc, &catalog);
+    for (config.models) |id| try appendModel(alloc, &catalog, id, config.vision_models);
+    return catalog;
+}
+
+fn appendModel(alloc: Allocator, catalog: *std.ArrayList(model_catalog.ModelCatalogEntry), model: []const u8, vision_models: []const []const u8) Allocator.Error!void {
+    if (model.len == 0) return;
+    for (catalog.items) |entry| if (std.mem.eql(u8, entry.id, model)) return;
+    const id = try alloc.dupe(u8, model);
+    errdefer alloc.free(id);
+    const model_type = try alloc.dupe(u8, "language");
+    errdefer alloc.free(model_type);
+    const vision = containsModelId(vision_models, model);
+    try catalog.append(alloc, .{ .id = id, .model_type = model_type, .has_tool_use = true, .has_vision = vision, .has_file_input = vision });
 }
 
 fn parseCatalog(
@@ -903,6 +946,12 @@ fn parseCatalog(
         if (entry != .object) continue;
         const id_value = entry.object.get("id") orelse continue;
         if (id_value != .string or id_value.string.len == 0) continue;
+        var duplicate = false;
+        for (catalog.items) |existing| if (std.mem.eql(u8, existing.id, id_value.string)) {
+            duplicate = true;
+            break;
+        };
+        if (duplicate) continue;
         const id = try alloc.dupe(u8, id_value.string);
         errdefer alloc.free(id);
         const model_type = try alloc.dupe(u8, "language");
@@ -943,6 +992,35 @@ fn fallbackCatalog(
     const has_vision = containsModelId(vision_models, fallback_model);
     try catalog.append(alloc, .{ .id = id, .model_type = model_type, .has_tool_use = true, .has_vision = has_vision, .has_file_input = has_vision });
     return catalog;
+}
+
+test "runtime direct configs keep independent endpoints and local catalogs without discovery" {
+    const alloc = std.testing.allocator;
+    const configs = [_]Config{
+        .{ .base_url = "http://127.0.0.1:1/v1", .fallback_model = "private-a", .models_endpoint = null, .models = &.{ "private-a", "extra-a", "extra-a" } },
+        .{ .base_url = "http://127.0.0.1:2/v2", .fallback_model = "private-b", .models_endpoint = null },
+    };
+    for (&configs, 0..) |*config, index| {
+        const stream = runtimeAgentStreamProvider(config);
+        try std.testing.expectEqualStrings(config.base_url, configFrom(stream.context).base_url);
+        const provider = runtimeModelCatalogProvider(config);
+        const result = try provider.fetch(alloc, .{ .endpoint = "unused" });
+        var catalog = result.catalog;
+        defer model_catalog.freeModelCatalog(alloc, &catalog);
+        try std.testing.expectEqualStrings(config.fallback_model, catalog.items[0].id);
+        try std.testing.expectEqual(@as(usize, if (index == 0) 2 else 1), catalog.items.len);
+    }
+}
+
+test "runtime direct catalog merges declared models without duplicate remote IDs" {
+    const alloc = std.testing.allocator;
+    var catalog = try parseCatalog(alloc, "{\"data\":[{\"id\":\"remote\"},{\"id\":\"remote\"}]}", &.{});
+    defer model_catalog.freeModelCatalog(alloc, &catalog);
+    try appendModel(alloc, &catalog, "remote", &.{});
+    try appendModel(alloc, &catalog, "private", &.{"private"});
+    try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
+    try std.testing.expectEqualStrings("private", catalog.items[1].id);
+    try std.testing.expect(catalog.items[1].has_vision);
 }
 
 test "chatCompletionsUrl keeps existing version segments and adds v1 to bare hosts" {
