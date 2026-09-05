@@ -463,6 +463,16 @@ const App = struct {
         provider: model_provider.ProviderId,
         access: credentials.CatalogAccess,
     ) !model_catalog.ProviderResult {
+        if (self.custom_provider_config) |*config| {
+            if (std.mem.eql(u8, provider_runtime.providerKey(self), self.custom_provider_definition.?.parsed.value.id)) {
+                return openai_direct.runtimeModelCatalogProvider(config).fetch(self.alloc, .{
+                    .access = access,
+                    .endpoint = builtin_gateway.models_path,
+                    .cancel_flag = &self.worker.worker_cancel_requested,
+                    .view = .picker,
+                });
+            }
+        }
         return builtin_providers.modelCatalog(provider).fetch(self.alloc, .{
             .access = access,
             .endpoint = builtin_gateway.models_path,
@@ -1746,6 +1756,11 @@ const App = struct {
     }
 
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
+        if (self.custom_provider_config) |*config| {
+            if (std.mem.eql(u8, provider_runtime.providerKey(self), self.custom_provider_definition.?.parsed.value.id)) {
+                return AgentAppRuntime.fetchModelIds(self, openai_direct.runtimeModelCatalogProvider(config), builtin_gateway.models_path);
+            }
+        }
         return AgentAppRuntime.fetchModelIds(
             self,
             if (comptime host_target.is_wasm)
@@ -1767,10 +1782,16 @@ const App = struct {
                 self.auth.modelCatalogAccess(),
             );
         } else {
-            self.model_cache.startWarmup(
-                builtin_providers.modelCatalog(self.provider_selection.selection().provider),
-                self.auth.modelCatalogAccess(),
-            );
+            if (self.custom_provider_config) |*config| {
+                if (std.mem.eql(u8, provider_runtime.providerKey(self), self.custom_provider_definition.?.parsed.value.id)) {
+                    self.model_cache.startWarmup(
+                        openai_direct.runtimeModelCatalogProvider(config),
+                        self.auth.modelCatalogAccess(),
+                    );
+                    return;
+                }
+            }
+            self.model_cache.startWarmup(builtin_providers.modelCatalog(self.provider_selection.selection().provider), self.auth.modelCatalogAccess());
         }
     }
 
