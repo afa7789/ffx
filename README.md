@@ -65,6 +65,34 @@ To configure a key interactively:
 ffx setup
 ```
 
+Custom providers are stored in the profile settings file under `providers`.
+The provider id is an arbitrary lowercase identifier. Select it with `provider`
+and keep API keys in `api_keys`, which is never sent as part of the provider
+definition:
+
+```json
+{
+  "provider": "team-models",
+  "model_preferences": { "team-models": "private-model" },
+  "providers": {
+    "team-models": {
+      "id": "team-models",
+      "display_name": "Team Models",
+      "protocol": "openai_chat_completions",
+      "endpoint": "https://models.example.com/v1",
+      "models": ["private-model"],
+      "auth": { "kind": "api_key", "env_var": "TEAM_MODELS_API_KEY" }
+    }
+  },
+  "api_keys": { "team-models": "stored-in-the-secret-store" }
+}
+```
+
+The supported protocols are `openai_chat_completions`, `openai_responses`, and
+`anthropic_messages`. Standard device and browser PKCE OAuth definitions use
+the `oauth_device`, `oauth_browser`, or `oauth_authorization_code` auth kinds;
+native Codex, Grok, and Vercel sessions keep their existing adapters.
+
 Run ffx from a project:
 
 ```bash
