@@ -263,8 +263,13 @@ pub fn Runtime(comptime App: type) type {
                 } else {
                     app.provider_selection.adoptOwned(startup.provider, &selected_model);
                 }
-                if (startup.custom_provider) |*custom| {
-                    if (comptime @hasDecl(App, "installCustomProvider")) app.installCustomProvider(custom);
+                if (startup.takeCustomProvider()) |custom| {
+                    var owned_custom = custom;
+                    if (comptime @hasDecl(App, "installCustomProvider")) {
+                        app.installCustomProvider(&owned_custom);
+                    } else {
+                        owned_custom.deinit();
+                    }
                 }
             } else {
                 try provider_runtime.replaceModel(app, selected_model);

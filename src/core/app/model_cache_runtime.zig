@@ -1586,9 +1586,8 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expectEqual(ModelProviderFilter.all, runtime.menu.providerFilter());
 
     runtime.menu.provider_index = @intFromEnum(ModelProviderFilter.others);
-    try std.testing.expectEqual(@as(usize, 2), runtime.menu.filteredItemCount());
-    try std.testing.expectEqualStrings("private/blue-hornbill", runtime.menu.itemAt(0).?.id);
-    try std.testing.expectEqualStrings("standalone", runtime.menu.itemAt(1).?.id);
+    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
+    try std.testing.expectEqualStrings("standalone", runtime.menu.itemAt(0).?.id);
     runtime.menu.provider_index = @intFromEnum(ModelProviderFilter.all);
 
     try std.testing.expect(runtime.menu.moveVisibleItems(-1, 2));

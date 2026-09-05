@@ -216,6 +216,13 @@ pub const StartupState = struct {
         return value;
     }
 
+    /// Transfers ownership of a configured provider definition to the app.
+    pub fn takeCustomProvider(self: *StartupState) ?provider_definition.OwnedDefinition {
+        const value = self.custom_provider;
+        self.custom_provider = null;
+        return value;
+    }
+
     pub fn takePermissionRules(self: *StartupState) types.PermissionRuleSet {
         const value = self.permission_rules;
         self.permission_rules = .{};
@@ -2542,4 +2549,17 @@ test "failed terminal takeover leave and manager handoff keep physical ownership
         ),
     );
     try std.testing.expect(handoff_terminal.terminalSessionScreenActive());
+}
+
+test "startup state transfers custom provider ownership exactly once" {
+    const alloc = std.testing.allocator;
+    var state = StartupState{ .agent_step_limit = 1 };
+    state.custom_provider = try provider_definition.parse(
+        alloc,
+        "{\"id\":\"custom\",\"display_name\":\"Custom\",\"protocol\":\"openai_responses\",\"endpoint\":\"https://example.test\"}",
+    );
+    var owned = state.takeCustomProvider().?;
+    defer owned.deinit();
+    try std.testing.expect(state.custom_provider == null);
+    state.deinit(alloc);
 }
