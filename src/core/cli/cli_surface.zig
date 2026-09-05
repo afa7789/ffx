@@ -12,6 +12,7 @@ const cli_replay = @import("cli_replay.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const provider_definition = @import("../provider/definition.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
@@ -846,6 +847,81 @@ fn readLoginApiKeyLine(alloc: Allocator) ![]u8 {
     return try alloc.dupe(u8, line orelse "");
 }
 
+/// Interactively registers a runtime provider. The definition is kept in the
+/// profile while its API key is sent through the normal secure credential
+/// store. This deliberately uses line prompts so it also works from a pipe.
+fn runProviderAdd(alloc: Allocator, deps: RunDeps) !bool {
+    var input = std.Io.File.stdin();
+    const all_input = try io_mod.readFileToEnd(alloc, &input, 64 * 1024);
+    defer alloc.free(all_input);
+    var lines = std.mem.splitScalar(u8, all_input, '\n');
+    const prompt = struct {
+        fn read(alloc_: Allocator, deps_: RunDeps, lines_: *std.mem.SplitIterator(u8, .scalar), text_: []const u8) ![]u8 {
+            try writeStdout(deps_, text_);
+            return alloc_.dupe(u8, std.mem.trim(u8, lines_.next() orelse "", " \t\r\n"));
+        }
+    }.read;
+    const id = try prompt(alloc, deps, &lines, "Provider id (lowercase): ");
+    defer alloc.free(id);
+    const display_name = try prompt(alloc, deps, &lines, "Display name: ");
+    defer alloc.free(display_name);
+    const protocol = try prompt(alloc, deps, &lines, "Protocol (openai_chat_completions|openai_responses|anthropic_messages): ");
+    defer alloc.free(protocol);
+    const endpoint = try prompt(alloc, deps, &lines, "Endpoint URL: ");
+    defer alloc.free(endpoint);
+    const model = try prompt(alloc, deps, &lines, "Default model: ");
+    defer alloc.free(model);
+    const key = try prompt(alloc, deps, &lines, "API key: ");
+    defer secret.zeroAndFree(alloc, key);
+    const trimmed_id = std.mem.trim(u8, id, " \t\r\n");
+    var json_writer = std.Io.Writer.Allocating.init(alloc);
+    defer json_writer.deinit();
+    try json_writer.writer.writeAll("{\"id\":");
+    try std.json.Stringify.value(trimmed_id, .{}, &json_writer.writer);
+    try json_writer.writer.writeAll(",\"display_name\":");
+    try std.json.Stringify.value(display_name, .{}, &json_writer.writer);
+    try json_writer.writer.writeAll(",\"protocol\":");
+    try std.json.Stringify.value(protocol, .{}, &json_writer.writer);
+    try json_writer.writer.writeAll(",\"endpoint\":");
+    try std.json.Stringify.value(endpoint, .{}, &json_writer.writer);
+    try json_writer.writer.writeAll(",\"default_model\":");
+    try std.json.Stringify.value(model, .{}, &json_writer.writer);
+    try json_writer.writer.writeAll(",\"auth\":{\"kind\":\"api_key\",\"header\":\"authorization\"}}");
+    const json = json_writer.written();
+    var owned = provider_definition.parse(alloc, json) catch |err| {
+        var detail: [128]u8 = undefined;
+        const message = std.fmt.bufPrint(&detail, "ffx provider add: invalid provider definition ({s})\n", .{@errorName(err)}) catch "ffx provider add: invalid provider definition\n";
+        try writeStderr(deps, message);
+        debug_trace.logf("config", "provider add validation failed err={s}", .{@errorName(err)});
+        return false;
+    };
+    defer owned.deinit();
+    var providers: std.StringHashMapUnmanaged(provider_definition.OwnedDefinition) = .empty;
+    defer providers.deinit(alloc);
+    const owned_id = try alloc.dupe(u8, owned.parsed.value.id);
+    try providers.put(alloc, owned_id, owned);
+    owned = undefined;
+    var outcome = config_runtime.attemptUserPreferences(alloc, .{
+        .provider_key = trimmed_id,
+        .model = model,
+        .providers = providers,
+    });
+    defer outcome.deinit(alloc);
+    switch (outcome) {
+        .failure => |failure| {
+            try writeStderr(deps, "ffx provider add: could not save provider\n");
+            debug_trace.logf("config", "provider add save failed err={s}", .{@errorName(failure.err)});
+            return false;
+        },
+        .outcome => {},
+    }
+    var saved = providers.iterator();
+    while (saved.next()) |entry| entry.value_ptr.deinit();
+    try credentials.storeDirectProviderKey(alloc, trimmed_id, key);
+    try writeStdout(deps, "Provider added and selected.\n");
+    return true;
+}
+
 /// Pasted keys arrive with terminal whitespace; trim before validation.
 fn normalizeEnteredKey(alloc: Allocator, raw: []const u8) ![]u8 {
     return try alloc.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
@@ -1176,6 +1252,9 @@ fn runNonInteractiveWithDeps(
             return .handled_failure;
         },
         .provider => |rest| {
+            if (rest.len == 1 and std.mem.eql(u8, rest[0], "add")) {
+                return if (try runProviderAdd(alloc, deps)) .handled_success else .handled_failure;
+            }
             if (rest.len != 1) {
                 try writeStderr(deps, "usage: ffx provider <codex|grok|opencode|openrouter|ppq|deepseek|openai|anthropic|minimax|zhipu|zai|alibaba-cloud>\n");
                 return .handled_failure;

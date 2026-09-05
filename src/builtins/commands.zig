@@ -137,8 +137,8 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .provider,
         .token = "provider",
-        .usage = "provider <gateway|codex|grok|<provider>>",
-        .summary = "Choose the model provider used by ffx",
+        .usage = "provider <gateway|codex|grok|<provider>> | provider add",
+        .summary = "Choose or add the model provider used by ffx",
     },
     .{
         .kind = .doctor,
