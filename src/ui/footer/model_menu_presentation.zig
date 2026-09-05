@@ -187,7 +187,7 @@ fn appendProviderTabAt(
     index: usize,
     active_index: usize,
 ) !void {
-    try appendProviderTab(alloc, row, providerTabLabel(projection.providerFilterAt(index)), index == active_index);
+    try appendProviderTab(alloc, row, projection.providerNameAt(index), index == active_index);
 }
 
 fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void {
@@ -209,7 +209,7 @@ fn providerTabLabel(filter: model_cache_runtime.ModelProviderFilter) []const u8 
 
 fn providerTabWidth(projection: ModelMenuProjection, index: usize, active_index: usize) usize {
     const active_padding: usize = if (index == active_index) 2 else 0;
-    return display_width.visibleWidth(providerTabLabel(projection.providerFilterAt(index))) + active_padding;
+    return display_width.visibleWidth(projection.providerNameAt(index)) + active_padding;
 }
 
 fn providerRangeWidth(

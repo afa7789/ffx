@@ -12,6 +12,7 @@ const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
@@ -48,6 +49,7 @@ pub const ModelMenuProjection = struct {
     load_state: model_cache_runtime.ModelMenuLoadState = .loading,
     catalog_state: model_cache_runtime.ModelMenuCatalogState = .{},
     items: []const model_cache_runtime.ModelMenuItem = &.{},
+    provider_names: []const []const u8 = &.{},
     provider_index: usize = 0,
     selected_index: usize = 0,
     window_start: usize = 0,
@@ -58,19 +60,47 @@ pub const ModelMenuProjection = struct {
     }
 
     pub fn providerFilterCount(self: ModelMenuProjection) usize {
-        return model_cache_runtime.availableProviderFilterCount(self.items);
+        return if (self.provider_names.len > 0) @min(self.provider_names.len, model_cache_runtime.max_provider_tabs) else model_cache_runtime.availableProviderFilterCount(self.items);
     }
 
     pub fn providerFilterAt(self: ModelMenuProjection, index: usize) model_cache_runtime.ModelProviderFilter {
         return model_cache_runtime.availableProviderFilterAt(self.items, index);
     }
 
+    pub fn providerNameAt(self: ModelMenuProjection, index: usize) []const u8 {
+        if (self.provider_names.len > 0) return self.provider_names[@min(index, @min(self.provider_names.len, model_cache_runtime.max_provider_tabs) - 1)];
+        return switch (self.providerFilterAt(index)) {
+            .all => "All",
+            .anthropic => "Anthropic",
+            .openai => "OpenAI",
+            .xai => "xAI",
+            .zai => "Z.AI",
+            .others => "Others",
+        };
+    }
+
     pub fn filteredItemCount(self: ModelMenuProjection) usize {
-        return model_cache_runtime.modelMenuFilteredItemCount(self.items, self.providerFilter(), self.query);
+        const provider = self.providerNameAt(self.provider_index);
+        var count: usize = 0;
+        for (self.items) |item| {
+            if (!std.mem.eql(u8, provider, "All") and !std.ascii.eqlIgnoreCase(item.provider, provider)) continue;
+            const q = std.mem.trim(u8, self.query, " \t\r\n");
+            if (q.len == 0 or text_utils.containsIgnoreCase(item.id, q) or text_utils.containsIgnoreCase(item.provider, q)) count += 1;
+        }
+        return count;
     }
 
     pub fn itemAt(self: ModelMenuProjection, display_index: usize) ?*const model_cache_runtime.ModelMenuItem {
-        return model_cache_runtime.modelMenuItemAt(self.items, self.providerFilter(), self.query, display_index);
+        const provider = self.providerNameAt(self.provider_index);
+        var current: usize = 0;
+        for (self.items) |*item| {
+            if (!std.mem.eql(u8, provider, "All") and !std.ascii.eqlIgnoreCase(item.provider, provider)) continue;
+            const q = std.mem.trim(u8, self.query, " \t\r\n");
+            if (q.len != 0 and !text_utils.containsIgnoreCase(item.id, q) and !text_utils.containsIgnoreCase(item.provider, q)) continue;
+            if (current == display_index) return item;
+            current += 1;
+        }
+        return null;
     }
 };
 
@@ -270,6 +300,7 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
         .load_state = cache.menu.load_state,
         .catalog_state = cache.menu.catalog_state,
         .items = cache.menu.items.items,
+        .provider_names = cache.menu.provider_names.items,
         .provider_index = cache.menu.provider_index,
         .selected_index = cache.menu.selected_index,
         .window_start = cache.menu.window_start,

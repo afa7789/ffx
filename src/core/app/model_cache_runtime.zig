@@ -113,6 +113,9 @@ pub const ModelProviderFilter = enum {
 
 pub const model_provider_filter_count = std.meta.fields(ModelProviderFilter).len;
 const provider_filters = [_]ModelProviderFilter{ .anthropic, .openai, .xai, .zai, .others };
+/// Keep the tab strip usable on narrow terminals while retaining the aggregate
+/// tab and the most useful provider groups in a deterministic order.
+pub const max_provider_tabs: usize = 8;
 
 pub fn availableProviderFilterCount(items: []const ModelMenuItem) usize {
     var count: usize = 1;
@@ -149,6 +152,8 @@ pub const ModelMenu = struct {
     load_state: ModelMenuLoadState = .loading,
     catalog_state: ModelMenuCatalogState = .{},
     items: std.ArrayList(ModelMenuItem) = .empty,
+    /// Dynamic provider tabs. Entry zero is always the aggregate tab.
+    provider_names: std.ArrayList([]const u8) = .empty,
     provider_index: usize = 0,
     selected_index: usize = 0,
     window_start: usize = 0,
@@ -176,12 +181,22 @@ pub const ModelMenu = struct {
         return availableProviderFilterAt(self.items.items, self.provider_index);
     }
 
+    pub fn providerNameAt(self: *const ModelMenu, index: usize) []const u8 {
+        if (self.provider_names.items.len > 0)
+            return self.provider_names.items[@min(index, @min(self.provider_names.items.len, max_provider_tabs) - 1)];
+        return providerFilterLabel(self.providerFilterAt(index));
+    }
+
+    fn providerFilterAt(self: *const ModelMenu, index: usize) ModelProviderFilter {
+        return availableProviderFilterAt(self.items.items, index);
+    }
+
     pub fn filteredItemCount(self: *const ModelMenu) usize {
-        return modelMenuFilteredItemCount(self.items.items, self.providerFilter(), self.query());
+        return modelMenuFilteredItemCountByName(self.items.items, self.providerNameAt(self.provider_index), self.query());
     }
 
     pub fn itemAt(self: *const ModelMenu, display_index: usize) ?*const ModelMenuItem {
-        return modelMenuItemAt(self.items.items, self.providerFilter(), self.query(), display_index);
+        return modelMenuItemAtByName(self.items.items, self.providerNameAt(self.provider_index), self.query(), display_index);
     }
 
     pub fn moveVisibleItems(self: *ModelMenu, delta: i32, visible_items: u16) bool {
@@ -204,7 +219,7 @@ pub const ModelMenu = struct {
 
     pub fn moveProvider(self: *ModelMenu, delta: i32) bool {
         if (!self.active or self.load_state != .ready) return false;
-        const filter_count = availableProviderFilterCount(self.items.items);
+        const filter_count = if (self.provider_names.items.len > 0) @min(self.provider_names.items.len, max_provider_tabs) else availableProviderFilterCount(self.items.items);
         if (filter_count <= 1) return false;
 
         var next = @as(i32, @intCast(self.provider_index)) + delta;
@@ -226,6 +241,8 @@ pub const ModelMenu = struct {
         for (self.items.items) |item| item.deinit(alloc);
         self.items.deinit(alloc);
         self.items = .empty;
+        self.provider_names.deinit(alloc);
+        self.provider_names = .empty;
         self.provider_index = 0;
         self.selected_index = 0;
         self.window_start = 0;
@@ -257,6 +274,43 @@ pub fn modelMenuItemAt(
         current += 1;
     }
     return null;
+}
+
+fn modelMenuFilteredItemCountByName(items: []const ModelMenuItem, provider: []const u8, query: []const u8) usize {
+    if (std.mem.eql(u8, provider, "All")) return modelMenuFilteredItemCount(items, .all, query);
+    var count: usize = 0;
+    for (items) |item| {
+        if (std.ascii.eqlIgnoreCase(item.provider, provider) and modelQueryMatches(item, query)) count += 1;
+    }
+    return count;
+}
+
+fn modelMenuItemAtByName(items: []const ModelMenuItem, provider: []const u8, query: []const u8, display_index: usize) ?*const ModelMenuItem {
+    var current: usize = 0;
+    for (items) |*item| {
+        if (!std.mem.eql(u8, provider, "All") and !std.ascii.eqlIgnoreCase(item.provider, provider)) continue;
+        if (!modelQueryMatches(item.*, query)) continue;
+        if (current == display_index) return item;
+        current += 1;
+    }
+    return null;
+}
+
+fn modelQueryMatches(item: ModelMenuItem, query: []const u8) bool {
+    const query_text = std.mem.trim(u8, query, " \t\r\n");
+    return query_text.len == 0 or text_utils.containsIgnoreCase(item.id, query_text) or
+        text_utils.containsIgnoreCase(item.provider, query_text);
+}
+
+fn providerFilterLabel(filter: ModelProviderFilter) []const u8 {
+    return switch (filter) {
+        .all => "All",
+        .anthropic => "Anthropic",
+        .openai => "OpenAI",
+        .xai => "xAI",
+        .zai => "Z.AI",
+        .others => "Others",
+    };
 }
 
 test "model provider filters omit categories with zero models" {
@@ -771,9 +825,11 @@ fn hydrateMenuSnapshot(
     catalog: []const model_catalog.ModelCatalogEntry,
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
+    var providers: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (items.items) |item| item.deinit(alloc);
         items.deinit(alloc);
+        providers.deinit(alloc);
     }
     try items.ensureTotalCapacity(alloc, catalog.len);
 
@@ -796,8 +852,26 @@ fn hydrateMenuSnapshot(
         };
     }
 
+    try providers.append(alloc, "All");
+    for (items.items) |item| {
+        if (item.provider.len == 0) continue;
+        var exists = false;
+        for (providers.items[1..]) |name| if (std.mem.eql(u8, name, item.provider)) {
+            exists = true;
+            break;
+        };
+        if (!exists) try providers.append(alloc, item.provider);
+    }
+    // Stable alphabetical provider tabs make repeated refreshes predictable.
+    if (providers.items.len > 2) std.mem.sort([]const u8, providers.items[1..], {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.ascii.lessThanIgnoreCase(left, right);
+        }
+    }.lessThan);
+
     menu.clearSnapshot(alloc);
     menu.items = items;
+    menu.provider_names = providers;
     menu.load_state = .ready;
 }
 
