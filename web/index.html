@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ffx — agente de código nativo no terminal</title>
+  <meta name="description" content="ffx: fork do fx com a dependência de login da Vercel removida. Agente de código nativo, escrito em Zig, Apache-2.0. Suporta skills, subagentes, servidores MCP e instruções de projeto.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <span class="logo">ffx</span>
+    <span class="logo-tag">fork do fx</span>
+    <nav class="topnav" aria-label="Seções">
+      <a href="#habilidades">Habilidades</a>
+      <a href="#subagentes">Subagentes</a>
+      <a href="#mcp">MCP</a>
+      <a href="#instrucoes">Instruções</a>
+      <a href="#install">Instalar</a>
+    </nav>
+  </header>
+  <main>
+    <section class="hero">
+      <h1>ffx</h1>
+      <p class="hero-tagline">Agente de código nativo, escrito em Zig, para o seu terminal.</p>
+      <p class="hero-sub">Leve, aberto (Apache-2.0) e embutível em sistemas maiores — com skills, subagentes, servidores MCP e instruções de projeto.</p>
+    </section>
+
+    <section class="differentiator" id="differentiator">
+      <h2>Fork do fx, sem o login obrigatório</h2>
+      <p>O fx exigia login com conta da Vercel para começar a usar. O ffx remove essa dependência: configure sua própria chave de API de provedor e use direto.</p>
+      <ul>
+        <li>Dependência de login da Vercel removida</li>
+        <li>Mesmo foco em minimalismo e performance</li>
+        <li>Binário nativo de ~7,8&nbsp;MiB</li>
+        <li>Skills, subagentes e MCP como no fx original</li>
+      </ul>
+    </section>
+
+    <section class="capability" id="habilidades">
+      <h2>Habilidades (skills)</h2>
+      <p>Uma <strong>habilidade</strong> é um diretório com um arquivo <code>SKILL.md</code>. O ffx descobre os metadados das habilidades na inicialização, mas carrega as instruções somente quando você ou o agente invoca aquela habilidade.</p>
+
+      <h3>Descobrir e usar</h3>
+      <p>Abra o catálogo interativo de habilidades:</p>
+      <pre><code>/skills</code></pre>
+      <p>Use as abas de origem e o campo de busca para filtrar. Pressione Enter para inserir a habilidade selecionada no prompt. Você também pode digitar <code>$</code> no composer para buscar habilidades diretamente. Para inspecionar uma habilidade sem invocá-la:</p>
+      <pre><code>/skills show &lt;nome&gt;</code></pre>
+
+      <h3>Onde o ffx procura</h3>
+      <p>Do diretório de trabalho para cima, parando antes do diretório home:</p>
+      <pre><code>skills/
+.opencode/skills/
+.codex/skills/
+.claude/skills/
+.agents/skills/
+.claw/skills/</code></pre>
+      <p>E então nas raízes do usuário:</p>
+      <pre><code>~/.fx/skills/
+~/.config/opencode/skills/
+~/.codex/skills/
+~/.claude/skills/
+~/.agents/skills/
+~/.claw/skills/</code></pre>
+
+      <h3>Instalar</h3>
+      <p>Instale uma habilidade de um repositório:</p>
+      <pre><code>/skills install vercel-labs/agent-skills --skill find-skills</code></pre>
+      <p>Ou de um diretório local:</p>
+      <pre><code>/skills add ./minhas-habilidades --skill minha-ferramenta</code></pre>
+      <p><code>add</code> é um alias de <code>install</code>. Sem <code>--skill</code>, o ffx instala todas as habilidades válidas da origem. Instalações gerenciadas sempre vão para <code>~/.fx/skills/</code>. Use <code>/skills path</code> para imprimir a raiz de instalação.</p>
+
+      <h3>Criar e remover</h3>
+      <pre><code>/skills create minha-habilidade
+/skills remove minha-habilidade</code></pre>
+
+      <h3>Formato do arquivo</h3>
+      <p>Cada habilidade usa um <code>SKILL.md</code> com frontmatter YAML seguido de instruções em Markdown:</p>
+      <pre><code>---
+name: minha-habilidade
+description: Use isto quando uma solicitação precisar de...
+---
+
+# Minha habilidade
+
+Instruções para o agente.</code></pre>
+      <p><code>name</code> é obrigatório e deve caber em uma linha. <code>description</code> é opcional. Candidatos malformados ou ilegíveis são ignorados com um aviso; as demais habilidades da mesma raiz continuam carregando.</p>
+      <p class="note">O carregamento é explícito: descobrir uma habilidade não adiciona suas instruções a todo prompt. As instruções entram no contexto só quando a habilidade é invocada.</p>
+    </section>
+
+    <section class="capability" id="subagentes">
+      <h2>Subagentes</h2>
+      <p>Um <strong>subagente</strong> é uma sessão filha do ffx controlada por outro agente. Ele usa o mesmo workspace e runtime, com seu próprio modelo, esforço de raciocínio, modo de permissão, transcrição e ciclo de vida.</p>
+
+      <h3>Modos de execução</h3>
+      <ul>
+        <li><strong>One-off:</strong> o filho executa um prompt e termina.</li>
+        <li><strong>Persistente:</strong> retorna ao estado ocioso após cada turno e pode receber mais mensagens. Continua sendo uma sessão do ffx retomável.</li>
+      </ul>
+
+      <h3>Gerenciador ctrl+x</h3>
+      <p>Pressione <kbd>ctrl+x</kbd> em uma sessão interativa para abrir o gerenciador. Com ele você pode:</p>
+      <ul>
+        <li>mostrar a árvore de filhos e o estado atual;</li>
+        <li>criar e abrir filhos persistentes;</li>
+        <li>enviar instruções de acompanhamento;</li>
+        <li>alterar nome, modelo, esforço, modo de permissão e notificações;</li>
+        <li>anexar, desanexar ou reparentar uma sessão existente;</li>
+        <li>retomar, cancelar, fechar ou reabrir um filho;</li>
+        <li>resolver pedidos de aprovação do filho.</li>
+      </ul>
+      <p>Fechar o gerenciador não interrompe os filhos persistentes.</p>
+
+      <h3>Ferramenta do agente</h3>
+      <p>O modelo usa uma ferramenta <code>subagent</code> com seis ramos:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Ramo</th><th>Finalidade</th></tr></thead>
+          <tbody>
+            <tr><td><code>create</code></td><td>Criar um filho one-off ou persistente.</td></tr>
+            <tr><td><code>inspect</code></td><td>Ler o estado selecionado de um filho pelo ID.</td></tr>
+            <tr><td><code>message</code></td><td>Enviar mensagem do pai ou emitir marco do filho.</td></tr>
+            <tr><td><code>relationship</code></td><td>Anexar, desanexar ou reparentar uma sessão.</td></tr>
+            <tr><td><code>configure</code></td><td>Alterar modelo, esforço, permissões, nome ou notificações.</td></tr>
+            <tr><td><code>lifecycle</code></td><td>Retomar, cancelar, fechar ou reabrir um filho.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Criar um filho persistente:</p>
+      <pre><code>{
+  "command": {
+    "create": {
+      "name": "pesquisador",
+      "mode": "persistent",
+      "prompt": "Inspecione o fluxo de autenticação e relate pontos de risco.",
+      "model": "&lt;provedor/id-do-modelo&gt;",
+      "effort": "high",
+      "permission_mode": "ask"
+    }
+  }
+}</code></pre>
+      <p>As operações usam identidades duráveis, então uma nova tentativa segura retorna o resultado original em vez de repetir o efeito.</p>
+      <p class="note">Um filho criado pelo modelo sem modo de permissão herda o modo efetivo do chamador e não pode pedir autoridade mais ampla. Um filho criado por humano no gerenciador ctrl+x pode usar a configuração explícita do gerenciador e pode adotar <code>yolo</code> por padrão — revise essa opção antes de iniciá-lo.</p>
+    </section>
+
+    <section class="capability" id="mcp">
+      <h2>Servidores MCP</h2>
+      <p>O ffx é um cliente MCP. Os servidores que você configura ficam disponíveis no shell interativo, no <code>fx ask</code>, em sessões ACP e para subagentes autorizados.</p>
+
+      <h3>Configuração de perfil</h3>
+      <p>O perfil privado de MCP fica em <code>~/.fx/mcp.json</code>. <code>/mcp path</code> imprime o caminho exato:</p>
+      <pre><code>/mcp path</code></pre>
+      <p>O objeto raiz contém um mapa <code>mcp</code>. <code>mcpServers</code> é aceito como alias de compatibilidade, mas <code>mcp</code> prevalece quando ambos existem, e o ffx sempre grava <code>mcp</code>.</p>
+      <pre><code>{
+  "mcp": {
+    "ferramentas-locais": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-everything"],
+      "enabled": true
+    },
+    "ferramentas-remotas": {
+      "type": "http",
+      "url": "https://mcp.exemplo.com/mcp",
+      "enabled": true
+    }
+  }
+}</code></pre>
+      <p>Nomes passados aos comandos MCP só podem conter letras, números, <code>_</code> ou <code>-</code>.</p>
+
+      <h3>Configuração de projeto e confiança</h3>
+      <p>Um workspace pode fornecer configuração MCP compatível com o Claude em <code>&lt;workspace&gt;/.mcp.json</code>. O ffx a abre como arquivo regular limitado e lê apenas o objeto de topo <code>mcpServers</code>. Servidores de projeto começam pendentes e permanecem desconectados até você aprovar:</p>
+      <pre><code>/mcp trust approve &lt;nome&gt;
+/mcp trust reject &lt;nome&gt;
+/mcp trust approve-all
+/mcp trust reset</code></pre>
+      <p>A confiança é salva em <code>~/.fx/settings.json</code> sob o caminho canônico do workspace, nunca no <code>.mcp.json</code>. Antes da aprovação, o ffx não inicia o processo do projeto, não contata o endpoint e não carrega credenciais.</p>
+
+      <h3>Adicionar servidores</h3>
+      <p>Servidor stdio local:</p>
+      <pre><code>/mcp add ferramentas-locais npx -y @modelcontextprotocol/server-everything</code></pre>
+      <p>Servidor remoto (Streamable HTTP):</p>
+      <pre><code>/mcp add --transport http prisma https://mcp.prisma.io/mcp</code></pre>
+      <p>Depois de editar um servidor manualmente, aplique a mudança sem reiniciar:</p>
+      <pre><code>/mcp reload</code></pre>
+
+      <h3>Autenticar um servidor remoto</h3>
+      <p>Escolha o mecanismo mais estreito que o servidor aceita: cabeçalho estático (<code>headers</code>), cabeçalho secreto (<code>header_env</code>), token bearer (<code>bearer_token_env</code>) ou OAuth delegado (<code>oauth</code>). Um cabeçalho <code>Authorization</code> literal é rejeitado.</p>
+      <pre><code>/mcp auth &lt;nome&gt; --open
+/mcp logout &lt;nome&gt;</code></pre>
+
+      <h3>Gerenciar servidores</h3>
+      <pre><code>/mcp list
+/mcp resource list &lt;servidor&gt;
+/mcp add &lt;nome&gt; &lt;comando&gt; [args...]
+/mcp add --transport http &lt;nome&gt; &lt;url&gt;
+/mcp remove &lt;nome&gt;
+/mcp reload
+/mcp auth &lt;nome&gt; --open
+/mcp logout &lt;nome&gt;
+/mcp trust approve &lt;nome&gt;
+/mcp path</code></pre>
+      <p>Todas as operações também existem como comando de topo <code>fx mcp</code>.</p>
+
+      <h3>Como as ferramentas chegam ao modelo</h3>
+      <p>As ferramentas são descobertas de forma preguiçosa. <code>capability_search</code> busca habilidades instaladas e ferramentas MCP configuradas a partir de uma solicitação em linguagem natural. O modelo então chama <code>mcp_select_tool</code> com um resultado exato para carregar o schema executável, evitando estourar a janela de contexto. Chamadas dinâmicas de MCP usam a mesma política de permissão das ferramentas internas.</p>
+      <p class="note">Trate a configuração do servidor como sensível: valores de ambiente do MCP podem conter credenciais, e as ferramentas do servidor executam com a autoridade que o processo ou endpoint fornece. Mantenha <code>~/.fx/mcp.json</code> privado e nunca comite segredos.</p>
+    </section>
+
+    <section class="capability" id="instrucoes">
+      <h2>Instruções de projeto (AGENTS.md)</h2>
+      <p>O ffx carrega arquivos <code>AGENTS.md</code> como orientação de projeto. Eles podem descrever layout do repositório, comandos, convenções, requisitos de segurança e expectativas de verificação.</p>
+
+      <h3>Origens das instruções</h3>
+      <ul>
+        <li>instruções globais de <code>~/.fx/AGENTS.md</code>;</li>
+        <li>arquivos <code>AGENTS.md</code> do ancestor de lançamento e do workspace primário;</li>
+        <li><code>AGENTS.md</code> mais específicos para arquivos ou diretórios alvo de uma chamada de ferramenta.</li>
+      </ul>
+      <p>O escopo de projeto mais estreito aplicável vence em caso de conflito. Uma solicitação direta do usuário ainda tem prioridade mais alta que as instruções de projeto.</p>
+
+      <h3>Instruções com escopo de alvo</h3>
+      <p>As instruções aplicáveis não são fixas só na inicialização. Quando uma ferramenta tem um caminho como alvo, o ffx resolve a cadeia de instruções daquele alvo. Um pacote aninhado pode definir regras que valem só dentro do próprio diretório:</p>
+      <pre><code>projeto/
+├── AGENTS.md
+├── apps/
+│   └── web/
+│       ├── AGENTS.md
+│       └── src/
+└── packages/</code></pre>
+      <p>Uma chamada sob <code>apps/web/src/</code> recebe os dois arquivos de projeto, com <code>apps/web/AGENTS.md</code> no escopo mais estreito. Defina <code>context</code> como <code>false</code> em <code>.fx.json</code> ou nas configurações do usuário para desativar o contexto de projeto.</p>
+      <p class="note">Mantenha as instruções seguras para o repositório: arquivos <code>AGENTS.md</code> de projeto podem entrar no contexto do modelo. Não coloque credenciais, tokens privados ou dados sensíveis neles.</p>
+    </section>
+
+    <section class="install" id="install">
+      <h2>Instalação</h2>
+      <!-- INSTALL: substituir este bloco pelos comandos reais depois do npm publish. Ver .claude/PLAN.md na secao Wire-up -->
+      <pre><code>npm install -g @afa7789/ffx</code></pre>
+      <p class="install-note">Comandos finais de instalação serão publicados aqui após o <code>npm publish</code>.</p>
+    </section>
+  </main>
+  <footer class="site-footer">
+    <p>Código-fonte: <a href="https://github.com/afa7789/ffx">github.com/afa7789/ffx</a> · Changelog: <a href="https://github.com/afa7789/ffx/blob/main/CHANGELOG.md">CHANGELOG.md</a></p>
+    <p>Baseado em <a href="https://github.com/vercel-labs/fx">fx</a> (vercel-labs). Licença Apache-2.0.</p>
+    <p>Docs originais: <a href="https://fx.sh/docs/capabilities/skills">Skills</a> · <a href="https://fx.sh/docs/capabilities/subagents">Subagents</a> · <a href="https://fx.sh/docs/capabilities/mcp">MCP</a> · <a href="https://fx.sh/docs/configure-fx/project-instructions">Project instructions</a></p>
+  </footer>
+</body>
+</html>
