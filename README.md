@@ -1,45 +1,49 @@
-# ffx
+<p align="center">
+  <img src="web/ffx-mark.svg" alt="ffx" width="220">
+</p>
 
-ffx é um coding agent nativo para o terminal, escrito em Zig. É um fork
-comunitário do [fx](https://fx.sh/) focado em liberdade de providers: use
-OpenAI, Anthropic, DeepSeek, OpenRouter, PPQ, MiniMax, Zhipu/GLM, Z.AI,
-OpenCode ou endpoints compatíveis sem login obrigatório da Vercel.
+<p align="center">A tiny, open, native coding agent for the terminal.</p>
 
-## O que o ffx oferece
+ffx is a native coding agent written in Zig. It is a community fork of
+[fx](https://fx.sh/) focused on provider freedom: use OpenAI, Anthropic,
+DeepSeek, OpenRouter, PPQ, MiniMax, Zhipu/GLM, Z.AI, OpenCode, or compatible
+custom endpoints without a mandatory Vercel login.
 
-- providers diretos e providers customizados;
-- configuração persistida em `~/.ffx/settings.json`;
-- `/connect-provider` para adicionar uma conexão;
-- `/switch-provider` e `/provider` para selecionar o provider ativo;
-- `/models` com catálogo dinâmico, tabs por provider e favoritos;
-- skills, subagentes, MCP e instruções de projeto;
-- binário nativo pequeno e embutível.
+## Features
 
-## Instalação
+- Direct and custom AI providers.
+- Persistent configuration in `~/.ffx/settings.json`.
+- `/connect-provider` for adding a provider connection.
+- `/switch-provider` and `/provider` for selecting the active provider.
+- `/models` with dynamic provider tabs, model discovery, and favorites.
+- Skills, subagents, MCP, and project instructions.
+- A small native binary designed for embedding.
 
-Compile com Zig 0.16 ou mais recente:
+## Install
+
+Build with Zig 0.16 or newer:
 
 ```bash
 git clone https://github.com/afa7789/ffx.git
 cd ffx
-zig build -Doptimize=ReleaseSafe
+zig build --release=safe
 ./zig-out/bin/ffx
 ```
 
-Ou use o instalador:
+Or use the installer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/afa7789/ffx/main/setup.sh | bash
 ```
 
-## Uso rápido
+## Quick start
 
 ```bash
 ffx
-ffx ask "explique as mudanças neste repositório"
+ffx ask "explain the changes in this repository"
 ```
 
-Dentro da sessão:
+Inside a session:
 
 ```text
 /connect-provider
@@ -49,8 +53,7 @@ Dentro da sessão:
 /help
 ```
 
-Para um endpoint OpenAI-compatible customizado, use `/connect-provider` ou
-configure as variáveis de ambiente:
+For an OpenAI-compatible custom endpoint, use `/connect-provider` or set:
 
 ```bash
 export FFX_PROVIDER_API_KEY="..."
@@ -58,10 +61,10 @@ export FFX_PROVIDER_BASE_URL="https://models.example.com/v1"
 ./zig-out/bin/ffx
 ```
 
-As configurações existentes são carregadas na inicialização e podem ser
-alteradas sem editar arquivos manualmente.
+Existing settings are loaded at startup and can be changed without editing
+configuration files by hand.
 
-## Desenvolvimento
+## Development
 
 ```bash
 zig build
@@ -69,15 +72,15 @@ zig build test
 zig fmt src/
 ```
 
-Consulte [`CONTRIBUTING.md`](CONTRIBUTING.md) para contribuir. A landing page
-está em [`web/index.html`](web/index.html) e é publicada pelo GitHub Pages.
+The landing page lives in [`web/index.html`](web/index.html) and is published
+through GitHub Pages.
 
 ## Links
 
-- [Site](https://afa7789.github.io/ffx/)
-- [Código-fonte](https://github.com/afa7789/ffx)
-- [fx original](https://github.com/vercel-labs/fx)
+- [Website](https://afa7789.github.io/ffx/)
+- [Source](https://github.com/afa7789/ffx)
+- [Original fx project](https://github.com/vercel-labs/fx)
 
-## Licença
+## License
 
 [Apache-2.0](LICENSE)
