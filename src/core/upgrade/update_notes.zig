@@ -16,7 +16,7 @@ pub const Destination = struct {
     pub fn writeUrl(self: Destination, writer: *std.Io.Writer) !void {
         switch (self.channel) {
             .stable => try writer.print(
-                "https://fx.sh/changelog#v{s}",
+                "https://ffx.sh/changelog#v{s}",
                 .{update_target.normalizeVersion(self.version)},
             ),
             .dev => {
@@ -88,7 +88,7 @@ test "stable destination uses normalized changelog anchor" {
     try std.testing.expectEqual(Kind.notes, value.kind);
     try value.writeUrl(&out.writer);
     try std.testing.expectEqualStrings(
-        "https://fx.sh/changelog#v0.0.8",
+        "https://ffx.sh/changelog#v0.0.8",
         out.writer.buffered(),
     );
 }
@@ -161,7 +161,7 @@ test "destination links only the label, not its parentheses" {
     }{
         .{
             .value = stable,
-            .expected = "(\x1b]8;;https://fx.sh/changelog#v0.0.8\x1b\\" ++
+            .expected = "(\x1b]8;;https://ffx.sh/changelog#v0.0.8\x1b\\" ++
                 "\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{

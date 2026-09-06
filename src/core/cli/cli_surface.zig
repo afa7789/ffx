@@ -11,6 +11,8 @@ const cli_replay = @import("cli_replay.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const provider_definition = @import("../provider/definition.zig");
+const builtin_providers = @import("../../builtins/providers.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -156,7 +158,7 @@ pub const RunResult = union(enum) {
     handled_exit: u8,
 };
 
-const version_usage = "usage: fx --version\n";
+const version_usage = "usage: ffx --version\n";
 
 pub const Config = struct {
     version: []const u8 = "",
@@ -205,7 +207,9 @@ const LocalSurfaceOptions = struct {
 fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
     if (rest.len == 0) return null;
     if (rest.len != 1) return error.InvalidLoginProviderArgs;
-    return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
+    const provider = model_provider.parse(rest[0]) orelse return error.InvalidLoginProviderArgs;
+    if (provider != .codex and provider != .grok) return error.InvalidLoginProviderArgs;
+    return provider;
 }
 
 fn selectCatalogModel(
@@ -584,8 +588,8 @@ pub fn parseInteractiveLaunch(
     }
 }
 
-/// Detects `fx <subcommand> --help` / `-h` and returns the subcommand kind so the
-/// caller can render command-specific help. Top-level `fx --help`/`fx help` are
+/// Detects `ffx <subcommand> --help` / `-h` and returns the subcommand kind so the
+/// caller can render command-specific help. Top-level `ffx --help`/`ffx help` are
 /// handled separately and intentionally excluded here.
 fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const u8) ?TopLevelKind {
     if (args.len < 2) return null;
@@ -661,7 +665,7 @@ fn writeProviderActivationError(
     const message = try std.fmt.allocPrint(
         alloc,
         "{s}: {s}\n",
-        .{ if (caller == .provider_login) "fx login" else "fx provider", detail },
+        .{ if (caller == .provider_login) "ffx login" else "ffx provider", detail },
     );
     defer alloc.free(message);
     try writeStderr(deps, message);
@@ -701,6 +705,7 @@ fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.Prov
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        else => return error.ProviderLoginUnavailable,
     }
 }
 
@@ -714,9 +719,9 @@ fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_pr
         return;
     }
     try writeProviderActivationError(alloc, deps, caller, switch (err) {
-        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first",
+        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the ffx Vercel App client id first",
         error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
-        error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run fx login again",
+        error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run ffx login again",
         else => "failed to sign in",
     });
 }
@@ -759,12 +764,15 @@ fn activateProviderSelectionFallible(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            else => "Provider is already selected.\n",
         });
         return true;
     }
 
     var performed_login: ?model_provider.ProviderId = null;
-    if (cfg.auth_mode == .local and prepared_credential == null and provider_catalog.find(target).subscription and caller == .provider_command) {
+    if (cfg.auth_mode == .local and prepared_credential == null and
+        (target == .codex or target == .grok) and caller == .provider_command)
+    {
         runProviderLogin(alloc, cfg, target) catch |err| {
             try writeProviderLoginFailure(alloc, deps, target, caller, err);
             return false;
@@ -792,15 +800,43 @@ fn activateProviderSelectionFallible(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
+                else => "provider credential is unavailable",
             },
         );
         return false;
     };
+    if (target != .gateway and target != .codex and target != .grok) {
+        const entry = builtin_providers.byId(model_provider.registryId(target)) orelse {
+            try writeProviderActivationError(alloc, deps, caller, "provider definition is unavailable");
+            return false;
+        };
+        const selected_model = settings.models.get(target) orelse entry.default_model;
+        if (selected_model.len == 0) {
+            try writeProviderActivationError(alloc, deps, caller, "provider has no default model");
+            return false;
+        }
+        var attempt = config_runtime.attemptUserPreferences(alloc, .{
+            .provider = target,
+            .model_preference = .{ .provider = target, .model = selected_model },
+            .credential_source = exact_source,
+        });
+        defer attempt.deinit(alloc);
+        switch (attempt) {
+            .failure => {
+                try writeProviderActivationError(alloc, deps, caller, "failed to save provider selection");
+                return false;
+            },
+            .outcome => {},
+        }
+        if (caller == .provider_command) try writeStdout(deps, "Provider selected.\n");
+        return true;
+    }
     const catalog_provider = cfg.provider_set.select(target).model_catalog orelse {
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
+            else => "provider model catalog is unavailable",
         });
         return false;
     };
@@ -868,13 +904,154 @@ fn activateProviderSelectionFallible(
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
         .gateway => unreachable,
+        else => {},
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            else => "Provider selected.\n",
         });
+    }
+    return true;
+}
+
+fn resolveCredentialForTarget(
+    alloc: Allocator,
+    cfg: Config,
+    target: model_provider.ProviderId,
+) !credentials.Resolution {
+    return switch (target) {
+        .gateway => credentials.resolveForProvider(alloc, cfg.secret_store, model_provider.registryId(target)),
+        .codex => .{ .credential = if (try chatgpt_oauth.loadAccess(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            .if_needed,
+        )) |access| .{
+            .token = access.access_token,
+            .source = .stored_key,
+            .account_id = access.account_id,
+        } else null },
+        .grok => .{ .credential = if (try grok_oauth.loadAccess(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            .if_needed,
+        )) |access| .{
+            .token = access.access_token,
+            .source = .stored_key,
+            .account_id = access.account_id,
+        } else null },
+        else => .{ .credential = if (builtin_providers.byId(model_provider.registryId(target))) |entry|
+            try credentials.resolveDirectProvider(alloc, cfg.secret_store, entry.id, entry.env_var)
+        else
+            null },
+    };
+}
+
+fn readLoginApiKeyLine(alloc: Allocator) ![]u8 {
+    var read_buf: [4096]u8 = undefined;
+    var reader = std.Io.File.stdin().reader(io_mod.getIo(), &read_buf);
+    const line = reader.interface.takeDelimiter('\n') catch |err| return err;
+    return try alloc.dupe(u8, line orelse "");
+}
+
+/// Interactively registers a runtime provider. The definition is kept in the
+/// profile while its API key is sent through the normal secure credential
+/// store. This deliberately uses line prompts so it also works from a pipe.
+fn runProviderAdd(alloc: Allocator, deps: RunDeps) !bool {
+    var input = std.Io.File.stdin();
+    const all_input = try io_mod.readFileToEnd(alloc, &input, 64 * 1024);
+    defer alloc.free(all_input);
+    var lines = std.mem.splitScalar(u8, all_input, '\n');
+    const prompt = struct {
+        fn read(alloc_: Allocator, deps_: RunDeps, lines_: *std.mem.SplitIterator(u8, .scalar), text_: []const u8) ![]u8 {
+            try writeStdout(deps_, text_);
+            return alloc_.dupe(u8, std.mem.trim(u8, lines_.next() orelse "", " \t\r\n"));
+        }
+    }.read;
+    const id = try prompt(alloc, deps, &lines, "Provider id (lowercase): ");
+    defer alloc.free(id);
+    const display_name = try prompt(alloc, deps, &lines, "Display name: ");
+    defer alloc.free(display_name);
+    const protocol = try prompt(alloc, deps, &lines, "Protocol (openai_chat_completions|openai_responses|anthropic_messages): ");
+    defer alloc.free(protocol);
+    const endpoint = try prompt(alloc, deps, &lines, "Endpoint URL: ");
+    defer alloc.free(endpoint);
+    const model = try prompt(alloc, deps, &lines, "Default model: ");
+    defer alloc.free(model);
+    const key = try prompt(alloc, deps, &lines, "API key: ");
+    defer secret.zeroAndFree(alloc, key);
+    const trimmed_id = std.mem.trim(u8, id, " \t\r\n");
+    var json_writer = std.Io.Writer.Allocating.init(alloc);
+    defer json_writer.deinit();
+    try json_writer.writer.writeAll("{\"id\":");
+    try std.json.Stringify.value(trimmed_id, .{}, &json_writer.writer);
+    try json_writer.writer.writeAll(",\"display_name\":");
+    try std.json.Stringify.value(display_name, .{}, &json_writer.writer);
+    try json_writer.writer.writeAll(",\"protocol\":");
+    try std.json.Stringify.value(protocol, .{}, &json_writer.writer);
+    try json_writer.writer.writeAll(",\"endpoint\":");
+    try std.json.Stringify.value(endpoint, .{}, &json_writer.writer);
+    try json_writer.writer.writeAll(",\"default_model\":");
+    try std.json.Stringify.value(model, .{}, &json_writer.writer);
+    try json_writer.writer.writeAll(",\"auth\":{\"kind\":\"api_key\",\"header\":\"authorization\"}}");
+    const json = json_writer.written();
+    var owned = provider_definition.parse(alloc, json) catch |err| {
+        var detail: [128]u8 = undefined;
+        const message = std.fmt.bufPrint(&detail, "ffx provider add: invalid provider definition ({s})\n", .{@errorName(err)}) catch "ffx provider add: invalid provider definition\n";
+        try writeStderr(deps, message);
+        debug_trace.logf("config", "provider add validation failed err={s}", .{@errorName(err)});
+        return false;
+    };
+    var owned_transferred = false;
+    defer if (!owned_transferred) owned.deinit();
+    var providers: std.StringHashMapUnmanaged(provider_definition.OwnedDefinition) = .empty;
+    defer {
+        var iterator = providers.iterator();
+        while (iterator.next()) |entry| entry.value_ptr.deinit();
+        providers.deinit(alloc);
+    }
+    const owned_id = try alloc.dupe(u8, owned.parsed.value.id);
+    try providers.put(alloc, owned_id, owned);
+    owned_transferred = true;
+    var outcome = config_runtime.attemptUserPreferences(alloc, .{
+        .provider_key = trimmed_id,
+        .model_preference = .{ .provider = .custom, .model = model },
+        .providers = providers,
+    });
+    defer outcome.deinit(alloc);
+    switch (outcome) {
+        .failure => |failure| {
+            try writeStderr(deps, "ffx provider add: could not save provider\n");
+            debug_trace.logf("config", "provider add save failed err={s}", .{@errorName(failure.err)});
+            return false;
+        },
+        .outcome => {},
+    }
+    try credentials.storeDirectProviderKey(alloc, trimmed_id, key);
+    try writeStdout(deps, "Provider added and selected.\n");
+    return true;
+}
+
+/// Pasted keys arrive with terminal whitespace; trim before validation.
+fn normalizeEnteredKey(alloc: Allocator, raw: []const u8) ![]u8 {
+    return try alloc.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
+}
+
+fn activateDirectProvider(alloc: Allocator, target: model_provider.ProviderId) !bool {
+    const entry = builtin_providers.byId(model_provider.registryId(target)) orelse return false;
+    var attempt = config_runtime.attemptUserPreferences(alloc, .{
+        .provider = target,
+        .model = entry.default_model,
+    });
+    defer attempt.deinit(alloc);
+    switch (attempt) {
+        .failure => |failure| {
+            debug_trace.logf("config", "direct provider selection persistence failed err={s}", .{@errorName(failure.err)});
+            return false;
+        },
+        .outcome => {},
     }
     return true;
 }
@@ -888,11 +1065,11 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         var writer: std.Io.Writer.Allocating = .init(alloc);
         defer writer.deinit();
         if (globalLaunchErrorMessage(err)) |message| {
-            try writer.writer.print("fx: {s}\n", .{message});
+            try writer.writer.print("ffx: {s}\n", .{message});
         } else {
-            try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
+            try writer.writer.print("ffx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: ffx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -956,7 +1133,7 @@ fn runNonInteractiveWithDeps(
         },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--log-file <path>]\n");
+                try writeStderr(deps, "usage: ffx acp [--model <id>] [--log-file <path>]\n");
                 return .handled_failure;
             };
             try cfg.acp_runner.run(alloc, .{
@@ -993,15 +1170,18 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: ffx login [codex|grok]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
-            // Preserve the original `fx login` behavior for scripts and users.
-            const login_provider = maybe_login_provider orelse .gateway;
+            // Preserve the original `ffx login` behavior for scripts and users.
+            const login_provider = maybe_login_provider orelse {
+                try writeStderr(deps, "usage: ffx login [codex|grok]\n");
+                return .handled_failure;
+            };
             runProviderLogin(alloc, cfg, login_provider) catch |err| {
                 try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
                 return .handled_failure;
@@ -1015,26 +1195,26 @@ fn runNonInteractiveWithDeps(
                 if (login_provider == .gateway) .fx_login else null,
             )) return .handled_failure;
             try writeStdout(deps, switch (login_provider) {
-                .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
                 .codex => "Signed in with Codex.\n",
                 .grok => "Signed in with Grok.\n",
+                else => "Signed in with the selected provider.\n",
             });
             return .handled_success;
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: ffx logout [vercel|codex|grok]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
-            // Preserve the original `fx logout` behavior for scripts and users.
+            // Preserve the original `ffx logout` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                    try writeStderr(deps, "ffx logout: failed to durably remove saved Codex login\n");
                     return .handled_failure;
                 };
                 return switch (outcome) {
@@ -1047,18 +1227,18 @@ fn runNonInteractiveWithDeps(
                         break :result .handled_success;
                     },
                     .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                        try writeStderr(deps, "ffx logout: failed to durably remove saved Codex login\n");
                         break :result .handled_failure;
                     },
                 };
             }
             if (login_provider == .grok) {
                 const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                    try writeStderr(deps, "ffx logout: failed to durably remove saved Grok login\n");
                     return .handled_failure;
                 };
                 if (outcome.revocation_failed) {
-                    try writeStderr(deps, "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                    try writeStderr(deps, "ffx logout: local Grok session removed, but remote revocation could not be confirmed\n");
                 }
                 return switch (outcome.deletion) {
                     .deleted => result: {
@@ -1070,14 +1250,14 @@ fn runNonInteractiveWithDeps(
                         break :result .handled_success;
                     },
                     .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                        try writeStderr(deps, "ffx logout: failed to durably remove saved Grok login\n");
                         break :result .handled_failure;
                     },
                 };
             }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
+                    try writeStderr(deps, "ffx logout: failed to durably remove saved ffx login\n");
                     return .handled_failure;
                 },
             };
@@ -1095,17 +1275,17 @@ fn runNonInteractiveWithDeps(
                             "logout credential preference clear failed err={s}",
                             .{@errorName(failure.err)},
                         );
-                        try writeStderr(deps, "fx logout: signed out, but failed to clear the saved fx login selection\n");
+                        try writeStderr(deps, "ffx logout: signed out, but failed to clear the saved ffx login selection\n");
                         return .handled_failure;
                     },
                 }
             }
             if (result.local_durability_failed) {
-                try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
+                try writeStderr(deps, "ffx logout: failed to durably remove saved ffx login\n");
             } else {
                 try writeStdout(
                     deps,
-                    if (result.session_deleted) "Signed out of fx.\n" else "No fx login session found.\n",
+                    if (result.session_deleted) "Signed out of ffx.\n" else "No ffx login session found.\n",
                 );
             }
             if (result.remote_revocation_failed) {
@@ -1116,7 +1296,7 @@ fn runNonInteractiveWithDeps(
         },
         .teams => |rest| {
             if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx teams\n");
+                try writeStderr(deps, "usage: ffx teams\n");
                 return .handled_failure;
             }
             if (cfg.auth_mode == .host_managed) {
@@ -1133,13 +1313,13 @@ fn runNonInteractiveWithDeps(
                 },
             ) catch |err| {
                 const message = switch (err) {
-                    error.NoSession => "fx teams: run fx login first\n",
-                    error.SessionChanged => "fx teams: authentication changed; try again\n",
-                    error.TeamRequestFailed => "fx teams: failed to list Vercel teams\n",
-                    error.InvalidTeamSelection => "fx teams: no team selected\n",
-                    error.AccessDenied => "fx teams: authorization denied\n",
-                    error.TeamValidationFailed => "fx teams: selected team could not access AI Gateway\n",
-                    else => "fx teams: failed to switch team\n",
+                    error.NoSession => "ffx teams: run ffx login first\n",
+                    error.SessionChanged => "ffx teams: authentication changed; try again\n",
+                    error.TeamRequestFailed => "ffx teams: failed to list Vercel teams\n",
+                    error.InvalidTeamSelection => "ffx teams: no team selected\n",
+                    error.AccessDenied => "ffx teams: authorization denied\n",
+                    error.TeamValidationFailed => "ffx teams: selected team could not access AI Gateway\n",
+                    else => "ffx teams: failed to switch team\n",
                 };
                 try writeStderr(deps, message);
                 return .handled_failure;
@@ -1155,12 +1335,15 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .provider => |rest| {
+            if (rest.len == 1 and std.mem.eql(u8, rest[0], "add")) {
+                return if (try runProviderAdd(alloc, deps)) .handled_success else .handled_failure;
+            }
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: ffx provider <provider-id>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "ffx provider: unknown provider id\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
@@ -1276,9 +1459,10 @@ fn runNonInteractiveWithDeps(
             const catalog_access = startup.modelCatalogAccess();
             const catalog_provider = cfg.provider_set.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
-                    .gateway => "fx models: Gateway model catalog is unavailable\n",
-                    .codex => "fx models: Codex model catalog is unavailable\n",
-                    .grok => "fx models: Grok model catalog is unavailable\n",
+                    .gateway => "ffx models: Gateway model catalog is unavailable\n",
+                    .codex => "ffx models: Codex model catalog is unavailable\n",
+                    .grok => "ffx models: Grok model catalog is unavailable\n",
+                    else => "ffx models: provider model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };
@@ -1304,7 +1488,7 @@ fn runNonInteractiveWithDeps(
                             message,
                         );
                     } else {
-                        try writeStderr(deps, "fx models: ");
+                        try writeStderr(deps, "ffx models: ");
                         try writeStderr(deps, message);
                         try writeStderr(deps, "\n");
                     }
@@ -1713,7 +1897,7 @@ fn runNonInteractiveWithDeps(
                 if (opts.format == .json) {
                     try writeJsonCommandFailure(alloc, deps, "upgrade", err, "failed to load update settings");
                 } else {
-                    try writeStderr(deps, "fx upgrade: failed to load update settings\n");
+                    try writeStderr(deps, "ffx upgrade: failed to load update settings\n");
                 }
                 return .handled_failure;
             };
@@ -1726,7 +1910,7 @@ fn runNonInteractiveWithDeps(
                     if (opts.format == .json) {
                         try writeJsonCommandFailure(alloc, deps, "upgrade", err, "failed to save update channel");
                     } else {
-                        try writeStderr(deps, "fx upgrade: failed to save update channel\n");
+                        try writeStderr(deps, "ffx upgrade: failed to save update channel\n");
                     }
                     return .handled_failure;
                 };
@@ -1746,7 +1930,7 @@ fn runNonInteractiveWithDeps(
                 .text => .text,
                 .json => .json,
             }) catch {
-                try writeStderr(deps, "fx upgrade: render failed\n");
+                try writeStderr(deps, "ffx upgrade: render failed\n");
                 return .handled_failure;
             };
             defer alloc.free(text);
@@ -1759,7 +1943,7 @@ fn runNonInteractiveWithDeps(
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
         .unknown => |command| {
-            try writeStderr(deps, "fx: unknown subcommand: ");
+            try writeStderr(deps, "ffx: unknown subcommand: ");
             try writeStderr(deps, command);
             try writeStderr(deps, "\n\n");
             try writeTopLevelHelp(alloc, cfg.command_catalog, deps, cfg.version, .stderr);
@@ -1804,7 +1988,7 @@ fn runGithubWorkflow(
     const prompt = switch (workflow) {
         .pull_request => github_workflows.buildPrompt(alloc, workflow, workflowLanguagePlaceholder(), opts.context) catch |err| switch (err) {
             error.NotGitRepository => {
-                try writeStderr(deps, "fx pr: requires running inside a git repository\n");
+                try writeStderr(deps, "ffx pr: requires running inside a git repository\n");
                 return .handled_failure;
             },
             else => return err,
@@ -1825,8 +2009,8 @@ fn runGithubWorkflow(
 
     const draft = github_publish.parseDraft(alloc, run_result.assistant_output) catch {
         try writeStderr(deps, switch (workflow) {
-            .pull_request => "fx pr: failed to parse drafted PR title/body\n",
-            .issue => "fx issue: failed to parse drafted issue title/body\n",
+            .pull_request => "ffx pr: failed to parse drafted PR title/body\n",
+            .issue => "ffx issue: failed to parse drafted issue title/body\n",
         });
         return .handled_failure;
     };
@@ -1839,8 +2023,8 @@ fn runGithubWorkflow(
     defer published.deinit(alloc);
     if (!published.ok) {
         try writeStderr(deps, switch (workflow) {
-            .pull_request => "fx pr: ",
-            .issue => "fx issue: ",
+            .pull_request => "ffx pr: ",
+            .issue => "ffx issue: ",
         });
         try writeStderr(deps, published.text);
         try writeStderr(deps, "\n");
@@ -1865,11 +2049,11 @@ fn runPasteSetup(
     deps: RunDeps,
 ) !bool {
     if (secret_store.isDisabled()) {
-        try writeStderr(deps, "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n");
+        try writeStderr(deps, "ffx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n");
         return false;
     }
     if (!deps.setup_terminal_available(deps.setup_ctx)) {
-        try writeStderr(deps, "fx setup: an interactive terminal is required to paste an API key\n");
+        try writeStderr(deps, "ffx setup: an interactive terminal is required to paste an API key\n");
         return false;
     }
 
@@ -1891,7 +2075,7 @@ fn runPasteSetup(
         defer secret.zeroAndFree(alloc, key);
         try writeStderr(deps, "\n");
         secret_store.store(alloc, key) catch {
-            try writeStderr(deps, "fx setup: API key was not saved\n");
+            try writeStderr(deps, "ffx setup: API key was not saved\n");
             return false;
         };
     }
@@ -2013,7 +2197,7 @@ fn writeConfigDiagnostics(
         var notice_writer: std.Io.Writer.Allocating = .init(alloc);
         defer notice_writer.deinit();
         try notice_writer.writer.print(
-            "fx: config {s}: {s}",
+            "ffx: config {s}: {s}",
             .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
         );
         try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
@@ -2167,7 +2351,7 @@ fn selfExePathDefault(_: ?*anyopaque, alloc: Allocator) ![]u8 {
 }
 
 fn writeTopLevelUsage(command_catalog: CommandCatalog, deps: RunDeps, kind: TopLevelKind) !void {
-    try writeStderr(deps, "usage: fx ");
+    try writeStderr(deps, "usage: ffx ");
     try writeStderr(deps, command_specs.topLevelUsage(command_catalog, kind));
     try writeStderr(deps, "\n");
 }
@@ -2363,7 +2547,7 @@ fn runTopLevelMcp(
     }
     if (std.mem.eql(u8, operation, "auth")) {
         if (rest.len != 2 or rest[1].len == 0) {
-            try writeStderr(deps, "usage: fx " ++ command_specs.mcp_auth_usage ++ "\n");
+            try writeStderr(deps, "usage: ffx " ++ command_specs.mcp_auth_usage ++ "\n");
             return .handled_failure;
         }
         var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
@@ -2565,7 +2749,7 @@ fn writeMcpProfileMutationSuccess(
 fn writeMcpAddUsage(deps: RunDeps) !void {
     return writeStderr(
         deps,
-        "usage: fx mcp add NAME COMMAND [ARGS...] | fx mcp add --transport http NAME URL\n",
+        "usage: ffx mcp add NAME COMMAND [ARGS...] | ffx mcp add --transport http NAME URL\n",
     );
 }
 
@@ -2578,7 +2762,7 @@ fn writeMcpOperationFailure(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.print(
-        "fx mcp {s} failed: {s}.\n",
+        "ffx mcp {s} failed: {s}.\n",
         .{ operation, @errorName(err) },
     );
     try writeStderr(deps, out.written());
@@ -2605,7 +2789,7 @@ fn writeMcpProfileWarning(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.print(
-        "fx: ~/.fx/mcp.json warning: {s}",
+        "ffx: ~/.ffx/mcp.json warning: {s}",
         .{@tagName(warning.cause)},
     );
     if (warning.key()) |key| {
@@ -2652,7 +2836,7 @@ fn writeUsageCommandFailure(
             message,
         );
     }
-    try writeStderr(deps, "fx usage: ");
+    try writeStderr(deps, "ffx usage: ");
     try writeStderr(deps, message);
     try writeStderr(deps, "\n");
 }
@@ -2676,7 +2860,7 @@ fn writeWorkspaceCommandError(
 ) !void {
     if (!argsContainJson(args)) {
         if (output_contracts.workspaceErrorMessage(err)) |message| {
-            try writeStderr(deps, "fx workspace: ");
+            try writeStderr(deps, "ffx workspace: ");
             try writeStderr(deps, message);
             try writeStderr(deps, "\n");
             return;
@@ -2708,7 +2892,7 @@ fn writeWorkspaceIndeterminateError(
         .unconfirmed => "settings durability is uncertain; reloaded settings match neither the requested nor previous state",
     };
     if (!argsContainJson(args)) {
-        try writeStderr(deps, "fx workspace: ");
+        try writeStderr(deps, "ffx workspace: ");
         try writeStderr(deps, message);
         try writeStderr(deps, "\n");
         return;
@@ -2849,87 +3033,87 @@ fn writeLookupFailure(
 
     switch (err) {
         error.NoSavedSessions => {
-            try writeStderr(deps, "fx session: no saved sessions for this workspace\n");
+            try writeStderr(deps, "ffx session: no saved sessions for this workspace\n");
         },
         error.NoReadableSessions => {
-            try writeStderr(deps, "fx session: saved sessions are unreadable; run `fx doctor` for recovery guidance\n");
+            try writeStderr(deps, "ffx session: saved sessions are unreadable; run `ffx doctor` for recovery guidance\n");
         },
         error.SessionNotFound => {
-            try writeStderr(deps, "fx session: record not found\n");
+            try writeStderr(deps, "ffx session: record not found\n");
         },
         error.InvalidSessionFormat => {
             try writeStderr(
                 deps,
-                "fx session: record is corrupt; run `fx doctor` for recovery guidance\n",
+                "ffx session: record is corrupt; run `ffx doctor` for recovery guidance\n",
             );
         },
         error.UnsupportedSessionSchema => {
             try writeStderr(
                 deps,
-                "fx session: record uses an unsupported session version\n",
+                "ffx session: record uses an unsupported session version\n",
             );
         },
         error.InvalidSessionId => {
-            try writeStderr(deps, "fx session: invalid session id\n");
+            try writeStderr(deps, "ffx session: invalid session id\n");
         },
         error.LegacySessionTooLarge => {
             try writeStderr(
                 deps,
-                "fx session: legacy session is too large for automatic loading; run `fx session migrate <id> --allow-large`\n",
+                "ffx session: legacy session is too large for automatic loading; run `ffx session migrate <id> --allow-large`\n",
             );
         },
         error.LegacySessionReadResourceExhausted => {
             try writeStderr(
                 deps,
-                "fx session: legacy session could not be loaded with available resources\n",
+                "ffx session: legacy session could not be loaded with available resources\n",
             );
         },
         error.LegacySessionMigrationResourceExhausted => {
             try writeStderr(
                 deps,
-                "fx session: migration did not complete because resources were exhausted; the original session remains authoritative\n",
+                "ffx session: migration did not complete because resources were exhausted; the original session remains authoritative\n",
             );
         },
         error.LegacySessionMigrationFailed, error.LegacySessionChanged => {
             try writeStderr(
                 deps,
-                "fx session: migration did not complete; the original session remains authoritative\n",
+                "ffx session: migration did not complete; the original session remains authoritative\n",
             );
         },
         error.LegacySessionMigrationIndeterminate => {
             try writeStderr(
                 deps,
-                "fx session: migration outcome is indeterminate and will be resolved by the next exact writable load\n",
+                "ffx session: migration outcome is indeterminate and will be resolved by the next exact writable load\n",
             );
         },
         error.SessionRecoveryNotNeeded => {
             try writeStderr(
                 deps,
-                "fx session: recovery was refused because the session has a valid commit boundary; resume it normally\n",
+                "ffx session: recovery was refused because the session has a valid commit boundary; resume it normally\n",
             );
         },
         error.SessionRecoveryRequiresCurrentSchema => {
             try writeStderr(
                 deps,
-                "fx session: recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first\n",
+                "ffx session: recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first\n",
             );
         },
         error.SessionRecoveryUnsupportedSchema => {
             try writeStderr(
                 deps,
-                "fx session: recovery is unavailable for this unsupported session version\n",
+                "ffx session: recovery is unavailable for this unsupported session version\n",
             );
         },
         error.SessionRecoveryBoundaryInvalid => {
             try writeStderr(
                 deps,
-                "fx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
+                "ffx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
             );
         },
         error.SessionRecoveryIndeterminate => {
             try writeStderr(
                 deps,
-                "fx session: the recovery copy could not be confirmed; the source was left unchanged\n",
+                "ffx session: the recovery copy could not be confirmed; the source was left unchanged\n",
             );
         },
         error.SessionAuthorityBoundaryUnavailable,
@@ -2937,19 +3121,19 @@ fn writeLookupFailure(
         => {
             try writeStderr(
                 deps,
-                "fx session: session authority is temporarily unavailable while an incomplete commit is resolved\n",
+                "ffx session: session authority is temporarily unavailable while an incomplete commit is resolved\n",
             );
         },
         error.SessionAuthorityIntentCleanupPending => {
             try writeStderr(
                 deps,
-                "fx session: session authority is confirmed but transition cleanup is still pending\n",
+                "ffx session: session authority is confirmed but transition cleanup is still pending\n",
             );
         },
         error.SessionBusy, error.SessionLockUnsupported => {
             try writeStderr(
                 deps,
-                "fx session: session is busy or the filesystem cannot provide the required lock\n",
+                "ffx session: session is busy or the filesystem cannot provide the required lock\n",
             );
         },
         error.SessionPathUnsafe,
@@ -2958,14 +3142,14 @@ fn writeLookupFailure(
         => {
             try writeStderr(
                 deps,
-                "fx session: durable session storage is unsafe or does not support required private permissions\n",
+                "ffx session: durable session storage is unsafe or does not support required private permissions\n",
             );
         },
         error.DurableLayoutFailed, error.SessionStoreUnavailable => {
-            try writeStderr(deps, "fx session: durable session store is unavailable\n");
+            try writeStderr(deps, "ffx session: durable session store is unavailable\n");
         },
         error.HomeNotSet => {
-            try writeStderr(deps, "fx ");
+            try writeStderr(deps, "ffx ");
             try writeStderr(deps, kind);
             try writeStderr(deps, ": HOME is not set\n");
         },
@@ -2983,7 +3167,7 @@ fn writeSessionDetailFailure(
     const message = switch (err) {
         error.InvalidSessionFormat => try std.fmt.allocPrint(
             alloc,
-            "session {s} is corrupt; run `fx session recover {s}`",
+            "session {s} is corrupt; run `ffx session recover {s}`",
             .{ session_id, session_id },
         ),
         error.UnsupportedSessionSchema => try std.fmt.allocPrint(
@@ -3009,7 +3193,7 @@ fn writeSessionDetailFailure(
             message,
         );
     }
-    try writeStderr(deps, "fx session: ");
+    try writeStderr(deps, "ffx session: ");
     try writeStderr(deps, message);
     try writeStderr(deps, "\n");
 }
@@ -3031,12 +3215,12 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
 fn lookupFailureMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.NoSavedSessions => "no saved sessions for this workspace",
-        error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
+        error.NoReadableSessions => "saved sessions are unreadable; run `ffx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
-        error.InvalidSessionFormat => "record is corrupt; run `fx doctor` for recovery guidance",
+        error.InvalidSessionFormat => "record is corrupt; run `ffx doctor` for recovery guidance",
         error.UnsupportedSessionSchema => "record uses an unsupported session version",
         error.InvalidSessionId => "invalid session id",
-        error.LegacySessionTooLarge => "legacy session is too large for automatic loading; run `fx session migrate <id> --allow-large`",
+        error.LegacySessionTooLarge => "legacy session is too large for automatic loading; run `ffx session migrate <id> --allow-large`",
         error.LegacySessionReadResourceExhausted => "legacy session could not be loaded with available resources",
         error.LegacySessionMigrationResourceExhausted => "migration did not complete because resources were exhausted; the original session remains authoritative",
         error.LegacySessionMigrationFailed, error.LegacySessionChanged => "migration did not complete; the original session remains authoritative",
@@ -3073,7 +3257,7 @@ test "session detail failures separate corruption from unsupported schema" {
     );
     try std.testing.expectEqualStrings("", corrupt_text.stdout.written());
     try std.testing.expectEqualStrings(
-        "fx session: session broken-session is corrupt; run `fx session recover broken-session`\n",
+        "ffx session: session broken-session is corrupt; run `ffx session recover broken-session`\n",
         corrupt_text.stderr.written(),
     );
 
@@ -3091,7 +3275,7 @@ test "session detail failures separate corruption from unsupported schema" {
         std.mem.find(
             u8,
             corrupt_json.stdout.written(),
-            "\"error\":\"session broken-session is corrupt; run `fx session recover broken-session`\"",
+            "\"error\":\"session broken-session is corrupt; run `ffx session recover broken-session`\"",
         ) != null,
     );
     try std.testing.expect(
@@ -3113,7 +3297,7 @@ test "session detail failures separate corruption from unsupported schema" {
     );
     try std.testing.expectEqualStrings("", unsupported_text.stdout.written());
     try std.testing.expectEqualStrings(
-        "fx session: session future-session uses an unsupported session version\n",
+        "ffx session: session future-session uses an unsupported session version\n",
         unsupported_text.stderr.written(),
     );
 }
@@ -3130,7 +3314,7 @@ test "session recovery boundary failures keep stable text and json guidance" {
     );
     try std.testing.expectEqualStrings("", text_output.stdout.written());
     try std.testing.expectEqualStrings(
-        "fx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
+        "ffx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
         text_output.stderr.written(),
     );
 
@@ -3209,7 +3393,7 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --add-dir and --no-additional-dirs are only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
+        "ffx: --add-dir and --no-additional-dirs are only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
     );
 }
 
@@ -4345,7 +4529,7 @@ test "runIfRequested help writes top-level help" {
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("help")}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇𝒇x v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
@@ -4375,7 +4559,7 @@ test "top-level MCP add mutates through the focused provider without startup" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqual(@as(usize, 1), mcp_profile_add_calls_for_test);
     try std.testing.expectEqualStrings(
-        "Saved MCP server 'fixture' to /tmp/test-home/.fx/mcp.json.\n",
+        "Saved MCP server 'fixture' to /tmp/test-home/.ffx/mcp.json.\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqualStrings("", capture.stderr.written());
@@ -4427,7 +4611,7 @@ test "top-level MCP list loads configuration without discovery and remove uses i
         try std.testing.expectEqual(RunResult.handled_success, result);
         try std.testing.expectEqual(@as(usize, 1), mcp_profile_remove_calls_for_test);
         try std.testing.expectEqualStrings(
-            "Removed MCP server 'fixture' from /tmp/test-home/.fx/mcp.json.\n",
+            "Removed MCP server 'fixture' from /tmp/test-home/.ffx/mcp.json.\n",
             capture.stdout.written(),
         );
         try std.testing.expectEqualStrings("", capture.stderr.written());
@@ -4489,7 +4673,7 @@ test "workspace launch modifiers preserve supported command help" {
         deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "fx ask\n\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "ffx ask\n\n"));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
@@ -4516,11 +4700,11 @@ test "global workspace launch option errors use user-facing copy" {
     }{
         .{
             .args = &.{@constCast("--add-dir")},
-            .expected = "fx: --add-dir requires a directory path\n",
+            .expected = "ffx: --add-dir requires a directory path\n",
         },
         .{
             .args = &.{ @constCast("--no-additional-dirs"), @constCast("--no-additional-dirs") },
-            .expected = "fx: --no-additional-dirs may only be specified once\n",
+            .expected = "ffx: --no-additional-dirs may only be specified once\n",
         },
     };
 
@@ -4567,7 +4751,7 @@ test "runIfRequested version flags reject extra args" {
         const result = try runIfRequestedWithDeps(std.testing.allocator, args, testConfig(), capture.deps());
         try std.testing.expectEqual(RunResult.handled_failure, result);
         try std.testing.expectEqualStrings("", capture.stdout.written());
-        try std.testing.expectEqualStrings("usage: fx --version\n", capture.stderr.written());
+        try std.testing.expectEqualStrings("usage: ffx --version\n", capture.stderr.written());
     }
 }
 
@@ -4631,7 +4815,7 @@ test "setup preserves the disabled secret-store failure" {
     try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
     try std.testing.expectEqualStrings(
-        "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
+        "ffx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
         capture.stderr.written(),
     );
 }
@@ -4716,7 +4900,7 @@ test "runIfRequested rejects removed record flag as unknown input" {
         ),
     );
 
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "fx: unknown subcommand: --record") != null);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "ffx: unknown subcommand: --record") != null);
 }
 
 test "runNoConfigIfRequested handles help without config" {
@@ -4730,7 +4914,7 @@ test "runNoConfigIfRequested handles help without config" {
         testCommandCatalog(),
         capture.deps(),
     ));
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇𝒇x v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 
     try std.testing.expect(!try runNoConfigIfRequestedWithDeps(
@@ -4799,7 +4983,7 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
         usage_capture.deps(),
     );
     try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqualStrings("usage: fx start\n", usage_capture.stderr.written());
+    try std.testing.expectEqualStrings("usage: ffx start\n", usage_capture.stderr.written());
 }
 
 test "workflow config does not carry placeholder gateway tools" {
@@ -4827,7 +5011,7 @@ test "runIfRequested invalid local flags write usage" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--wat") }, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expectEqualStrings("usage: fx status [--json]\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("usage: ffx status [--json]\n", capture.stderr.written());
 }
 
 test "runIfRequested invalid json local flags write json error" {
@@ -4980,7 +5164,7 @@ test "runIfRequested rejects malformed resume aliases with canonical usage" {
         );
         try std.testing.expectEqual(RunResult.handled_failure, result);
         try std.testing.expectEqualStrings(
-            "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
+            "usage: ffx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
             capture.stderr.written(),
         );
     }
@@ -5011,7 +5195,7 @@ test "runIfRequested invalid resume writes usage" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("resume"), @constCast("a"), @constCast("b") }, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
+        "usage: ffx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
         capture.stderr.written(),
     );
 }
@@ -5024,7 +5208,7 @@ test "runIfRequested unknown command writes header and help" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("wat")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "ffx: unknown subcommand: wat\n\n𝒇𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested bare version subcommand remains unknown" {
@@ -5035,7 +5219,7 @@ test "runIfRequested bare version subcommand remains unknown" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("version")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "ffx: unknown subcommand: version\n\n𝒇𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested model fetch failure is handled" {
@@ -5051,7 +5235,7 @@ test "runIfRequested model fetch failure is handled" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "fx models: could not list models: Unavailable\n",
+        "ffx models: could not list models: Unavailable\n",
         capture.stderr.written(),
     );
 }
@@ -5093,7 +5277,7 @@ test "runIfRequested model provider cancellation is handled" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "fx models: could not list models: the request was cancelled\n",
+        "ffx models: could not list models: the request was cancelled\n",
         capture.stderr.written(),
     );
 }
@@ -5191,7 +5375,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"ffx needs access to Vercel AI Gateway. Run ffx login to sign in, ffx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -5256,7 +5440,7 @@ test "status and doctor inspect MCP configuration once per command" {
     try std.testing.expect(std.mem.find(
         u8,
         doctor_capture.stdout.written(),
-        "\"detail\":\"failed to load ~/.fx/mcp.json: McpConfigInvalidJson\"",
+        "\"detail\":\"failed to load ~/.ffx/mcp.json: McpConfigInvalidJson\"",
     ) != null);
 }
 
@@ -5280,7 +5464,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"ffx needs access to Vercel AI Gateway. Run ffx login to sign in, ffx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
 }
@@ -5461,7 +5645,7 @@ fn captureMcpProfileAddForTest(
         .http => return error.TestUnexpectedResult,
     }
     return .{
-        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
+        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.ffx/mcp.json"),
     };
 }
 
@@ -5472,7 +5656,7 @@ fn captureMcpProfileRemoveForTest(
     mcp_profile_remove_calls_for_test += 1;
     try std.testing.expectEqualStrings("fixture", name);
     return .{
-        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
+        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.ffx/mcp.json"),
         .removed = true,
     };
 }

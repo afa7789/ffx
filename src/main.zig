@@ -59,6 +59,8 @@ const provider_set = @import("core/gateway/provider_set.zig");
 const provider_catalog = @import("core/auth/provider_catalog.zig");
 const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
+const openai_direct = @import("gateway/openai_direct.zig");
+const provider_definition = @import("core/provider/definition.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
@@ -460,13 +462,31 @@ const App = struct {
     }
 
     pub fn agentStreamProvider(self: *const Self) agent_stream_provider.Provider {
+        if (self.custom_provider_config) |*config| return openai_direct.runtimeAgentStreamProvider(config);
         return self.providerSet()
             .select(self.provider_selection.selection().provider)
             .agent_stream_or_unavailable();
     }
 
     pub fn providerCatalog(self: *Self, provider: model_provider.ProviderId) ?model_catalog.Provider {
+        if (provider == .custom) if (self.custom_provider_config) |*config| return openai_direct.runtimeModelCatalogProvider(config);
         return self.providerSet().select(provider).model_catalog;
+    }
+
+    pub fn installCustomProvider(self: *Self, owned: *provider_definition.OwnedDefinition) void {
+        if (self.custom_provider_definition) |*old| old.deinit();
+        self.custom_provider_definition = owned.*;
+        owned.* = undefined;
+        const value = &self.custom_provider_definition.?.parsed.value;
+        self.custom_provider_config = .{
+            .protocol = value.protocol,
+            .auth_required = value.auth.kind != .none,
+            .auth_header = value.auth.header,
+            .base_url = value.endpoint orelse "",
+            .fallback_model = value.default_model orelse "",
+            .models_endpoint = value.models_endpoint,
+            .models = value.models,
+        };
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
@@ -507,6 +527,8 @@ const App = struct {
         app_secret_store,
     ),
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
+    custom_provider_definition: ?provider_definition.OwnedDefinition = null,
+    custom_provider_config: ?openai_direct.Config = null,
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     usage_dashboard: usage_dashboard_runtime.Runtime = usage_dashboard_runtime.Runtime.init(std.heap.c_allocator),
     workspace_root: []u8 = &.{},
@@ -868,6 +890,9 @@ const App = struct {
         self.shell.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         self.provider_selection.deinit();
+        if (self.custom_provider_definition) |*custom| custom.deinit();
+        self.custom_provider_definition = null;
+        self.custom_provider_config = null;
         self.session_title.deinit(self.alloc);
         SessionAppRuntime.deinitPersistence(self);
         if (self.requested_resume) |*target| {
@@ -3322,7 +3347,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
 
     const alloc = processAllocator();
     const auth_mode = credentials.parseAuthMode(rawEnvValue(raw_env, "FX_AUTH_MODE")) catch {
-        try writeStderrFast("fx: FX_AUTH_MODE must be local or host-managed\n");
+        try writeStderrFast("ffx: FX_AUTH_MODE must be local or host-managed\n");
         exitFast(1);
     };
     const cfg = if (cli_args.len == 0)
@@ -3864,8 +3889,8 @@ test "session reset traces and clears active paste state" {
 }
 
 test "raw benchmark preflight matches no-arg FX_BENCH presence" {
-    const no_args = [_][*:0]const u8{"fx"};
-    const help_args = [_][*:0]const u8{ "fx", "help" };
+    const no_args = [_][*:0]const u8{"ffx"};
+    const help_args = [_][*:0]const u8{ "ffx", "help" };
     const bench_env = [_:null]?[*:0]const u8{"FX_BENCH=1"};
     const empty_env = [_:null]?[*:0]const u8{};
 

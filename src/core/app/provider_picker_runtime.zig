@@ -21,6 +21,7 @@ const list_window = @import("../shared/list_window.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const builtin_providers = @import("../../builtins/providers.zig");
 
 const ProviderPickerStage = picker_state.ProviderPickerStage;
 const max_options = provider_picker_catalog.max_column_options;
@@ -263,6 +264,21 @@ pub fn Runtime(comptime App: type) type {
                         try commit(app, .{ .provider = provider });
                         return true;
                     }
+                    if (provider != .gateway) {
+                        if (builtin_providers.byId(model_provider.registryId(provider))) |entry| {
+                            if (credentials.resolveDirectProvider(
+                                app.alloc,
+                                app.auth.secret_store,
+                                entry.id,
+                                entry.env_var,
+                            ) catch null) |credential| {
+                                var owned = credential;
+                                owned.deinit(app.alloc);
+                                try commit(app, .{ .provider = provider });
+                                return true;
+                            }
+                        }
+                    }
                     // Nothing is applied yet: the provider is only a heading
                     // until the method, and then the team, are chosen too.
                     const slug = provider_catalog.find(provider).slug;
@@ -273,13 +289,25 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .method => {
                     const method = provider_picker_catalog.parseMethod(selected) orelse return false;
+                    const provider = provider_catalog.parse(
+                        app.input_runtime.picker.provider_picker_pending_provider.items,
+                    ) orelse .gateway;
+                    if (provider != .gateway) {
+                        if (method != .api_key) return false;
+                        const prefix = try app.alloc.dupe(u8, query.prefix);
+                        defer app.alloc.free(prefix);
+                        const provider_slug = try app.alloc.dupe(u8, app.input_runtime.picker.provider_picker_pending_provider.items);
+                        defer app.alloc.free(provider_slug);
+                        try setComposerText(app, "{s}{s} {s} ", .{ prefix, provider_slug, provider_picker_catalog.methodSlug(method) });
+                        try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, provider_slug, provider_picker_catalog.methodSlug(method), .api_key);
+                        app.auth.openApiKeyPickerInlineForProvider(app.alloc, provider);
+                        app.shell.render_requests.request(.footer);
+                        return true;
+                    }
                     // The inventory is what says whether this method already
                     // has a credential to switch to; it goes stale the moment
                     // a key lands in the environment or the keychain.
                     try app.auth.refreshSourceInventory(app.alloc);
-                    const provider = provider_catalog.parse(
-                        app.input_runtime.picker.provider_picker_pending_provider.items,
-                    ) orelse .gateway;
                     if (method == .api_key) {
                         // With detected keys the next column asks which to use
                         // (or `new` to paste one); with none there is nothing
@@ -721,19 +749,19 @@ test "provider picker loading preserves query and selection instead of exposing 
     var app = ColumnTestApp.init(alloc);
     defer app.deinit();
     app.auth.inventory_refresh_active = true;
-    try app.input_runtime.textReplacementState().replace(alloc, "/provider co");
+    try app.input_runtime.textReplacementState().replace(alloc, "/provider codex");
     app.input_runtime.picker.provider_column_index = 2;
 
-    const pending = columnFor(&app, .provider, "co");
+    const pending = columnFor(&app, .provider, "codex");
     try std.testing.expectEqual(@as(usize, 1), pending.count);
     try std.testing.expectEqualStrings("checking credentials...", pending.labels[0]);
     try Runtime(ColumnTestApp).autocomplete(&app);
     Runtime(ColumnTestApp).navigate(&app, 1);
-    try std.testing.expectEqualStrings("/provider co", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("/provider codex", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 2), app.input_runtime.picker.provider_column_index);
 
     app.auth.inventory_refresh_active = false;
-    const ready = columnFor(&app, .provider, "co");
+    const ready = columnFor(&app, .provider, "codex");
     try std.testing.expectEqual(@as(usize, 1), ready.count);
     try std.testing.expectEqualStrings("codex", ready.labels[0]);
     try Runtime(ColumnTestApp).autocomplete(&app);

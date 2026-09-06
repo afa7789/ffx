@@ -96,10 +96,9 @@ fn selectStorageBackend(os_tag: std.Target.Os.Tag, keychain_disabled: bool) Stor
 }
 
 fn storageBackend() StorageBackend {
-    // A temporary HOME does not isolate the host account's macOS Keychain.
-    // Keychain-specific tests inject their backend explicitly.
-    if (comptime builtin.is_test) return .profile_file;
-    return selectStorageBackend(builtin.os.tag, native_keychain.isDisabled());
+    // OAuth sessions are intentionally stored in the private ffx profile.
+    // This keeps startup deterministic and avoids platform keychain prompts.
+    return .profile_file;
 }
 
 pub fn presence() host_contract.SecretStorePresence {

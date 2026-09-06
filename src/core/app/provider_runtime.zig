@@ -9,6 +9,7 @@ pub const Runtime = struct {
 
     alloc: Allocator,
     active_provider: model_provider.ProviderId = .gateway,
+    active_provider_key: std.ArrayList(u8) = .empty,
     model: std.ArrayList(u8) = .empty,
 
     pub fn init(alloc: Allocator) Self {
@@ -17,7 +18,12 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Self) void {
         self.model.deinit(self.alloc);
+        self.active_provider_key.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    pub fn providerKey(self: *const Self) []const u8 {
+        return if (self.active_provider_key.items.len > 0) self.active_provider_key.items else model_provider.registryId(self.active_provider);
     }
 
     /// The returned model slice is borrowed until the next mutation or deinit.
@@ -53,6 +59,14 @@ pub const Runtime = struct {
         self.model = .fromOwnedSlice(owned_model.*);
         owned_model.* = &.{};
         self.active_provider = target_provider;
+    }
+
+    pub fn adoptOwnedKey(self: *Self, key: []const u8, target_provider: model_provider.ProviderId, owned_model: *[]u8) !void {
+        const owned_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned_key);
+        self.adoptOwned(target_provider, owned_model);
+        self.active_provider_key.deinit(self.alloc);
+        self.active_provider_key = .fromOwnedSlice(owned_key);
     }
 };
 

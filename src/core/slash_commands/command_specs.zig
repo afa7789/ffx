@@ -294,7 +294,7 @@ pub fn renderTopLevelHelpWithStyle(alloc: Allocator, registry: TopLevelRegistry,
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    try writeStyled(&out.writer, style, .brand, "𝒇x");
+    try writeStyled(&out.writer, style, .brand, "𝒇𝒇x");
     try out.writer.writeByte(' ');
     try writeStyleStart(&out.writer, style, .muted);
     try out.writer.writeByte('v');
@@ -306,8 +306,8 @@ pub fn renderTopLevelHelpWithStyle(alloc: Allocator, registry: TopLevelRegistry,
     try writeWrappedStyledLine(&out.writer, "", "", registry.interactive_hint, width, style, .muted);
 
     try writeSectionHeading(&out.writer, style, "Usage:");
-    try writeWrappedStyledLine(&out.writer, "  ", "  ", "fx [flags]", width, style, .syntax);
-    try writeWrappedStyledLine(&out.writer, "  ", "  ", "fx <command> [...flags] [...args]", width, style, .syntax);
+    try writeWrappedStyledLine(&out.writer, "  ", "  ", "ffx [flags]", width, style, .syntax);
+    try writeWrappedStyledLine(&out.writer, "  ", "  ", "ffx <command> [...flags] [...args]", width, style, .syntax);
 
     try writeSectionHeading(&out.writer, style, "Commands:");
     for (registry.help_groups, 0..) |group, group_index| {
@@ -346,12 +346,12 @@ pub fn renderTopLevelCommandHelp(alloc: Allocator, registry: TopLevelRegistry, k
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    try out.writer.writeAll("fx ");
+    try out.writer.writeAll("ffx ");
     try out.writer.writeAll(spec.token);
     try out.writer.writeAll("\n\n");
     try out.writer.writeAll(spec.summary);
     try out.writer.writeAll("\n\nUsage:\n");
-    try out.writer.writeAll("  fx ");
+    try out.writer.writeAll("  ffx ");
     try out.writer.writeAll(spec.usage);
     try out.writer.writeByte('\n');
 
@@ -1579,21 +1579,21 @@ test "rendered top-level help is a complete CLI navigation page" {
     const text = try testTopLevelHelpText(std.testing.allocator);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.startsWith(u8, text, "𝒇x v9.8.7\nFast, native coding agent for the terminal."));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "𝒇x"));
-    try std.testing.expect(std.mem.find(u8, text, "fx starts an interactive session by default.") != null);
-    try std.testing.expect(std.mem.find(u8, text, "fx <command> [...flags] [...args]") != null);
+    try std.testing.expect(std.mem.startsWith(u8, text, "𝒇𝒇x v9.8.7\nFast, native coding agent for the terminal."));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "𝒇𝒇x"));
+    try std.testing.expect(std.mem.find(u8, text, "ffx starts an interactive session by default.") != null);
+    try std.testing.expect(std.mem.find(u8, text, "ffx <command> [...flags] [...args]") != null);
     try std.testing.expect(std.mem.find(u8, text, "Commands:") != null);
     try std.testing.expect(std.mem.find(u8, text, "ask <prompt>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Run one noninteractive request") != null);
     try std.testing.expect(std.mem.find(u8, text, "Draft or publish a GitHub issue") != null);
     try std.testing.expect(std.mem.find(u8, text, "credits|balance") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Sign in to a model provider") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Sign out of a model provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Sign in with Codex or Grok") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Sign out of a Codex or Grok session") != null);
     try std.testing.expect(std.mem.find(u8, text, "Choose the active model provider") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Configure a Vercel AI Gateway API key") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Choose a Vercel AI Gateway team") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Show Vercel AI Gateway credits") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Configure a provider API key") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Choose a Gateway team") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Show Gateway credits") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign in to Vercel or a selected provider") == null);
     try std.testing.expect(std.mem.find(u8, text, "Flags:") != null);
     try std.testing.expect(std.mem.find(u8, text, "--context-limit <spec>") != null);
@@ -1610,16 +1610,16 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "FX_EXPERIMENTAL_WORKSPACE_ACCESS=1") == null);
     try std.testing.expect(std.mem.find(u8, text, "Supported for interactive, resume, ask, ACP, PR, and issue launches") == null);
     try std.testing.expect(std.mem.find(u8, text, "Examples:") != null);
-    try std.testing.expect(std.mem.find(u8, text, "fx ask \"Explain the changes in this repository\"") != null);
-    try std.testing.expect(std.mem.find(u8, text, "fx session resume last") != null);
+    try std.testing.expect(std.mem.find(u8, text, "ffx ask \"Explain the changes in this repository\"") != null);
+    try std.testing.expect(std.mem.find(u8, text, "ffx session resume last") != null);
     try std.testing.expect(std.mem.find(u8, text, "session resume [last|id]") != null);
-    try std.testing.expect(std.mem.find(u8, text, "fx status --json") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Run `fx <command> --help` for command-specific usage and options.") != null);
+    try std.testing.expect(std.mem.find(u8, text, "ffx status --json") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Run `ffx <command> --help` for command-specific usage and options.") != null);
     try std.testing.expect(std.mem.find(u8, text, "command-specific options and examples") == null);
     try std.testing.expect(std.mem.find(u8, text, "Run `/help` inside an interactive session for slash commands.") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Learn more about fx:  https://fx.sh/docs") != null);
-    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:     run `/feedback` inside fx\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "\n\n\nRun `fx <command> --help`") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Learn more about ffx:  https://ffx.sh/docs") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:      run `/feedback` inside ffx\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\n\n\nRun `ffx <command> --help`") == null);
     try std.testing.expect(std.mem.find(u8, text, "Start:") == null);
     try std.testing.expect(std.mem.find(u8, text, "  Work      ") == null);
     try std.testing.expect(std.mem.find(u8, text, "More:") == null);
@@ -1631,7 +1631,7 @@ test "top-level help summary overrides do not change command-specific help" {
     const login = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .login);
     defer std.testing.allocator.free(login);
 
-    try std.testing.expect(std.mem.find(u8, login, "Sign in to Vercel or a selected provider") != null);
+    try std.testing.expect(std.mem.find(u8, login, "Sign in with Codex or Grok") != null);
     try std.testing.expect(std.mem.find(u8, login, "Sign in to a model provider") == null);
 }
 
@@ -1644,12 +1644,12 @@ test "terminal top-level help adds styling without changing visible content" {
     defer std.testing.allocator.free(stripped);
 
     try std.testing.expect(std.mem.find(u8, plain, "\x1b[") == null);
-    try std.testing.expect(std.mem.startsWith(u8, terminal, "\x1b[1m𝒇x\x1b[0m"));
+    try std.testing.expect(std.mem.startsWith(u8, terminal, "\x1b[1m𝒇𝒇x\x1b[0m"));
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[1mUsage:\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mask <prompt>\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;243mFast, native coding agent") != null);
-    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[4mhttps://fx.sh/docs\x1b[0m") != null);
-    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mrun `/feedback` inside fx\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[4mhttps://ffx.sh/docs\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mrun `/feedback` inside ffx\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;252m") == null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;245m") == null);
     try std.testing.expectEqualStrings(plain, stripped);
@@ -1667,9 +1667,10 @@ test "top-level help renders flags as compact aligned rows" {
     try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
     try std.testing.expect(lineContainsBoth(wide, "--resume-last", "Resume the latest workspace session"));
-    try std.testing.expect(std.mem.find(u8, wide, "Print the fx version and exit\n\nExamples:") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "List available models\n\n  setup") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "Show Vercel AI Gateway credits\n\n  usage") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "Print the ffx version and exit\n\nExamples:") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "List available models") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "Configure a provider API key") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "Show Gateway credits") != null);
     try expectAllLinesFit(narrow, 60);
 }
 
@@ -1682,7 +1683,7 @@ test "top-level help hides developer recording surfaces" {
 
     const replay = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .replay);
     defer std.testing.allocator.free(replay);
-    try std.testing.expect(std.mem.find(u8, replay, "fx replay") != null);
+    try std.testing.expect(std.mem.find(u8, replay, "ffx replay") != null);
 }
 
 test "default top-level help styles fit the startup buffer" {
@@ -1699,8 +1700,8 @@ test "per-command help renders header usage options and details" {
     const text = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .permissions);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.find(u8, text, "fx permissions\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx permissions [--json]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "ffx permissions\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  ffx permissions [--json]") != null);
     try std.testing.expect(std.mem.find(u8, text, "Options:") != null);
     try std.testing.expect(std.mem.find(u8, text, "--json") != null);
     try std.testing.expect(std.mem.find(u8, text, "Modes:") != null);
@@ -1710,7 +1711,7 @@ test "per-command help preserves long resume usage without debug recording" {
     const text = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .@"resume");
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  ffx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Options:") != null);
     try std.testing.expect(std.mem.find(u8, text, "--record") == null);
 }
@@ -1719,8 +1720,8 @@ test "ACP help documents accepted options" {
     const text = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .acp);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.find(u8, text, "fx acp\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--model <id>] [--log-file <path>]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "ffx acp\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  ffx acp [--model <id>] [--log-file <path>]") != null);
     try std.testing.expect(std.mem.find(u8, text, "--model <id>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--log-file <path>") != null);
 }
@@ -2113,7 +2114,7 @@ test "slash completion descriptions follow completion matches" {
     try std.testing.expectEqualStrings("choose what model and reasoning effort to use", nthSlashCompletionDescription(testSlashRegistry(), "/mo", 0).?);
     try std.testing.expectEqualStrings("start a fresh conversation while keeping managed processes", nthSlashCompletionDescription(testSlashRegistry(), "/cl", 0).?);
     try std.testing.expectEqualStrings("undo the latest tracked file operation", nthSlashCompletionDescription(testSlashRegistry(), "/un", 0).?);
-    try std.testing.expectEqualStrings("open the fx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
+    try std.testing.expectEqualStrings("open the ffx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
     try std.testing.expectEqualStrings("copy a private diagnostic trace", nthSlashCompletionDescription(testSlashRegistry(), "/tr", 0).?);
     try std.testing.expectEqualStrings("summarize context into a fresh window", nthSlashCompletionDescription(testSlashRegistry(), "/comp", 0).?);
     try std.testing.expectEqualStrings("show alias availability", nthSlashCompletionDescription(testSlashRegistry(), "/ali", 0).?);

@@ -8,6 +8,7 @@ const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
+const provider_definition = @import("../provider/definition.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -123,6 +124,8 @@ pub const StartupState = struct {
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
     fx_login_status: credentials.FxLoginReadStatus = .not_attempted,
     provider: model_provider.ProviderId = .gateway,
+    provider_key: []u8 = &.{},
+    custom_provider: ?provider_definition.OwnedDefinition = null,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
     model_source: config_runtime.ModelSource = .compiled_default,
@@ -160,6 +163,8 @@ pub const StartupState = struct {
         if (self.credential) |*credential| credential.deinit(alloc);
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
+        if (self.provider_key.len > 0) alloc.free(self.provider_key);
+        if (self.custom_provider) |*value| value.deinit();
         self.permission_rules.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
@@ -204,6 +209,12 @@ pub const StartupState = struct {
     pub fn takeCredential(self: *StartupState) ?credentials.Credential {
         const value = self.credential;
         self.credential = null;
+        return value;
+    }
+
+    pub fn takeCustomProvider(self: *StartupState) ?provider_definition.OwnedDefinition {
+        const value = self.custom_provider;
+        self.custom_provider = null;
         return value;
     }
 
@@ -411,11 +422,11 @@ pub fn loadStartupStatusWithAuthMode(
             .grok_connected = true,
         }
     else
-        try auth_runtime.loadStatusSnapshotForProvider(
+        try loadStatusSnapshotForConfiguredProvider(
             alloc,
             secret_store,
+            settings,
             configured_selection.provider,
-            settings.credential_source,
         );
     errdefer auth_status.deinit(alloc);
 
@@ -492,6 +503,12 @@ fn loadStartupStateFromOwnedWorkspace(
 
     const configured_selection = try configuredProviderSelection(default_model, settings);
     state.provider = configured_selection.provider;
+    state.provider_key = try alloc.dupe(u8, settings.provider_key orelse model_provider.registryId(state.provider));
+    if (settings.provider_key) |key| {
+        if (settings.providers.get(key)) |definition| {
+            state.custom_provider = try definition.clone(alloc);
+        }
+    }
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
     state.model_source = detailed.model_source orelse .compiled_default;
     state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
@@ -503,14 +520,18 @@ fn loadStartupStateFromOwnedWorkspace(
     state.credential_source_preference = settings.credential_source;
     if (auth_mode == .local) {
         if (credential_mode) |mode| {
-            const resolution = try credentials.resolveForProvider(
-                alloc,
-                transport,
-                secret_store,
-                mode,
-                state.provider,
-                settings.credential_source,
-            );
+            const resolution = if (state.custom_provider) |custom| blk: {
+                if (custom.parsed.value.auth.kind == .api_key) {
+                    const credential = try credentials.resolveDirectProvider(
+                        alloc,
+                        secret_store,
+                        custom.parsed.value.id,
+                        custom.parsed.value.auth.env_var orelse "",
+                    );
+                    break :blk credentials.Resolution{ .credential = credential };
+                }
+                break :blk credentials.Resolution{};
+            } else try credentials.resolveForProvider(alloc, transport, secret_store, mode, state.provider, settings.credential_source);
             state.credential = resolution.credential;
             state.credential_load_failure = resolution.failure;
             state.stored_key_status = resolution.stored_key_status;
@@ -1147,12 +1168,44 @@ fn configuredProviderSelection(
     settings: *const config_runtime.Settings,
 ) !model_provider.ProviderSelection {
     const provider = settings.provider orelse .gateway;
+    if (settings.provider_key) |key| {
+        if (settings.providers.get(key)) |definition| {
+            return .{ .provider = provider, .model = settings.models.get(provider) orelse
+                settings.model_preferences.get(key) orelse definition.parsed.value.default_model orelse default_model };
+        }
+    }
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
+        else => settings.models.get(provider) orelse default_model,
     };
     return .{ .provider = provider, .model = model };
+}
+
+fn loadStatusSnapshotForConfiguredProvider(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    settings: *const config_runtime.Settings,
+    provider: model_provider.ProviderId,
+) !auth_runtime.StatusSnapshot {
+    if (settings.provider_key) |key| {
+        if (settings.providers.get(key)) |definition| {
+            if (definition.parsed.value.auth.kind == .api_key) {
+                return auth_runtime.loadStatusSnapshotForDirectProvider(
+                    alloc,
+                    definition.parsed.value.id,
+                    definition.parsed.value.auth.env_var orelse "",
+                );
+            }
+        }
+    }
+    return auth_runtime.loadStatusSnapshotForProvider(
+        alloc,
+        secret_store,
+        provider,
+        null,
+    );
 }
 
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
@@ -2000,7 +2053,7 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "configured");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
@@ -2029,7 +2082,7 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
         .{ configured_root, disabled_root, legacy_fast_root, bound_fast_root, codex_root },
     );
     defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "home/.ffx/settings.json", fixture);
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
@@ -2076,7 +2129,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
 
@@ -2093,7 +2146,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
         .{disabled_root},
     );
     defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "home/.ffx/settings.json", fixture);
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
@@ -2111,7 +2164,7 @@ test "loadStartupState resolves slash menu categories default and explicit false
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -2126,7 +2179,7 @@ test "loadStartupState resolves slash menu categories default and explicit false
     defer initial.deinit(std.testing.allocator);
     try std.testing.expect(initial.slash_menu_categories);
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"slash_menu_categories\":false}\n");
+    try writeFixtureFile(tmp.dir, "home/.ffx/settings.json", "{\"slash_menu_categories\":false}\n");
     var hidden = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default-model", 25);
     defer hidden.deinit(std.testing.allocator);
     try std.testing.expect(!hidden.slash_menu_categories);
@@ -2212,7 +2265,7 @@ test "loadStartupState falls back to auto for invalid first_call_tool_choice" {
 test "loadStartupState diagnoses the retired fuzzy skill setting" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -2220,7 +2273,7 @@ test "loadStartupState diagnoses the retired fuzzy skill setting" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"skill_match_fuzzy\":true}");
+    try writeFixtureFile(tmp.dir, "home/.ffx/settings.json", "{\"skill_match_fuzzy\":true}");
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();

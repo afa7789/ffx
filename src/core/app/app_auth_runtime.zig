@@ -11,6 +11,7 @@ const login_flow = @import("../auth/login_flow.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
+const builtin_providers = @import("../../builtins/providers.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
@@ -95,32 +96,13 @@ pub const PendingPromptCredentialReadiness = enum {
 pub fn Runtime(comptime App: type) type {
     return struct {
         fn ensurePromptCredential(app: *App) !bool {
-            if (try rejectPendingPreparation(app)) return false;
-            if (comptime provider_runtime.supported(App) and
-                @hasDecl(@TypeOf(app.auth), "selectForProvider"))
-            {
-                const provider = provider_runtime.provider(app);
-                if (!model_provider.authorizesCredential(provider, app.auth.credentialSource())) {
-                    const selection = selectProviderCredential(app, provider) catch |err| {
-                        if (err == error.OutOfMemory) return err;
-                        debug_trace.logf("auth", "prompt credential preference load failed err={s}", .{@errorName(err)});
-                        try writeAuthNotice(app, .{
-                            .topic = "auth",
-                            .tone = .@"error",
-                            .body = "Could not load authentication settings. Check user settings, then press Enter to retry.",
-                        });
-                        return false;
-                    };
-                    switch (selection) {
-                        .selected => applyCredentialChange(app, true),
-                        .unchanged => {},
-                        .failed => |failure| return recoverCredentialFailure(app, failure.source, failure.err),
-                        .missing => return missingPromptCredential(app, provider),
-                    }
-                }
-            }
             if (app.auth.credentialSource() != null) return true;
-            return missingPromptCredential(app, .gateway);
+            if (!app.auth.pickerView().active) {
+                try app.auth.refreshSourceInventory(app.alloc);
+                app.auth.openOnboardingPicker(app.alloc);
+            }
+            app.shell.render_requests.request(.footer);
+            return false;
         }
 
         fn selectProviderCredential(app: *App, provider: model_provider.ProviderId) !auth_runtime.ProviderCredentialSelection {
@@ -165,6 +147,7 @@ pub fn Runtime(comptime App: type) type {
                         .gateway => credentials.missing_interactive_credential_message,
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,
+                        else => "No credentials are configured for this provider. Set its API key or run /provider.",
                     },
                 }, true),
                 .failed => |failure| {
@@ -766,6 +749,7 @@ pub fn Runtime(comptime App: type) type {
                 .saved => |changed| {
                     applyCredentialChange(app, changed);
                     rememberCredentialSource(app, .stored_key);
+                    const target = app.auth.pickerView().active_provider;
                     const body = try std.fmt.allocPrint(
                         app.alloc,
                         "Saved the API key to {s} and made it active.",
@@ -782,6 +766,10 @@ pub fn Runtime(comptime App: type) type {
                     // way in. The staged hub also reaches this save, and there
                     // adding a key is not a request to switch.
                     if (comptime provider_runtime.supported(App) and provider_picker_runtime.supported(App)) {
+                        if (target != .gateway and target != .codex and target != .grok) {
+                            try switchProvider(app, target, false, .manual);
+                            return;
+                        }
                         if (app.input_runtime.picker.provider_picker_stage == .api_key and
                             provider_runtime.provider(app) != .gateway)
                         {
@@ -1072,6 +1060,10 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer settings.deinit(app.alloc);
+            if (target != .gateway and target != .codex and target != .grok) {
+                try activateDirectProvider(app, target, &settings);
+                return;
+            }
             const catalog_provider = app.providerCatalog(target) orelse {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -1088,6 +1080,83 @@ pub fn Runtime(comptime App: type) type {
                 .primary_model = if (intent == .post_oauth and provider_runtime.provider(app) == target) provider_runtime.model(app) else null,
                 .preferred_model = if (intent == .post_oauth) settings.models.get(target) else io_mod.getenv("FX_MODEL") orelse settings.models.get(target),
             });
+        }
+
+        fn activateDirectProvider(
+            app: *App,
+            target: model_provider.ProviderId,
+            settings: *const config_runtime.Settings,
+        ) !void {
+            const entry = builtin_providers.byId(model_provider.registryId(target)) orelse {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "The target provider definition is unavailable. The current provider is unchanged.",
+                }, true);
+                return;
+            };
+            var credential = credentials.resolveDirectProvider(
+                app.alloc,
+                app.auth.secret_store,
+                entry.id,
+                entry.env_var,
+            ) catch |err| {
+                debug_trace.logf("provider", "direct credential load failed provider={s} err={s}", .{ entry.id, @errorName(err) });
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = "The provider API key could not be loaded. The current provider is unchanged.",
+                }, true);
+                return;
+            } orelse {
+                app.auth.openApiKeyPickerInlineForProvider(app.alloc, target);
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .neutral,
+                    .body = "Enter this provider API key. It will be saved in your ffx profile and made active.",
+                }, true);
+                return;
+            };
+            defer credential.deinit(app.alloc);
+
+            const selected_model = settings.models.get(target) orelse entry.default_model;
+            if (selected_model.len == 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = "The provider has no default model. The current provider is unchanged.",
+                }, true);
+                return;
+            }
+            var owned_model = try app.alloc.dupe(u8, selected_model);
+            defer app.alloc.free(owned_model);
+            app.provider_selection.adoptOwned(target, &owned_model);
+            _ = app.auth.adoptCredential(app.alloc, &credential);
+            reconcileGatewayCredential(app);
+            app.model_cache.reset();
+
+            if (comptime @hasDecl(App, "persistRuntimePreferences")) {
+                var persistence = app.persistRuntimePreferences(.{
+                    .provider = target,
+                    .model = provider_runtime.model(app),
+                });
+                defer persistence.deinit(app.alloc);
+                if (persistence.settings_error != null or persistence.session_error != null) {
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .warning,
+                        .body = "Provider switched, but the selection could not be persisted.",
+                    }, true);
+                    return;
+                }
+            }
+            const body = try std.fmt.allocPrint(
+                app.alloc,
+                "Switched to {s} with {s}.",
+                .{ provider_catalog.label(target), provider_runtime.model(app) },
+            );
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true);
         }
 
         fn pendingPromptBlocksPreparation(app: *const App) bool {
@@ -1208,6 +1277,7 @@ pub fn Runtime(comptime App: type) type {
                         .codex => try beginCodexSignInForProviderSwitch(app),
                         .grok => try beginGrokSignInForProviderSwitch(app),
                         .gateway => {},
+                        else => {},
                     }
                 }
                 if (target == .gateway or !request.allow_login) {
@@ -1816,6 +1886,7 @@ pub fn Runtime(comptime App: type) type {
                 .ai_gateway_api_key,
                 .stored_key,
                 .host_managed,
+                .direct_provider,
                 => {},
             }
         }
@@ -2222,6 +2293,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
                 .gateway => unreachable,
+                else => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

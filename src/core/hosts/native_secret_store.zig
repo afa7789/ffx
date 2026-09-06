@@ -1,9 +1,7 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("host.zig");
 const io_mod = @import("../shared/io.zig");
-const keychain = @import("native_keychain.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("../auth/secret.zig");
 
@@ -11,7 +9,7 @@ const Allocator = std.mem.Allocator;
 
 /// Names the backend that answers on this platform so operators can tell where a
 /// stored key lives without knowing how the backend is selected.
-const backend_label = if (builtin.os.tag == .macos) "macOS Keychain" else "profile file";
+const backend_label = "profile file";
 
 const max_key_file_bytes: usize = 8 * 1024;
 
@@ -27,34 +25,22 @@ pub const provider: host.SecretStore = .{
     .store_interactive_fn = storeInteractiveCallback,
 };
 
-/// The disable switch is named for the macOS backend, so its reader stays there.
 fn isDisabled() bool {
-    return keychain.isDisabled();
+    return false;
 }
 
 /// Returns the stored key, or null when no key is stored. An error means the store
 /// could not be read, which callers must keep distinct from absence.
 fn load(alloc: Allocator) LoadError!?[]u8 {
-    if (comptime builtin.os.tag == .macos) return loadFromKeychain(alloc);
     return loadFromProfile(alloc);
 }
 
 fn store(alloc: Allocator, value: []const u8) StoreError!void {
     if (value.len == 0) return error.StoredKeyWriteFailed;
-    if (comptime builtin.os.tag == .macos) {
-        keychain.storeValue(value) catch |err| return writeFailed("keychain", err);
-        return;
-    }
     return storeInProfile(alloc, value);
 }
 
-/// Let the platform credential store own terminal input when it supports a
-/// secure prompt, keeping plaintext out of the fx process.
 fn storeInteractive() StoreError!bool {
-    if (comptime builtin.os.tag == .macos) {
-        keychain.storeInteractive() catch |err| return writeFailed("keychain_interactive", err);
-        return true;
-    }
     return false;
 }
 
@@ -64,9 +50,6 @@ fn isDisabledCallback(_: ?*anyopaque) bool {
 
 fn presenceCallback(_: ?*anyopaque) host.SecretStorePresence {
     if (isDisabled()) return .missing;
-    if (comptime builtin.os.tag == .macos) {
-        return keychain.contains() catch .unavailable;
-    }
     return presenceInProfile();
 }
 
@@ -100,14 +83,6 @@ fn storeCallback(
 
 fn storeInteractiveCallback(_: ?*anyopaque) StoreError!bool {
     return storeInteractive();
-}
-
-fn loadFromKeychain(alloc: Allocator) LoadError!?[]u8 {
-    return keychain.load(alloc) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.KeychainItemNotFound => null,
-        else => error.StoredKeyUnreadable,
-    };
 }
 
 fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
@@ -211,11 +186,7 @@ fn writeFailed(step: []const u8, err: anyerror) StoreError {
 }
 
 test "stored key backend label names the platform store" {
-    if (comptime builtin.os.tag == .macos) {
-        try std.testing.expectEqualStrings("macOS Keychain", backend_label);
-    } else {
-        try std.testing.expectEqualStrings("profile file", backend_label);
-    }
+    try std.testing.expectEqualStrings("profile file", backend_label);
     try std.testing.expectEqualStrings(backend_label, provider.backend_label);
 }
 

@@ -7,6 +7,7 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
+const provider_definition = @import("../provider/definition.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -93,6 +94,11 @@ pub const ProjectMcpMutation = struct {
 pub const UserSettingsPatch = struct {
     model_preference: ?ModelPreferencePatch = null,
     provider: ?model_provider.ProviderId = null,
+    provider_key: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    providers: ?std.StringHashMapUnmanaged(provider_definition.OwnedDefinition) = null,
+    api_keys: ?std.StringHashMapUnmanaged([]const u8) = null,
+    remove_api_key: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     /// Removes the key entirely so resolution returns to plain precedence.
@@ -114,6 +120,11 @@ pub const UserSettingsPatch = struct {
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model_preference == null and
             self.provider == null and
+            self.provider_key == null and
+            self.model == null and
+            self.providers == null and
+            self.api_keys == null and
+            self.remove_api_key == null and
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
@@ -336,18 +347,35 @@ pub const Store = struct {
         };
         defer home.close(zio);
 
-        var durable_home = home.openDir(zio, profile_paths.root_dir_name, .{
+        var root_dir_name: []const u8 = profile_paths.root_dir_name;
+        var durable_home = home.openDir(zio, root_dir_name, .{
             .iterate = true,
             .follow_symlinks = false,
         }) catch |err| switch (err) {
             error.FileNotFound => blk: {
+                // ffx owns ~/.ffx, but accept an existing ~/.fx profile so an
+                // upstream installation is not silently ignored after the
+                // product rename. New state is always created under ~/.ffx.
+                if (std.mem.eql(u8, profile_paths.root_dir_name, ".ffx")) {
+                    if (home.openDir(zio, ".fx", .{
+                        .iterate = true,
+                        .follow_symlinks = false,
+                    })) |legacy| {
+                        root_dir_name = ".fx";
+                        break :blk legacy;
+                    } else |legacy_err| switch (legacy_err) {
+                        error.FileNotFound => {},
+                        error.NotDir, error.SymLinkLoop => return error.DurablePathUnsafe,
+                        else => return legacy_err,
+                    }
+                }
                 if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path);
 
                 var verified_home = io_mod.VerifiedDir{
                     .dir = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }),
                 };
                 defer verified_home.close();
-                const created = try io_mod.openOrCreateVerifiedPrivateDir(&verified_home, profile_paths.root_dir_name);
+                const created = try io_mod.openOrCreateVerifiedPrivateDir(&verified_home, root_dir_name);
                 break :blk created.dir;
             },
             error.NotDir, error.SymLinkLoop => return error.DurablePathUnsafe,
@@ -1011,6 +1039,46 @@ fn applyUserPatchToRoot(
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
     }
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
+    if (patch.provider_key) |value| application.changed = try putString(arena, &root.object, "provider", value) or application.changed;
+    if (patch.model) |value| application.changed = try putString(arena, &root.object, "model", value) or application.changed;
+    if (patch.providers) |providers| {
+        const object = if (root.object.getPtr("providers")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk &value.object;
+        } else blk: {
+            try root.object.put(arena, "providers", .{ .object = .empty });
+            break :blk &root.object.getPtr("providers").?.object;
+        };
+        var iterator = providers.iterator();
+        while (iterator.next()) |entry| {
+            var writer = std.Io.Writer.Allocating.init(arena);
+            defer writer.deinit();
+            try std.json.Stringify.value(entry.value_ptr.parsed.value, .{}, &writer.writer);
+            const parsed = try std.json.parseFromSlice(std.json.Value, arena, writer.written(), .{});
+            try object.put(arena, try arena.dupe(u8, entry.key_ptr.*), parsed.value);
+        }
+        application.changed = true;
+    }
+    if (patch.api_keys) |api_keys| {
+        const object = if (root.object.getPtr("api_keys")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk &value.object;
+        } else blk: {
+            try root.object.put(arena, "api_keys", .{ .object = .empty });
+            break :blk &root.object.getPtr("api_keys").?.object;
+        };
+        var iterator = api_keys.iterator();
+        while (iterator.next()) |entry| {
+            try object.put(arena, try arena.dupe(u8, entry.key_ptr.*), .{ .string = try arena.dupe(u8, entry.value_ptr.*) });
+        }
+        application.changed = true;
+    }
+    if (patch.remove_api_key) |provider| {
+        if (root.object.getPtr("api_keys")) |value| {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            if (value.object.swapRemove(provider)) application.changed = true;
+        }
+    }
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -1589,6 +1657,7 @@ fn putModelPreference(
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
+        else => @tagName(preference.provider),
     };
     if (root.contains(legacy_key)) {
         _ = root.orderedRemove(legacy_key);
@@ -1825,8 +1894,9 @@ fn validateKnownSettingsObject(
         try validateModel(value.string);
     }
     if (object.get("provider")) |value| {
-        if (value != .string or model_provider.parse(value.string) == null) {
-            return error.InvalidSettingsFormat;
+        if (value != .string) return error.InvalidSettingsFormat;
+        if (model_provider.parse(value.string) == null) {
+            provider_definition.validate_id(value.string) catch return error.InvalidSettingsFormat;
         }
     }
     if (object.get("codex_model")) |value| {
@@ -2076,10 +2146,10 @@ test "user patch accepts existing full access aliases and preserves their spelli
     for ([_][]const u8{ "full-access", "Full Access", "yolo" }) |mode| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
         const original = try std.fmt.allocPrint(alloc, "{{\"permission_mode\":\"{s}\"}}\n", .{mode});
         defer alloc.free(original);
-        try writeStoreFixture(tmp.dir, "home/.fx/settings.json", original);
+        try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", original);
         const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
         defer alloc.free(home);
         var store = try Store.initFromHome(alloc, home, .writable);
@@ -2098,8 +2168,8 @@ test "user patch writes user preferences at top level" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"future\":{\"nested\":7}}\n");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", "{\"future\":{\"nested\":7}}\n");
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -2147,10 +2217,10 @@ test "user patch retires presentation settings without rejecting their values" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"input_appearance\":false,\"maxxing_mode\":7,\"future\":{\"profile\":1},\"workspaces\":{\"/workspace\":{\"input_appearance\":[],\"maxxing_mode\":{},\"future\":{\"workspace\":2}}}}\n",
     );
 
@@ -2175,10 +2245,10 @@ test "workspace statusline patch writes globally and preserves nested leaf" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"statusLine\":{\"future\":7},\"workspaces\":{\"/workspace\":{\"statusLine\":{\"workspace\":false,\"future\":8}}}}\n",
     );
 
@@ -2215,10 +2285,10 @@ test "durable validation rejects malformed workspace statusline" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"statusLine\":{\"workspace\":\"yes\"}}\n",
     );
 
@@ -2237,10 +2307,10 @@ test "notification user patch preserves sibling fields and valid workspace overr
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"notifications\":{\"attention_required\":true,\"future\":7}," ++
             "\"workspaces\":{\"/workspace\":{\"notifications\":{\"turn_end\":false," ++
             "\"attention_required\":false,\"future\":8}}}}\n",
@@ -2280,13 +2350,13 @@ test "user patch snapshots and removes legacy workspace copies" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     const original =
         "{\"model\":\"old/global\",\"future\":7,\"workspaces\":{" ++
         "\"/workspace/a\":{\"model\":\"workspace/a\",\"permission_mode\":\"ask\",\"input_appearance\":\"lines\",\"sandbox\":\"none\"}," ++
         "\"/workspace/b\":{\"model\":\"workspace/b\",\"permission_mode\":\"auto\",\"input_appearance\":\"lines\",\"effort\":\"low\"}," ++
         "\"legacy-string\":\"preserve-me\"}}\n";
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", original);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", original);
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -2335,10 +2405,10 @@ test "update channel patch removes legacy workspace copies" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"update_channel\":\"stable\",\"workspaces\":{\"/workspace\":{\"update_channel\":\"dev\",\"sandbox\":\"none\"}}}\n",
     );
 
@@ -2369,10 +2439,10 @@ test "slash menu category patch removes legacy workspace copies" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"workspaces\":{\"/workspace\":{\"slash_menu_categories\":false,\"sandbox\":\"none\"}}}\n",
     );
 
@@ -2399,10 +2469,10 @@ test "later migration refreshes the bounded field recovery snapshot" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     const first_original =
         "{\"workspaces\":{\"/workspace/a\":{\"model\":\"legacy/one\"}}}\n";
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", first_original);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", first_original);
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -2419,7 +2489,7 @@ test "later migration refreshes the bounded field recovery snapshot" {
 
     const second_original =
         "{\"model\":\"user/one\",\"workspaces\":{\"/workspace/b\":{\"model\":\"legacy/two\"}}}\n";
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", second_original);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", second_original);
     var second = try store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = "user/two" } });
     defer second.deinit(alloc);
 
@@ -2461,12 +2531,12 @@ test "user patch preserves unknown fields in unrelated workspaces" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     const original =
         "{\"workspaces\":{" ++
         "\"/workspace/current\":{\"output_level\":\"quiet\"}," ++
         "\"/workspace/unrelated\":{\"model\":123,\"future\":true}}}\n";
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", original);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", original);
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -2497,11 +2567,11 @@ test "migration snapshot failure leaves primary byte identical" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     const original =
         "{\"model\":\"old/global\",\"workspaces\":{" ++
         "\"/workspace/a\":{\"model\":\"workspace/a\",\"sandbox\":\"none\"}}}\n";
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", original);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", original);
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -2524,7 +2594,7 @@ test "nested user cleanup preserves siblings and skips non-object containers" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     const original =
         "{\"prompt_history\":{\"future\":1},\"statusLine\":{\"context\":true,\"future\":2}," ++
         "\"workspaces\":{" ++
@@ -2532,7 +2602,7 @@ test "nested user cleanup preserves siblings and skips non-object containers" {
         "\"statusLine\":{\"sandbox\":false,\"context\":false,\"future\":4}}," ++
         "\"/workspace/b\":{\"prompt_history\":\"preserve\",\"statusLine\":7}," ++
         "\"/workspace/c\":{\"prompt_history\":{\"enabled\":false}}}}\n";
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", original);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", original);
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -2591,7 +2661,7 @@ test "oversized migration candidate fails before creating recovery snapshot" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
 
     const original_len = max_settings_bytes - 100;
     const prefix = "{\"workspaces\":{\"/workspace/a\":{\"model\":\"x\",\"future\":true}},\"pad\":\"";
@@ -2601,7 +2671,7 @@ test "oversized migration candidate fails before creating recovery snapshot" {
     @memcpy(original[0..prefix.len], prefix);
     @memset(original[prefix.len .. original.len - suffix.len], 'p');
     @memcpy(original[original.len - suffix.len ..], suffix);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", original);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", original);
 
     const model = try alloc.alloc(u8, max_model_bytes);
     defer alloc.free(model);
@@ -2621,7 +2691,7 @@ test "oversized migration candidate fails before creating recovery snapshot" {
     try std.testing.expectEqualStrings(original, bytes);
     try std.testing.expectError(
         error.FileNotFound,
-        tmp.dir.statFile(io_mod.getIo(), "home/.fx/backups", .{}),
+        tmp.dir.statFile(io_mod.getIo(), "home/.ffx/backups", .{}),
     );
 }
 
@@ -2629,7 +2699,7 @@ test "user permission mutation preserves local rules" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
@@ -2639,7 +2709,7 @@ test "user permission mutation preserves local rules" {
         .{workspace},
     );
     defer alloc.free(fixture);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", fixture);
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -2670,7 +2740,7 @@ test "permission mutation validates scope paths and isolates remove and reset" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
@@ -2680,7 +2750,7 @@ test "permission mutation validates scope paths and isolates remove and reset" {
         .{workspace},
     );
     defer alloc.free(fixture);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", fixture);
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -2733,10 +2803,10 @@ test "permission mutation removes canonical rules stored with padded keys" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"permission\":{\" bash \":{\" git status * \":\"allow\",\"keep *\":\"deny\"}}}\n",
     );
 
@@ -2781,10 +2851,10 @@ test "permission reset matches padded category keys" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"permission\":{\" bash \":{\" one * \":\"allow\",\"two *\":\"allow\"}}}\n",
     );
 
@@ -2814,11 +2884,11 @@ test "user patch traces metadata without settings content" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"sentinel_secret\":\"FX_SETTINGS_SECRET\",\"workspaces\":{}}\n",
     );
 
@@ -2860,7 +2930,7 @@ test "settings primary accepts exactly 64 KiB and rejects one byte more" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
 
@@ -2871,7 +2941,7 @@ test "settings primary accepts exactly 64 KiB and rejects one byte more" {
     @memcpy(exact[0..prefix.len], prefix);
     @memset(exact[prefix.len .. exact.len - suffix.len], 'x');
     @memcpy(exact[exact.len - suffix.len ..], suffix);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", exact);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", exact);
 
     var store = try Store.initFromHome(alloc, home, .read_only);
     defer store.deinit(alloc);
@@ -2884,7 +2954,7 @@ test "settings primary accepts exactly 64 KiB and rejects one byte more" {
     defer alloc.free(oversized);
     @memcpy(oversized[0..exact.len], exact);
     oversized[oversized.len - 1] = ' ';
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", oversized);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", oversized);
     var too_large = try store.loadPrimary(alloc);
     defer too_large.deinit(alloc);
     try std.testing.expect(too_large == .oversized);
@@ -2936,10 +3006,10 @@ test "invalid primary is not replaced by backup or mutation" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/backups");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx/backups");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{broken");
-    try writeStoreFixture(tmp.dir, "home/.fx/backups/settings.json.backup.1-0000000000000001-00000000000000000000000000000000", "{}\n");
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", "{broken");
+    try writeStoreFixture(tmp.dir, "home/.ffx/backups/settings.json.backup.1-0000000000000001-00000000000000000000000000000000", "{}\n");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
@@ -2955,7 +3025,7 @@ test "invalid primary is not replaced by backup or mutation" {
     defer alloc.free(primary);
     try std.testing.expectEqualStrings("{broken", primary);
 
-    var backups = try tmp.dir.openDir(io_mod.getIo(), "home/.fx/backups", .{ .iterate = true });
+    var backups = try tmp.dir.openDir(io_mod.getIo(), "home/.ffx/backups", .{ .iterate = true });
     defer backups.close(io_mod.getIo());
     var iterator = backups.iterate();
     var corrupt_count: usize = 0;
@@ -2974,9 +3044,9 @@ test "oversized candidate leaves prior primary unchanged" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{}\n");
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", "{}\n");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
@@ -3000,9 +3070,9 @@ test "startup scrollback false is a present user patch" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"startup_scrollback\":false}\n");
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", "{\"startup_scrollback\":false}\n");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
@@ -3019,7 +3089,7 @@ test "startup scrollback user patch removes matching legacy workspace value" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -3027,7 +3097,7 @@ test "startup scrollback user patch removes matching legacy workspace value" {
     defer alloc.free(workspace);
     const fixture = try std.fmt.allocPrint(alloc, "{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n", .{workspace});
     defer alloc.free(fixture);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", fixture);
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
 
@@ -3042,7 +3112,7 @@ test "unrelated user patch preserves inert output level values" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -3054,7 +3124,7 @@ test "unrelated user patch preserves inert output level values" {
         .{workspace},
     );
     defer alloc.free(fixture);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", fixture);
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
 
@@ -3109,10 +3179,10 @@ test "symlinked settings primary is rejected without touching its target" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     try writeStoreFixture(tmp.dir, "outside.json", "{\"outside\":true}\n");
-    tmp.dir.symLink(io_mod.getIo(), "../../outside.json", "home/.fx/settings.json", .{ .is_directory = false }) catch |err| switch (err) {
+    tmp.dir.symLink(io_mod.getIo(), "../../outside.json", "home/.ffx/settings.json", .{ .is_directory = false }) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
@@ -3141,7 +3211,7 @@ test "symlinked durable home is rejected before reading settings" {
     try tmp.dir.createDirPath(io_mod.getIo(), "home");
     try tmp.dir.createDirPath(io_mod.getIo(), "outside");
     try writeStoreFixture(tmp.dir, "outside/settings.json", "{\"model\":\"outside/model\"}\n");
-    tmp.dir.symLink(io_mod.getIo(), "../outside", "home/.fx", .{ .is_directory = true }) catch |err| switch (err) {
+    tmp.dir.symLink(io_mod.getIo(), "../outside", "home/.ffx", .{ .is_directory = true }) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
@@ -3159,14 +3229,14 @@ test "read only settings rejects group or world writable policy files" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"permission_mode\":\"auto\",\"permission\":{\"bash\":\"allow\"}}\n",
     );
 
-    var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
+    var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.ffx", .{ .iterate = true });
     defer root_dir.close(io_mod.getIo());
     root_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o777)) catch return error.SkipZigTest;
 
@@ -3197,9 +3267,9 @@ test "three fingerprint conflicts return SettingsConcurrentModification" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{}\n");
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", "{}\n");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
@@ -3333,10 +3403,10 @@ test "indeterminate migration retains recovery metadata for the caller" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     const original =
         "{\"workspaces\":{\"/workspace/a\":{\"model\":\"legacy/model\",\"future\":true}}}\n";
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", original);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", original);
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
     var store = try Store.initFromHome(alloc, home, .writable);
@@ -3373,7 +3443,7 @@ test "read-only settings load under empty home creates no filesystem state" {
     var loaded = try store.loadPrimary(alloc);
     defer loaded.deinit(alloc);
     try std.testing.expect(loaded == .absent);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io_mod.getIo(), "home/.fx", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io_mod.getIo(), "home/.ffx", .{}));
 }
 
 test "read-only settings load under missing home is absent without creating state" {
@@ -3399,10 +3469,10 @@ test "workspace directory mutations compose against the latest settings state" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"future\":true,\"workspaces\":{\"/workspace\":{\"additional_directories\":[\"/removed\"],\"future_workspace\":true},\"/empty\":{\"additional_directories\":[\"/orphan\"]},\"/other\":{\"sandbox\":\"none\"}}}\n",
     );
 
@@ -3470,10 +3540,10 @@ test "workspace directory clear removes the final empty workspace" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"workspaces\":{\"/workspace\":{\"additional_directories\":[\"/shared\"]}}}\n",
     );
 
@@ -3498,7 +3568,7 @@ test "workspace directory mutations use workspace access path identity" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "shared", .default_dir);
     tmp.dir.symLink(std.testing.io, "shared", "shared-link", .{ .is_directory = true }) catch |err| switch (err) {
@@ -3522,7 +3592,7 @@ test "workspace directory mutations use workspace access path identity" {
         .{ primary, shared_dot, shared_link },
     );
     defer alloc.free(available_fixture);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", available_fixture);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", available_fixture);
 
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
@@ -3569,7 +3639,7 @@ test "workspace directory mutations use workspace access path identity" {
         .{ primary, missing_dot, missing_parent },
     );
     defer alloc.free(unavailable_fixture);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", unavailable_fixture);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", unavailable_fixture);
     const unavailable_sources = [_]workspace_access.SavedSource{
         .{ .source = missing_dot, .identity = missing },
         .{ .source = missing_parent, .identity = missing },
@@ -3591,7 +3661,7 @@ test "workspace directory removal uses observed sources and preserves unseen con
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "first", .default_dir);
     try tmp.dir.createDir(std.testing.io, "second", .default_dir);
@@ -3625,7 +3695,7 @@ test "workspace directory removal uses observed sources and preserves unseen con
         .{ primary, observed_source, unseen_source },
     );
     defer alloc.free(fixture);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", fixture);
 
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
@@ -3653,7 +3723,7 @@ test "workspace directory removal stabilizes observed survivor identity" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "removed", .default_dir);
     try tmp.dir.createDir(std.testing.io, "survivor", .default_dir);
@@ -3686,7 +3756,7 @@ test "workspace directory removal stabilizes observed survivor identity" {
         .{ primary, removed_source, survivor_source },
     );
     defer alloc.free(fixture);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", fixture);
 
     try tmp.dir.deleteFile(std.testing.io, "survivor-link");
     try tmp.dir.symLink(std.testing.io, "retarget", "survivor-link", .{ .is_directory = true });
@@ -3717,10 +3787,10 @@ test "workspace directory removal prefers an unseen canonical survivor" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"workspaces\":{\"/workspace\":{\"additional_directories\":[\"/unseen-before\",\"/target-alias\",\"/survivor-alias-a\",\"/survivor\",\"/survivor-alias-b\",\"/unseen-after\"]}}}\n",
     );
 
@@ -3754,10 +3824,10 @@ test "workspace directory removal removes an unseen exact target replacement" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"workspaces\":{\"/workspace\":{\"additional_directories\":[\"/unseen-before\",\"/target\",\"/unseen-after\"]}}}\n",
     );
 
@@ -3790,10 +3860,10 @@ test "workspace directory add prefers an unseen canonical survivor" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
     try writeStoreFixture(
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.ffx/settings.json",
         "{\"workspaces\":{\"/workspace\":{\"additional_directories\":[\"/survivor-alias\",\"/survivor\"]}}}\n",
     );
 
@@ -3826,7 +3896,7 @@ test "workspace directory add counts an unseen command line root once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
 
     var fixture: std.Io.Writer.Allocating = .init(alloc);
     defer fixture.deinit();
@@ -3836,7 +3906,7 @@ test "workspace directory add counts an unseen command line root once" {
         try fixture.writer.print("\"/unseen-{d}\"", .{index});
     }
     try fixture.writer.writeAll("]}}}\n");
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture.written());
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", fixture.written());
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -3871,7 +3941,7 @@ test "workspace directory existing add stabilizes a retargeted observed source" 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "first", .default_dir);
     try tmp.dir.createDir(std.testing.io, "second", .default_dir);
@@ -3898,7 +3968,7 @@ test "workspace directory existing add stabilizes a retargeted observed source" 
         .{ primary, source },
     );
     defer alloc.free(fixture);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", fixture);
 
     try tmp.dir.deleteFile(std.testing.io, "saved-link");
     try tmp.dir.symLink(std.testing.io, "second", "saved-link", .{ .is_directory = true });
@@ -3929,7 +3999,7 @@ test "workspace directory capacity compaction uses observed source identities" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "shared", .default_dir);
     try tmp.dir.createDir(std.testing.io, "retarget", .default_dir);
@@ -3970,7 +4040,7 @@ test "workspace directory capacity compaction uses observed source identities" {
         try std.json.Stringify.value(alias, .{}, &fixture.writer);
     }
     try fixture.writer.writeAll("]}}}\n");
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture.written());
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", fixture.written());
 
     try tmp.dir.deleteFile(std.testing.io, "stable-link-15");
     try tmp.dir.symLink(std.testing.io, "retarget", "stable-link-15", .{ .is_directory = true });
@@ -4002,7 +4072,7 @@ test "workspace directory add compacts saved aliases before applying effective c
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ffx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "shared", .default_dir);
     try tmp.dir.createDir(std.testing.io, "added", .default_dir);
@@ -4042,7 +4112,7 @@ test "workspace directory add compacts saved aliases before applying effective c
         try std.json.Stringify.value(alias, .{}, &fixture.writer);
     }
     try fixture.writer.writeAll("]}}}\n");
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture.written());
+    try writeStoreFixture(tmp.dir, "home/.ffx/settings.json", fixture.written());
 
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);

@@ -261,7 +261,7 @@ const ResumeNotice = union(enum) {
 };
 
 fn writeUpgradeNoticeBody(writer: *std.Io.Writer, upgrade: UpgradeNotice) !void {
-    try writer.writeAll("fx has been updated to ");
+    try writer.writeAll("ffx has been updated to ");
     if (upgrade.channel == .dev and update_target.isValidRevision(upgrade.revision)) {
         try writer.print("dev {s} (v{s})", .{
             upgrade.revision[0..@min(upgrade.revision.len, 12)],
@@ -5623,7 +5623,7 @@ test "session runtime owns temporary interactive image snapshot capture" {
 }
 
 fn testPaths(alloc: Allocator, tmp: *std.testing.TmpDir) !struct { home: []u8, workspace: []u8 } {
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     return .{
         .home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home"),
@@ -6626,7 +6626,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "",
             },
-            .expected = "fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
+            .expected = "ffx has been updated to v9.9.9 (\x1b]8;;https://ffx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -6635,7 +6635,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "1111111111111111111111111111111111111111",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
+            .expected = "ffx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -6644,7 +6644,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
+            .expected = "ffx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
     };
 
@@ -7010,7 +7010,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("run server", context[2].assistant.user.text);
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expectEqualStrings(
-        "● fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
+        "● ffx has been updated to v9.9.9 (\x1b]8;;https://ffx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         app.notices.items[0],
     );
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
@@ -8895,7 +8895,7 @@ test "session picker current mode filters workspace and all mode includes every 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.ffx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
