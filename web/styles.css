@@ -64,18 +64,21 @@ main,
   align-items: center;
   justify-content: space-between;
   gap: 2rem;
-  padding: 1.75rem 0;
+  padding: 1.25rem 0;
 }
 
 .brand {
   display: inline-flex;
   align-items: center;
   color: var(--accent);
-  font-size: 1.45rem;
   line-height: 1;
 }
 
-.brand-name { font-weight: 600; letter-spacing: -0.08em; }
+.brand-mark {
+  display: block;
+  width: 3.8rem;
+  height: auto;
+}
 
 .topnav {
   display: flex;
@@ -89,14 +92,14 @@ main,
 main { padding-bottom: 8rem; }
 
 .hero {
-  padding: clamp(8rem, 17vw, 15rem) 0 8rem;
+  padding: clamp(4.5rem, 8vw, 7rem) 0 5rem;
 }
 
 .hero h1 {
-  max-width: 28ch;
-  margin: 0 0 2.25rem;
+  max-width: 50ch;
+  margin: 0 0 1.5rem;
   color: var(--soft);
-  font-size: clamp(1.25rem, 2.2vw, 2rem);
+  font-size: clamp(1.2rem, 1.8vw, 1.7rem);
   font-weight: 400;
   letter-spacing: -0.05em;
   line-height: 1.25;
@@ -106,15 +109,20 @@ main { padding-bottom: 8rem; }
   display: block;
   width: 100%;
   max-width: 100%;
-  margin-bottom: 1.75rem;
+  margin-bottom: 1.25rem;
   color: var(--accent);
-  font-size: clamp(1rem, 1.6vw, 1.35rem);
+  font-size: clamp(0.9rem, 1.2vw, 1.1rem);
   font-weight: 700;
   overflow-wrap: anywhere;
-  word-break: break-word;
+  word-break: normal;
 }
 
 .hero-command span { color: var(--soft); }
+
+.hero-command .command-prefix,
+.hero-command .command-suffix { color: var(--accent); }
+
+.mobile-break { display: none; }
 
 .hero-meta,
 .section-label,
@@ -126,8 +134,8 @@ main { padding-bottom: 8rem; }
 .hero-meta span { color: #575757; }
 
 .terminal-window {
-  min-height: clamp(24rem, 45vw, 36rem);
-  margin: 5rem 0 4rem;
+  min-height: clamp(22rem, 36vw, 30rem);
+  margin: 3.5rem 0 3rem;
   border: 1px solid var(--line);
   border-radius: 1.1rem;
   background: var(--surface);
@@ -161,8 +169,8 @@ main { padding-bottom: 8rem; }
 }
 
 .terminal-body {
-  min-height: 20rem;
-  padding: 2.5rem 2rem;
+  min-height: 17rem;
+  padding: 2rem;
   color: var(--muted);
   font-size: clamp(0.9rem, 1.6vw, 1.2rem);
 }
@@ -187,7 +195,7 @@ main { padding-bottom: 8rem; }
 
 section {
   border-top: 1px solid var(--line);
-  padding: 6rem 0;
+  padding: 4.5rem 0;
   scroll-margin-top: 2rem;
 }
 
@@ -245,8 +253,8 @@ li { margin: 0.4rem 0; padding-inline-start: 0.4rem; }
 .capability-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 4rem 5rem;
-  margin-top: 4rem;
+  gap: 3rem 5rem;
+  margin-top: 3rem;
 }
 
 .capability-grid article {
@@ -316,7 +324,7 @@ pre {
 
   .site-header,
   main,
-  .site-footer { width: min(100% - 1.5rem, 42rem); }
+  .site-footer { width: calc(100% - 1.5rem); }
 
   .site-header { display: block; }
 
@@ -326,6 +334,18 @@ pre {
   }
 
   .hero { padding-top: 5rem; }
+
+  .hero-command .command-url,
+  .hero-command .command-suffix { display: block; }
+
+  .hero-command .command-url {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    word-break: break-all;
+    white-space: normal;
+  }
+
+  .mobile-break { display: block; }
 
   .terminal-body { padding: 1.5rem 1rem; }
 }

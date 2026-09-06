@@ -5,13 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ffx — native coding agent for the terminal</title>
   <meta name="description" content="ffx is an open, native coding agent written in Zig with direct and custom AI provider support.">
+  <link rel="icon" href="ffx-mark.svg" type="image/svg+xml">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <a class="skip-link" href="#main-content">Skip to content</a>
   <header class="site-header">
     <a class="brand" href="#top" aria-label="ffx home">
-      <span class="brand-name">𝒇𝒇x</span>
+      <img class="brand-mark" src="ffx-mark.svg" alt="">
     </a>
     <nav class="topnav" aria-label="Main navigation">
       <a href="https://fx.sh/docs">docs</a>
@@ -25,7 +26,7 @@
   <main id="main-content">
     <section class="hero" id="top" aria-labelledby="hero-title">
       <h1 id="hero-title">Tiny, open, native coding agent.</h1>
-      <a class="hero-command" href="#install"><span aria-hidden="true">$</span> curl -fsSL https://raw.githubusercontent.com/afa7789/ffx/main/setup.sh | bash</a>
+      <a class="hero-command" href="#install"><span class="command-prefix"><span aria-hidden="true">$</span> curl -fsSL</span> <span class="command-url">https://raw.githubusercontent.com/<br class="mobile-break">afa7789/ffx/main/setup.sh</span> <span class="command-suffix">| bash</span></a>
       <p class="hero-meta">v0.0.8 <span aria-hidden="true">·</span> Zig <span aria-hidden="true">·</span> status: experimental <span aria-hidden="true">(i)</span></p>
 
       <div class="terminal-window" aria-label="ffx terminal preview">
