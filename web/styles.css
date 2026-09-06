@@ -70,21 +70,10 @@ main,
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 0.75rem;
   color: var(--accent);
-  font-size: 1.35rem;
+  font-size: 1.45rem;
   line-height: 1;
 }
-
-.brand-mark {
-  width: 0;
-  height: 0;
-  border-inline: 0.75rem solid transparent;
-  border-bottom: 1.4rem solid var(--accent);
-  transform: translateY(-0.1rem);
-}
-
-.brand-slash { color: var(--muted); }
 
 .brand-name { font-weight: 600; letter-spacing: -0.08em; }
 
