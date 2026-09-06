@@ -64,6 +64,7 @@ code { color: var(--accent); }
 main,
 .site-footer {
   width: 100%;
+  max-width: 760px;
   margin-inline: auto;
 }
 
@@ -98,7 +99,7 @@ main,
 
 .topnav a { transition: color 120ms ease; }
 
-main { padding: 2.5rem 2rem 4rem; }
+main { padding: 2.5rem 0 4rem; }
 
 .hero {
   max-width: 680px;
@@ -213,6 +214,7 @@ main { padding: 2.5rem 2rem 4rem; }
 
 section {
   max-width: 560px;
+  margin-inline: auto;
   border-top: 1px solid var(--line);
   padding: 2.75rem 0;
   scroll-margin-top: 2rem;
@@ -317,9 +319,9 @@ pre {
 
 @media (max-width: 48rem) {
   .site-header,
-  .site-footer { padding-inline: 1.25rem; }
+  .site-footer { max-width: none; padding-inline: 1.25rem; }
 
-  main { padding-inline: 1.25rem; }
+  main { max-width: none; padding-inline: 1.25rem; }
 
   .site-header { align-items: flex-start; }
 
