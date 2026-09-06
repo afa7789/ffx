@@ -213,7 +213,7 @@ main { padding: 2.5rem 0 4rem; }
 }
 
 section {
-  max-width: 560px;
+  max-width: 680px;
   margin-inline: auto;
   border-top: 1px solid var(--line);
   padding: 2.75rem 0;
