@@ -803,9 +803,9 @@ fn composeCatalogMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool,
         "Enter Esc",
     };
     const provider_variants = [_][]const u8{
-        "↑↓ Navigate     Tab Provider     Enter Use     Esc Close",
-        "↑↓ Navigate  Tab Provider  Enter Use  Esc Close",
-        "↑↓ Move  Tab Provider  Enter  Esc",
+        "↑↓ Navigate     Tab Provider     Ctrl+Y Favorite     Enter Use     Esc Close",
+        "↑↓ Navigate  Tab Provider  Ctrl+Y Favorite  Enter Use  Esc",
+        "↑↓ Move  Tab  Ctrl+Y  Enter  Esc",
         "Enter Use  Esc Close",
         "Enter Esc",
     };

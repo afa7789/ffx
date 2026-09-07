@@ -862,7 +862,7 @@ process.stdin.on("data", (chunk) => {
 `,
   );
   writeFileSync(
-    join(home, ".fx", "mcp.json"),
+    join(home, ".ffx", "mcp.json"),
     JSON.stringify({
       mcp: {
         fixture: {
@@ -1139,11 +1139,11 @@ async function runCanonicalLifecycleFixture(
   root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-gateway-ordering-")));
   const home = join(root, "home");
   const workspacePath = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspacePath, { recursive: true });
   const workspace = realpathSync(workspacePath);
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({
       permission_mode: "ask",
       permission: {
@@ -1349,9 +1349,9 @@ async function launchRouteRecoveryTui(
   const home = join(root, "home");
   const workspacePath = join(root, "workspace");
   const stderrPath = join(root, "stderr.log");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspacePath, { recursive: true });
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify(options.settings ?? {}));
+  writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify(options.settings ?? {}));
   const workspace = realpathSync(workspacePath);
   const model = options.model ?? MODEL;
 
@@ -1580,9 +1580,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const sourceSentence = renderedSentence.replace("smooth", "**smooth**");
       const toolMarker = "PACING_TOOL_BOUNDARY_DONE";
       const finalText = "PACING_STREAM_COMPLETE";
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
 
       const queuedGateway = startFakeGateway([
         () =>
@@ -1880,9 +1880,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const home = join(root, "home");
       const workspacePath = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       const workspace = realpathSync(workspacePath);
       const finalText = "Follow-up accepted after HTTP 503.";
 
@@ -2000,9 +2000,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const home = join(root, "home");
       const workspacePath = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       const workspace = realpathSync(workspacePath);
 
       const finalText = "TUI route recovery completed.";
@@ -2617,9 +2617,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const expectedFailure =
         "read_tool_result failed for handle unknown-dogfood-handle: ResultHandleNotFound. No exact match exists in the active tool-result store; handles are session-scoped and must be copied exactly from the tool result preview.";
       const finalText = "Read tool result failure lifecycle completed.";
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       const workspace = realpathSync(workspacePath);
 
       const queuedGateway = startFakeGateway([
@@ -2663,7 +2663,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "tool-result continuation request",
       );
 
-      const sessionsRoot = join(home, ".fx", "sessions");
+      const sessionsRoot = join(home, ".ffx", "sessions");
       await waitForCondition(
         () =>
           existsSync(sessionsRoot) &&
@@ -2714,9 +2714,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const tapePath = join(root, "session.fxtape");
       const draft = "draft while stream is active";
       const stream = { started: false, cancelled: false };
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
 
       const streamingGateway = startFakeGateway([
         () => heldGatewayResponse(stream),
@@ -2777,9 +2777,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const submittedPrompt = "IDLE_SUBMIT_ORDER_SENTINEL";
       const newerDraft = "RAPID_SECOND_DRAFT_SENTINEL";
       const hold: HoldState = { started: false, cancelled: false };
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       writeFileSync(
         join(root, "outside-instructions.md"),
         "# Outside instructions\n",
@@ -2883,9 +2883,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const seedReply = "MULTI_TURN_SEED_REPLY";
       const submittedPrompt = "MULTI_TURN_ROW_SENTINEL";
       const hold: HoldState = { started: false, cancelled: false };
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
 
       const queuedGateway = startFakeGateway([
         fakeGatewayFinalText(seedReply),
@@ -2953,9 +2953,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const tracePath = join(root, "trace.log");
       const firstResponse: HoldState = { started: false, cancelled: false };
       const secondResponse = { started: false, cancelled: false };
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       const workspace = realpathSync(workspacePath);
 
       const splitGateway = startFakeGateway([
@@ -3109,9 +3109,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const steering = lines.join("\n");
       const finalHold: HoldState = { started: false, cancelled: false };
       const requestHold: HoldState = { started: false, cancelled: false };
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       writeFileSync(
         join(workspace, "check.sh"),
         "printf started > started\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf once >> effect\n",
@@ -3234,9 +3234,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const bufferedTail = "CANCELLED_RESPONSE_BUFFERED_TAIL";
       const steering = "Replace the cancelled response with the short corrected answer.";
       const finalText = "STEERED_RESPONSE_FRESH";
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       const workspace = realpathSync(workspacePath);
 
       const lateTailGateway = startFakeGateway([
@@ -3327,9 +3327,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const toolOutput = "TOOL_HANDOFF_EXECUTED";
       const steering = "Respond exactly TOOL_HANDOFF_STEERING_COMPLETE.";
       const finalText = "TOOL_HANDOFF_STEERING_COMPLETE";
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       const workspace = realpathSync(workspacePath);
 
       const handoffGateway = startFakeGateway([
@@ -3450,9 +3450,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const tracePath = join(root, "trace.log");
       const stderrPath = join(root, "stderr.log");
       const releasePath = join(workspace, ".release-steering-tool");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       const command =
         `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
         "printf COOPERATIVE_TOOL_DONE";
@@ -3595,9 +3595,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const stderrPath = join(root, "stderr.log");
       const releasePath = join(workspace, ".release-rich-steering-tool");
       const imagePath = join(workspace, "steering-image.png");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       copyFileSync(join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"), imagePath);
       const expectedImageData = readFileSync(imagePath).toString("base64");
       const command =
@@ -3702,9 +3702,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const tracePath = join(root, "trace.log");
       const stderrPath = join(root, "stderr.log");
       const releasePath = join(workspace, ".release-failed-steering-tool");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       const command =
         `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
         "printf FAILED_TOOL_STEERING_RESULT; exit 7";
@@ -3780,9 +3780,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const workspace = join(root, "workspace");
       const tracePath = join(root, "trace.log");
       const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       const steering = "Apply IMMEDIATE_STEERING_SENTINEL now.";
       const finalText = "IMMEDIATE_STEERING_COMPLETE";
       const steeringGateway = startFakeGateway([
@@ -3856,9 +3856,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const tracePath = join(root, "trace.log");
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "session.fxtape");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       const workspace = realpathSync(workspacePath);
       const nested = join(workspace, "assets", "nested");
       const sibling = join(workspace, "sibling");
@@ -3881,7 +3881,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const newRootRule = "STEERING_SNAPSHOT_NEW_ROOT_MUST_BE_ABSENT";
       const newNestedRule = "STEERING_SNAPSHOT_NEW_NESTED_MUST_BE_ABSENT";
       const newSiblingRule = "STEERING_SNAPSHOT_NEW_SIBLING_MUST_BE_ABSENT";
-      writeFileSync(join(home, ".fx", "AGENTS.md"), `${oldGlobalRule}\n`);
+      writeFileSync(join(home, ".ffx", "AGENTS.md"), `${oldGlobalRule}\n`);
       writeFileSync(join(launchAncestor, "AGENTS.md"), `${oldAncestorRule}\n`);
       writeFileSync(join(workspace, "AGENTS.md"), `${oldRootRule}\n`);
       writeFileSync(join(nested, "AGENTS.md"), `${oldNestedRule}\n`);
@@ -3941,7 +3941,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("attached image: steering-snapshot.png", TIMEOUT);
       await session.sendText(steeringPrompt);
 
-      writeFileSync(join(home, ".fx", "AGENTS.md"), `${newGlobalRule}\n`);
+      writeFileSync(join(home, ".ffx", "AGENTS.md"), `${newGlobalRule}\n`);
       writeFileSync(join(launchAncestor, "AGENTS.md"), `${newAncestorRule}\n`);
       writeFileSync(join(workspace, "AGENTS.md"), `${newRootRule}\n`);
       writeFileSync(join(nested, "AGENTS.md"), `${newNestedRule}\n`);
@@ -4025,9 +4025,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const activeAfter = "ACTIVE_PERMISSION_AFTER_SENTINEL\n";
       const followupPrompt = "ACTIVE_PERMISSION_FOLLOWUP_PROMPT_SENTINEL";
       const followupResponse = "ACTIVE_PERMISSION_FOLLOWUP_RESPONSE_SENTINEL";
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       writeFileSync(join(workspacePath, readFilename), "active permission fixture\n");
       const workspace = realpathSync(workspacePath);
       const hold: HoldState = { started: false, cancelled: false };
@@ -4129,9 +4129,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const stderrPath = join(artifacts, "stderr.log");
       const tracePath = join(artifacts, "trace.log");
       const tapePath = join(artifacts, "session.fxtape");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
 
       const hold: HoldState = { started: false, cancelled: false };
       const heldGateway = startFakeGateway([
@@ -4225,10 +4225,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const prompt = "Recall CTRL_C_EXIT_HISTORY_SENTINEL exactly.";
       const finalText = "CTRL_C_EXIT_HISTORY_DONE";
       const exitHint = "press ctrl+c again to exit";
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         '{"prompt_history":{"enabled":true}}',
       );
 
@@ -4451,10 +4451,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         (_, index) => `SCROLL_PRE_${String(index + 1).padStart(2, "0")}`,
       );
       const final_text = "SCROLLBACK_FINAL_SENTINEL";
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({}),
       );
       writeFileSync(join(workspace, "one.txt"), "first fixture\n");
@@ -4561,7 +4561,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "",
         tail,
       ].join("\n");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       mkdirSync(join(workspace, "docs"), { recursive: true });
       for (let index = 1; index <= 27; index += 1) {
@@ -4571,7 +4571,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         );
       }
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({
           sandbox: "none",
           permission_mode: "yolo",
@@ -4671,10 +4671,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         const home = join(runRoot, "home");
         const workspace = join(runRoot, "workspace");
         const stderrPath = join(runRoot, "stderr.log");
-        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(join(home, ".ffx"), { recursive: true });
         mkdirSync(workspace, { recursive: true });
         writeFileSync(
-          join(home, ".fx", "settings.json"),
+          join(home, ".ffx", "settings.json"),
           JSON.stringify({}),
         );
         const fixture = writeDelayedMcpFixture(runRoot, home, 0);
@@ -4793,10 +4793,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const argumentTail = "FXC194_OVERLONG_TAIL";
       const overlongText = `FXC194_OVERLONG_HEAD_${"x".repeat(5_000)}\u001b[31m${argumentTail}`;
       const finalText = "FXC194_NARROW_DENY_COMPLETE";
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({}),
       );
       const fixture = writeDelayedMcpFixture(root, home, 0);
@@ -4884,9 +4884,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const finalText = "INSTRUCTION_REFRESH_FINAL";
       const refreshLabel = "Reading project instructions before continuing:";
       const header = "● 2 tool calls · 2 commands";
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(nested, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       writeFileSync(join(nested, "AGENTS.md"), `${instruction}\n`);
 
       let executedBeforeRetry: boolean | undefined;
@@ -4973,10 +4973,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const resumedStderrPath = join(root, "resumed-stderr.log");
       const tracePath = join(root, "fx-trace.log");
       const tapePath = join(root, "session.fxtape");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({}),
       );
 
@@ -5114,9 +5114,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace);
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       writeFileSync(join(workspace, "fixture.txt"), "ROW_FILE_CONTENT");
       const tasks = ["Check one-off cleanup", "Check provider replay", "Check replay again"];
       const rootPrompt = "SUBAGENT_ROW_FIXTURE";
@@ -5250,10 +5250,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const stderrPath = join(root, "stderr.log");
       const resumedStderrPath = join(root, "resumed-stderr.log");
       const tracePath = join(root, "fx-trace.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(nested, { recursive: true });
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({}),
       );
 

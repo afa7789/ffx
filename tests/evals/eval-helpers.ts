@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-export const FX_BIN = resolve(import.meta.dirname, "../../zig-out/bin/fx");
+export const FX_BIN = resolve(import.meta.dirname, "../../zig-out/bin/ffx");
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
 export function providerVersionTestEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
@@ -134,9 +134,9 @@ export function cleanupIsolatedTestHome(home: string): void {
 
 function createEvalHome(): string {
   const home = mkdtempSync(join(tmpdir(), HOME_PREFIX));
-  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({
       permission_mode: "auto",
       permission: {

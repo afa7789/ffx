@@ -130,7 +130,7 @@ const LEGACY_GATEWAY_OPTIONS = {
 // Entirely synthetic schema-v3 data: no copied sessions, credentials, or child markers.
 function createLegacySession(fixture: ReturnType<typeof createFixture>, version: 2 | 3 | 4) {
   const id = `synthetic-legacy-v${version}`;
-  const source = join(fixture.home, ".fx", "sessions", id);
+  const source = join(fixture.home, ".ffx", "sessions", id);
   mkdirSync(source, { recursive: true, mode: 0o700 });
   const generation = "01".repeat(16);
   const authority = "03".repeat(16);
@@ -216,7 +216,7 @@ function createLegacySession(fixture: ReturnType<typeof createFixture>, version:
   writeJson("display.json", {
     schema_version: 1, title: LEGACY_TITLE, preview: null, origin_workspace_root: fixture.workspace,
   });
-  writeFileSync(join(fixture.home, ".fx", "settings.json"), JSON.stringify({
+  writeFileSync(join(fixture.home, ".ffx", "settings.json"), JSON.stringify({
     model: "workspace/default", effort: "low", fast_mode: false, auto_upgrade: false,
   }), { mode: 0o600 });
   return { id, source, watermarkPath };
@@ -284,7 +284,7 @@ describe("session recovery", () => {
     const gateway = startFakeGateway([fakeGatewayFinalText("SAVED_HEALTHY")]);
     try {
       const id = await createSavedSession(fixture, gateway);
-      const source = join(fixture.home, ".fx", "sessions", id);
+      const source = join(fixture.home, ".ffx", "sessions", id);
       const before = savedFileHashes(source);
       const result = await runFx(["session", "recover", id, "--json"], {
         cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
@@ -293,7 +293,7 @@ describe("session recovery", () => {
       expect(result.stderr).toBe("");
       expect(JSON.parse(result.stdout).code).toBe("SessionRecoveryNotNeeded");
       expect(savedFileHashes(source)).toEqual(before);
-      expect(readdirSync(join(fixture.home, ".fx", "sessions"))).toEqual([id]);
+      expect(readdirSync(join(fixture.home, ".ffx", "sessions"))).toEqual([id]);
       expect(gateway.requests).toHaveLength(1);
     } finally {
       gateway.stop();
@@ -320,7 +320,7 @@ describe("session recovery", () => {
         });
         expect(created.code).toBe(0);
         const id = JSON.parse(created.stdout).session_id;
-        const source = join(fixture.home, ".fx", "sessions", id);
+        const source = join(fixture.home, ".ffx", "sessions", id);
         const eventPath = join(source, "events.jsonl");
         const metadataPath = join(source, "session.json");
         const metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
@@ -355,7 +355,7 @@ describe("session recovery", () => {
         expect(result.recovered_id).not.toBe(id);
         expect(gateway.requests).toHaveLength(2);
         expect(savedFileHashes(source)).toEqual(before);
-        const target = join(fixture.home, ".fx", "sessions", result.recovered_id);
+        const target = join(fixture.home, ".ffx", "sessions", result.recovered_id);
         expect(JSON.parse(readFileSync(join(target, "session.json"), "utf8")).title).toBe(metadata.title);
         const targetEvents = readFileSync(join(target, "events.jsonl"), "utf8");
         expect(targetEvents.startsWith(prefix)).toBe(true);
@@ -416,7 +416,7 @@ describe("session recovery", () => {
         });
         expect(created.code).toBe(0);
         const id = JSON.parse(created.stdout).session_id;
-        const source = join(fixture.home, ".fx", "sessions", id);
+        const source = join(fixture.home, ".ffx", "sessions", id);
         const eventPath = join(source, "events.jsonl");
         const prefix = readFileSync(eventPath, "utf8");
         const records = prefix.trimEnd().split("\n").map(JSON.parse);
@@ -432,7 +432,7 @@ describe("session recovery", () => {
         expect(recovered.stderr).toBe("");
         const result = JSON.parse(recovered.stdout);
         expect(result.status).toBe("recovered");
-        const target = join(fixture.home, ".fx", "sessions", result.recovered_id);
+        const target = join(fixture.home, ".ffx", "sessions", result.recovered_id);
         expect(readFileSync(join(target, "events.jsonl"), "utf8")).toBe(prefix);
         expect(savedFileHashes(source)).toEqual(before);
         const inspected = await runFx(["session", "--id", result.recovered_id, "--json"], {
@@ -467,7 +467,7 @@ describe("session recovery", () => {
         });
         expect(created.code).toBe(0);
         const id = JSON.parse(created.stdout).session_id;
-        const source = join(fixture.home, ".fx", "sessions", id);
+        const source = join(fixture.home, ".ffx", "sessions", id);
         const eventPath = join(source, "events.jsonl");
         const committed = readFileSync(eventPath, "utf8");
         if (damage === "metadata" || damage === "private-child") {
@@ -502,7 +502,7 @@ describe("session recovery", () => {
         expect(result.stderr).toBe("");
         expect(JSON.parse(result.stdout).code).toBe(damage === "private-child" || damage === "private-marker" ? "SessionNotFound" : "SessionRecoveryBoundaryInvalid");
         expect(savedFileHashes(source)).toEqual(before);
-        const sessionRoot = join(fixture.home, ".fx", "sessions");
+        const sessionRoot = join(fixture.home, ".ffx", "sessions");
         expect(readdirSync(sessionRoot).filter((name) => existsSync(join(sessionRoot, name, "session.json")))).toEqual([id]);
         expect(gateway.requests).toHaveLength(2);
       } finally {
@@ -521,7 +521,7 @@ describe("session recovery", () => {
     let tui: TmuxSession | null = null;
     try {
       const sessionId = await createSavedSession(fixture, gateway);
-      const eventsPath = join(fixture.home, ".fx", "sessions", sessionId, "events.jsonl");
+      const eventsPath = join(fixture.home, ".ffx", "sessions", sessionId, "events.jsonl");
       const checkpoint = [
         { user: { text: "unfinished first request", images: [], work_id: null } },
         { context_checkpoint: { covers_through_seq: 1, summary: "<context_handoff>FIRST_CHECKPOINT_FACT</context_handoff>" } },
@@ -571,7 +571,7 @@ describe("session recovery", () => {
     let tui: TmuxSession | null = null;
     try {
       const id = await createSavedSession(fixture, gateway);
-      const sessions = join(fixture.home, ".fx", "sessions");
+      const sessions = join(fixture.home, ".ffx", "sessions");
       const unpublished = join(sessions, "unpublished");
       mkdirSync(unpublished, { mode: 0o700 });
       writeFileSync(join(unpublished, "session.lock"), "", { mode: 0o600 });
@@ -691,7 +691,7 @@ describe("session recovery", () => {
         expect(savedFileHashes(legacy.source)).toEqual(before);
         expect(gateway.requests).toHaveLength(0);
 
-        const sessionsRoot = join(fixture.home, ".fx", "sessions");
+        const sessionsRoot = join(fixture.home, ".ffx", "sessions");
         const sessionEntries = () => readdirSync(sessionsRoot).filter((name) => name !== ".resume-catalog").sort();
         const expectedSessionIds = [legacy.id];
         let blankSessionDir: string | null = null;
@@ -788,7 +788,7 @@ describe("session recovery", () => {
       expect(gateway.requests).toHaveLength(0);
       expect(gateway.classifierRequests).toHaveLength(0);
       expect(savedFileHashes(legacy.source)).toEqual(before);
-      expect(readdirSync(join(fixture.home, ".fx", "sessions"))).toEqual([legacy.id]);
+      expect(readdirSync(join(fixture.home, ".ffx", "sessions"))).toEqual([legacy.id]);
       writeFileSync(legacy.watermarkPath, watermark);
 
       for (const [index, args] of [["--resume-id", legacy.id], ["--resume", "last"]].entries()) {
@@ -893,7 +893,7 @@ describe("session recovery", () => {
       const gateway = startFakeGateway([fakeGatewayFinalText("FIFO_SOURCE_SAVED")]);
       try {
         const id = fenced ? "fenced-legacy-fifo" : await createSavedSession(fixture, gateway);
-        const source = join(fixture.home, ".fx", "sessions", id);
+        const source = join(fixture.home, ".ffx", "sessions", id);
         if (fenced) {
           mkdirSync(source, { recursive: true, mode: 0o700 });
           const snapshot = JSON.stringify({
@@ -931,7 +931,7 @@ describe("session recovery", () => {
         for (const [path, digest] of Object.entries(before)) {
           expect(createHash("sha256").update(readFileSync(join(source, path))).digest("hex")).toBe(digest);
         }
-        expect(readdirSync(join(fixture.home, ".fx", "sessions"))).toEqual([id]);
+        expect(readdirSync(join(fixture.home, ".ffx", "sessions"))).toEqual([id]);
       } finally {
         gateway.stop();
         rmSync(fixture.root, { recursive: true, force: true });
@@ -947,7 +947,7 @@ describe("session recovery", () => {
     ]);
     try {
       const sessionId = await createSavedSession(fixture, gateway);
-      const sessionDir = join(fixture.home, ".fx", "sessions", sessionId);
+      const sessionDir = join(fixture.home, ".ffx", "sessions", sessionId);
       const eventsPath = join(sessionDir, "events.jsonl");
       const committed = readFileSync(eventsPath, "utf8");
       appendFileSync(eventsPath, '{"schema_version":1,"partial-tail"');
@@ -1002,7 +1002,7 @@ describe("session recovery", () => {
         const sessionId = await createSavedSession(fixture, gateway);
         const eventsPath = join(
           fixture.home,
-          ".fx",
+          ".ffx",
           "sessions",
           sessionId,
           "events.jsonl",
@@ -1051,7 +1051,7 @@ describe("session recovery", () => {
       const sessionId = await createSavedSession(fixture, gateway);
       const eventsPath = join(
         fixture.home,
-        ".fx",
+        ".ffx",
         "sessions",
         sessionId,
         "events.jsonl",

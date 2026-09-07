@@ -81,20 +81,39 @@ pub const ModelMenuProjection = struct {
     load_state: model_cache_runtime.ModelMenuLoadState = .loading,
     catalog_state: model_cache_runtime.ModelMenuCatalogState = .{},
     items: []const model_cache_runtime.ModelMenuItem = &.{},
+    provider_tabs: []const []const u8 = &.{},
     provider_index: usize = 0,
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
 
     pub fn providerFilter(self: ModelMenuProjection) model_cache_runtime.ModelProviderFilter {
+        if (self.provider_tabs.len > 0) return .all;
         return @enumFromInt(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1));
     }
 
     pub fn filteredItemCount(self: ModelMenuProjection) usize {
+        if (self.provider_tabs.len > 0) {
+            return model_cache_runtime.modelMenuDynamicFilteredItemCount(
+                self.items,
+                self.provider_tabs,
+                self.provider_index,
+                self.query,
+            );
+        }
         return model_cache_runtime.modelMenuFilteredItemCount(self.items, self.providerFilter(), self.query);
     }
 
     pub fn itemAt(self: ModelMenuProjection, display_index: usize) ?*const model_cache_runtime.ModelMenuItem {
+        if (self.provider_tabs.len > 0) {
+            return model_cache_runtime.modelMenuDynamicItemAt(
+                self.items,
+                self.provider_tabs,
+                self.provider_index,
+                self.query,
+                display_index,
+            );
+        }
         return model_cache_runtime.modelMenuItemAt(self.items, self.providerFilter(), self.query, display_index);
     }
 };
@@ -396,6 +415,7 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
         .load_state = cache.menu.load_state,
         .catalog_state = cache.menu.catalog_state,
         .items = cache.menu.items.items,
+        .provider_tabs = cache.menu.provider_tabs.items,
         .provider_index = cache.menu.provider_index,
         .selected_index = cache.menu.selected_index,
         .window_start = cache.menu.window_start,

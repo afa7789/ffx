@@ -18,6 +18,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const builtin_providers = @import("../../builtins/providers.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -545,7 +546,7 @@ fn performApiKeySave(alloc: Allocator, key: []const u8, deps: ApiKeySaveDeps) Ap
         return .reload_failed;
     };
     const credential = loaded orelse return .reload_failed;
-    if (credential.source != .stored_key) {
+    if (credential.source != .stored_key and credential.source != .direct_provider) {
         var wrong = credential;
         wrong.deinit(alloc);
         return .reload_failed;
@@ -1408,7 +1409,7 @@ pub const StatusSnapshot = struct {
         if (self.active_source != null) return null;
         if (self.stored_key_status == .unavailable) {
             if (self.required_source == .stored_key) return switch (surface) {
-                .cli => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Start fx and open /provider to choose an available credential; no other credential was selected.",
+                .cli => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Start ffx and open /provider to choose an available credential; no other credential was selected.",
                 .interactive => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Run /provider to choose an available credential; no other credential was selected.",
             };
             return credentials.unreadable_store_message;
@@ -1422,21 +1423,21 @@ pub const StatusSnapshot = struct {
         };
         const required_source = self.required_source orelse return automatic_help;
         return switch (required_source) {
-            .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected.",
-            .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected.",
+            .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting ffx; no other credential was selected.",
+            .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting ffx; no other credential was selected.",
             .stored_key => switch (surface) {
-                .cli => "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected.",
+                .cli => "A stored API key is selected but unavailable. Start ffx and open /provider to choose an available credential; no other credential was selected.",
                 .interactive => "A stored API key is selected but unavailable. Run /provider to choose an available credential; no other credential was selected.",
             },
             .fx_login => switch (surface) {
                 .cli => if (self.fx_login_status == .unavailable)
-                    "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
+                    "The saved ffx login could not be loaded. Run ffx login to repair this source; no other credential was selected."
                 else
-                    "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.",
+                    "ffx login is selected but unavailable. Run ffx login to reconnect; no other credential was selected.",
                 .interactive => if (self.fx_login_status == .unavailable)
-                    "The saved fx login could not be loaded. Run /login to repair this source; no other credential was selected."
+                    "The saved ffx login could not be loaded. Run /login to repair this source; no other credential was selected."
                 else
-                    "fx login is selected but unavailable. Run /login to reconnect; no other credential was selected.",
+                    "ffx login is selected but unavailable. Run /login to reconnect; no other credential was selected.",
             },
             .chatgpt_subscription => switch (surface) {
                 .cli => credentials.missing_chatgpt_credential_message,
@@ -1446,6 +1447,7 @@ pub const StatusSnapshot = struct {
                 .cli => credentials.missing_grok_credential_message,
                 .interactive => credentials.missing_grok_interactive_credential_message,
             },
+            .direct_provider => automatic_help,
             .host_managed => automatic_help,
         };
     }
@@ -1563,6 +1565,23 @@ pub fn loadStatusSnapshotForProvider(
         .chatgpt_connected = chatgpt_connected,
         .grok_connected = grok_connected,
     };
+}
+
+pub fn loadStatusSnapshotForDirectProvider(
+    alloc: Allocator,
+    provider: []const u8,
+    env_var: []const u8,
+) !StatusSnapshot {
+    const credential = try credentials.resolveDirectProvider(alloc, host.unavailable_secret_store, provider, env_var);
+    if (credential) |loaded| {
+        var owned = loaded;
+        owned.deinit(alloc);
+        return .{
+            .active_source = .direct_provider,
+            .gateway_connected = true,
+        };
+    }
+    return .{ .required_source = .direct_provider };
 }
 
 pub const View = struct {
@@ -2232,6 +2251,18 @@ pub const Runtime = struct {
         self.api_key_inline = true;
     }
 
+    /// Opens the inline key field for a direct provider. Direct provider keys
+    /// use their provider-scoped store and must not be written to the Gateway
+    /// credential slot.
+    pub fn openApiKeyPickerInlineForProvider(
+        self: *Self,
+        alloc: Allocator,
+        provider: model_provider.ProviderId,
+    ) void {
+        self.provider_picker_active = provider;
+        self.openApiKeyPickerInline(alloc);
+    }
+
     pub fn apiKeyInlineActive(self: *const Self) bool {
         return self.apiKeyEntryActive() and self.api_key_inline;
     }
@@ -2402,6 +2433,17 @@ pub const Runtime = struct {
     /// store write can block for seconds on a locked keychain, and the gateway
     /// check is a network round trip; neither may run on the event loop.
     pub fn beginApiKeySave(self: *Self, alloc: Allocator) ApiKeySaveStart {
+        if (self.provider_picker_active != .gateway and
+            self.provider_picker_active != .codex and
+            self.provider_picker_active != .grok)
+        {
+            return self.beginApiKeySaveWithDeps(alloc, .{
+                .ctx = self,
+                .validator = .{ .validate_fn = validateDirectApiKey },
+                .store = storeDirectRuntimeSecret,
+                .loader = loadDirectRuntimeCredential,
+            });
+        }
         return self.beginApiKeySaveWithDeps(alloc, .{
             .ctx = self,
             .validator = self.api_key_validator,
@@ -2995,6 +3037,22 @@ fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !vo
     return self.secret_store.store(alloc, value);
 }
 
+fn validateDirectApiKey(_: ?*anyopaque, _: Allocator, value: []const u8) api_key_validator.Result {
+    return if (std.mem.trim(u8, value, " \t\r\n").len > 0) .accepted else .refused;
+}
+
+fn storeDirectRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
+    const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    const provider = builtin_providers.byId(model_provider.registryId(self.provider_picker_active)) orelse return error.UnknownProvider;
+    return credentials.storeDirectProviderKey(alloc, provider.id, value);
+}
+
+fn loadDirectRuntimeCredential(raw: ?*anyopaque, alloc: Allocator, _: credentials.Source) !?credentials.Credential {
+    const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    const provider = builtin_providers.byId(model_provider.registryId(self.provider_picker_active)) orelse return null;
+    return credentials.resolveDirectProvider(alloc, self.secret_store, provider.id, provider.env_var);
+}
+
 fn storeUnavailableSecret(_: ?*anyopaque, _: Allocator, _: []const u8) !void {
     return error.StoredKeyWriteFailed;
 }
@@ -3239,13 +3297,13 @@ test "auth failure snapshot keeps refresh failures distinct from HTTP rejection"
 
     const message = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(message);
-    try std.testing.expectEqualStrings("fx login credential refresh failed", message);
+    try std.testing.expectEqualStrings("ffx login credential refresh failed", message);
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("fx login", parsed.value.object.get("source").?.string);
+    try std.testing.expectEqualStrings("ffx login", parsed.value.object.get("source").?.string);
     try std.testing.expectEqualStrings("credential_refresh_failed", parsed.value.object.get("reason").?.string);
     try std.testing.expect(parsed.value.object.get("http_status") == null);
 
@@ -3410,7 +3468,7 @@ test "auth runtime exposes one current Gateway credential for prompt admission" 
     try std.testing.expectEqual(credentials.Source.fx_login, gateway_credential.source);
 }
 
-test "auth runtime never admits a teamless fx login credential" {
+test "auth runtime never admits a teamless ffx login credential" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -3421,7 +3479,7 @@ test "auth runtime never admits a teamless fx login credential" {
     try std.testing.expect(runtime.gatewayCredential() == null);
 }
 
-test "auth runtime withholds an fx credential across its expiry boundary" {
+test "auth runtime withholds an ffx credential across its expiry boundary" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -3734,9 +3792,9 @@ test "auth status names each explicit key source and its recovery" {
         cli_recovery: []const u8,
         interactive_recovery: []const u8,
     }{
-        .{ .source = .vercel_oidc_token, .label = "VERCEL_OIDC_TOKEN", .cli_recovery = "Set VERCEL_OIDC_TOKEN before starting fx", .interactive_recovery = "Set VERCEL_OIDC_TOKEN before starting fx" },
-        .{ .source = .ai_gateway_api_key, .label = "AI_GATEWAY_API_KEY", .cli_recovery = "Set AI_GATEWAY_API_KEY before starting fx", .interactive_recovery = "Set AI_GATEWAY_API_KEY before starting fx" },
-        .{ .source = .stored_key, .label = "stored API key", .cli_recovery = "Start fx and open /provider", .interactive_recovery = "Run /provider" },
+        .{ .source = .vercel_oidc_token, .label = "VERCEL_OIDC_TOKEN", .cli_recovery = "Set VERCEL_OIDC_TOKEN before starting ffx", .interactive_recovery = "Set VERCEL_OIDC_TOKEN before starting ffx" },
+        .{ .source = .ai_gateway_api_key, .label = "AI_GATEWAY_API_KEY", .cli_recovery = "Set AI_GATEWAY_API_KEY before starting ffx", .interactive_recovery = "Set AI_GATEWAY_API_KEY before starting ffx" },
+        .{ .source = .stored_key, .label = "stored API key", .cli_recovery = "Start ffx and open /provider", .interactive_recovery = "Run /provider" },
     };
     for (cases) |case| {
         const status = StatusSnapshot{ .required_source = case.source };
@@ -3769,14 +3827,14 @@ test "auth status preserves selected stored-key read failure without suggesting 
     try std.testing.expect(status.missingHelp(.cli) == null);
 }
 
-test "auth status keeps an unavailable explicit fx login distinct from automatic absence" {
+test "auth status keeps an unavailable explicit ffx login distinct from automatic absence" {
     for ([_]credentials.FxLoginReadStatus{ .absent, .unavailable }) |read_status| {
         const status = StatusSnapshot{
             .required_source = .fx_login,
             .fx_login_status = read_status,
         };
         const help = status.missingHelp(.cli).?;
-        try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
+        try std.testing.expect(std.mem.find(u8, help, "Run ffx login") != null);
         try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
         const interactive = status.missingHelp(.interactive).?;
         try std.testing.expect(std.mem.find(u8, interactive, "Run /login") != null);
@@ -3791,7 +3849,7 @@ test "auth status snapshot reports an expired session without claiming it is unr
     const fresh_detail = try fresh.formatDoctorDetail(alloc);
     defer alloc.free(fresh_detail);
     try std.testing.expectEqualStrings(
-        "fx login is configured; refreshable=true; team=vercel-labs",
+        "ffx login is configured; refreshable=true; team=vercel-labs",
         fresh_detail,
     );
 
@@ -3799,7 +3857,7 @@ test "auth status snapshot reports an expired session without claiming it is unr
     const stale_detail = try stale.formatDoctorDetail(alloc);
     defer alloc.free(stale_detail);
     try std.testing.expectEqualStrings(
-        "fx login is configured; session expired; refreshable=true; team=vercel-labs",
+        "ffx login is configured; session expired; refreshable=true; team=vercel-labs",
         stale_detail,
     );
 
@@ -4129,7 +4187,7 @@ const LogoutFixture = struct {
     }
 };
 
-test "logout replaces an active fx login with the next available source" {
+test "logout replaces an active ffx login with the next available source" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -4203,7 +4261,7 @@ test "logout clears the active login and re-enables auth selection when no sourc
     try std.testing.expect(!runtime.view().onboarding_skipped);
 }
 
-test "logout reconciliation adopts a newer concurrent fx login" {
+test "logout reconciliation adopts a newer concurrent ffx login" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -4316,7 +4374,7 @@ test "provider picker projects the active Vercel team" {
     try std.testing.expectEqualStrings("team_1", current_team.?);
 }
 
-test "adopting fx login publishes Vercel session availability to setup" {
+test "adopting ffx login publishes Vercel session availability to setup" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);

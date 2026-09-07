@@ -40,10 +40,10 @@ function createFixture(prefix: string) {
   const workspace = join(root, "workspace");
   const tracePath = join(root, "trace.log");
   const stderrPath = join(root, "stderr.log");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace);
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({
       permission_mode: "yolo",
       sandbox: "os",
@@ -148,7 +148,7 @@ function schemaFromRequest(body: string): Record<string, unknown> {
 }
 
 function terminalRecords(home: string): Array<Record<string, unknown>> {
-  const sessionsRoot = join(home, ".fx", "sessions");
+  const sessionsRoot = join(home, ".ffx", "sessions");
   if (!existsSync(sessionsRoot)) return [];
   return readdirSync(sessionsRoot).flatMap((sessionId) => {
     const terminalRoot = join(sessionsRoot, sessionId, "terminal", "state");
@@ -162,7 +162,7 @@ function terminalRecords(home: string): Array<Record<string, unknown>> {
 }
 
 async function cleanupTerminalHost(home: string): Promise<void> {
-  const identityPath = join(home, ".fx", "terminal-host-v7", "host.json");
+  const identityPath = join(home, ".ffx", "terminal-host-v7", "host.json");
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
     if (!existsSync(identityPath)) return;

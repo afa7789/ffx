@@ -285,11 +285,11 @@ function createIsolatedRoot(
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-web-search-e2e-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   const permission: Record<string, Record<string, string>> = {};
   if (webSearchPermission) permission.web_search = { "*": webSearchPermission };
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ ...settings, permission }));
+  writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({ ...settings, permission }));
   return { root, home, workspace: realpathSync(workspace) };
 }
 
@@ -966,7 +966,7 @@ describe("web_search Gateway fixture", () => {
           expect(gateway.requests[0].body).not.toContain('"thinking"');
 
           const stored = JSON.parse(
-            readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+            readFileSync(join(root.home, ".ffx", "settings.json"), "utf8"),
           );
           expect(stored.effort).toBe(testCase.effort);
           expect(stored.fast_mode).toBe(true);

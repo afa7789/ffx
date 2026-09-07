@@ -75,14 +75,14 @@ function createRoot(
   cleanupRoot = root;
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({}),
   );
   writeFileSync(
-    join(home, ".fx", "mcp.json"),
+    join(home, ".ffx", "mcp.json"),
     JSON.stringify({
       mcp: {
         fixture: {
@@ -199,7 +199,7 @@ describe("version-scoped legacy MCP remote transports", () => {
         sdkDiscoveryError,
       });
       const root = createRoot(`sdk-discovery-${sdkDiscoveryError}`, "http", streamable.url);
-      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profilePath = join(root.home, ".ffx", "mcp.json");
       const profile = JSON.parse(readFileSync(profilePath, "utf8"));
       profile.mcp.fixture.environment = { FX_MCP_PROTOCOL_VERSION: "2026-07-28" };
       writeFileSync(profilePath, JSON.stringify(profile));

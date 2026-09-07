@@ -157,13 +157,13 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
     defer row.deinit(alloc);
     try appendHeaderTitle(alloc, &row, projection.filteredItemCount());
 
-    const tabs = ProviderTabs.build(projection.items);
+    const tabs = ProviderTabs.build(projection);
     const active_position = tabs.activePosition(projection.provider_index);
     const active_index = tabs.indices[active_position];
     const title_width = display_width.visibleWidthIgnoringAnsi(row.items);
-    if (title_width + 2 + providerTabWidth(active_index, active_index) > width) {
+    if (title_width + 2 + providerTabWidth(projection, active_index, active_index) > width) {
         try row.appendSlice(alloc, "  ");
-        try appendProviderTabAt(alloc, &row, active_index, active_index);
+        try appendProviderTabAt(alloc, &row, projection, active_index, active_index);
         return cloneClippedRow(alloc, row.items, width);
     }
 
@@ -171,11 +171,11 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
     var end = active_position + 1;
     while (true) {
         var expanded = false;
-        if (end < tabs.len and title_width + 2 + providerRangeWidth(tabs, start, end + 1, active_index) <= width) {
+        if (end < tabs.len and title_width + 2 + providerRangeWidth(projection, tabs, start, end + 1, active_index) <= width) {
             end += 1;
             expanded = true;
         }
-        if (start > 0 and title_width + 2 + providerRangeWidth(tabs, start - 1, end, active_index) <= width) {
+        if (start > 0 and title_width + 2 + providerRangeWidth(projection, tabs, start - 1, end, active_index) <= width) {
             start -= 1;
             expanded = true;
         }
@@ -189,7 +189,7 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
     }
     for (start..end) |position| {
         if (position > start) try row.appendSlice(alloc, "  ");
-        try appendProviderTabAt(alloc, &row, tabs.indices[position], active_index);
+        try appendProviderTabAt(alloc, &row, projection, tabs.indices[position], active_index);
     }
     if (end < tabs.len) {
         try row.appendSlice(alloc, "  ");
@@ -199,11 +199,18 @@ fn composeHeaderRow(alloc: Allocator, projection: ModelMenuProjection, width: u1
 }
 
 const ProviderTabs = struct {
-    indices: [model_cache_runtime.model_provider_filter_count]usize = undefined,
+    indices: [64]usize = undefined,
     len: usize = 0,
 
-    fn build(items: []const model_cache_runtime.ModelMenuItem) ProviderTabs {
+    fn build(projection: ModelMenuProjection) ProviderTabs {
         var tabs: ProviderTabs = .{};
+        if (projection.provider_tabs.len > 0) {
+            const count = @min(model_cache_runtime.modelMenuDynamicTabCount(projection.provider_tabs), tabs.indices.len);
+            for (0..count) |index| tabs.indices[index] = index;
+            tabs.len = count;
+            return tabs;
+        }
+        const items = projection.items;
         for (0..model_cache_runtime.model_provider_filter_count) |index| {
             const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
             if (!model_cache_runtime.modelProviderFilterAvailable(items, filter)) continue;
@@ -240,10 +247,11 @@ fn appendProviderTab(alloc: Allocator, row: *std.ArrayList(u8), label: []const u
 fn appendProviderTabAt(
     alloc: Allocator,
     row: *std.ArrayList(u8),
+    projection: ModelMenuProjection,
     index: usize,
     active_index: usize,
 ) !void {
-    try appendProviderTab(alloc, row, providerTabLabel(index), index == active_index);
+    try appendProviderTab(alloc, row, providerTabLabel(projection, index), index == active_index);
 }
 
 fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void {
@@ -252,7 +260,8 @@ fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void
     try row.appendSlice(alloc, ui_render.reset_style);
 }
 
-fn providerTabLabel(index: usize) []const u8 {
+fn providerTabLabel(projection: ModelMenuProjection, index: usize) []const u8 {
+    if (projection.provider_tabs.len > 0) return model_cache_runtime.modelMenuDynamicTabLabel(projection.provider_tabs, index);
     const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
     return switch (filter) {
         .all => "All",
@@ -264,12 +273,13 @@ fn providerTabLabel(index: usize) []const u8 {
     };
 }
 
-fn providerTabWidth(index: usize, active_index: usize) usize {
+fn providerTabWidth(projection: ModelMenuProjection, index: usize, active_index: usize) usize {
     const active_padding: usize = if (index == active_index) 2 else 0;
-    return display_width.visibleWidth(providerTabLabel(index)) + active_padding;
+    return display_width.visibleWidth(providerTabLabel(projection, index)) + active_padding;
 }
 
 fn providerRangeWidth(
+    projection: ModelMenuProjection,
     tabs: ProviderTabs,
     start: usize,
     end: usize,
@@ -278,7 +288,7 @@ fn providerRangeWidth(
     var width: usize = if (start > 0) 3 else 0;
     for (start..end) |position| {
         if (position > start) width += 2;
-        width += providerTabWidth(tabs.indices[position], active_index);
+        width += providerTabWidth(projection, tabs.indices[position], active_index);
     }
     if (end < tabs.len) width += 3;
     return width;
@@ -310,6 +320,7 @@ fn composeTitleRow(
     const indent_width: u16 = if (width <= 2) 0 else 2;
     if (indent_width > 0) try row.appendSlice(alloc, "  ");
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
+    if (item.favorite) try row.appendSlice(alloc, "* ");
 
     var facts: std.ArrayList(u8) = .empty;
     defer facts.deinit(alloc);
@@ -420,6 +431,7 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
             .grok_subscription => "Grok catalog: authenticated with a subscription.",
             .host_managed => "Provider catalog: authentication is managed by the host.",
+            .direct_provider => "Provider catalog: authenticated with the selected provider key.",
         };
     }
     return null;

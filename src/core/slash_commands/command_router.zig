@@ -201,8 +201,11 @@ test "parse extracts an optional logout provider" {
     }
 }
 
-test "parse rejects removed plural model command" {
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/models"));
+test "parse accepts the plural model command alias" {
+    switch (parse(testSlashRegistry(), "/models")) {
+        .model => |query| try std.testing.expectEqualStrings("", query),
+        else => return error.TestExpectedModelCommand,
+    }
 }
 
 test "provider arguments belong to the inline picker, not the router" {

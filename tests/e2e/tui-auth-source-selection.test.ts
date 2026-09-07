@@ -211,7 +211,7 @@ function writeSeededChatGptLogin(
   accessToken = chatgptAccessToken(),
   expiresAtMs = Date.now() + 60 * 60 * 1000,
 ): void {
-  const fxDir = join(testHome, ".fx");
+  const fxDir = join(testHome, ".ffx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
   const authPath = join(fxDir, "chatgpt-auth.json");
@@ -231,7 +231,7 @@ function writeSeededGrokLogin(
   accountId = "acct_grok_e2e",
   expiresAtMs = Date.now() + 60 * 60 * 1000,
 ): void {
-  const fxDir = join(testHome, ".fx");
+  const fxDir = join(testHome, ".ffx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
   const authPath = join(fxDir, "grok-auth.json");
@@ -255,7 +255,7 @@ function readSingleUsageSnapshot(testHome: string): {
   models: Array<{ model: string; request_count: number | null }>;
   pending: unknown[];
 } {
-  const sessionsDir = join(testHome, ".fx", "sessions");
+  const sessionsDir = join(testHome, ".ffx", "sessions");
   const usagePaths = readdirSync(sessionsDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => join(sessionsDir, entry.name, "usage-v2.json"))
@@ -281,7 +281,7 @@ function writeSeededFxLogin(
   issuer = "https://vercel.com",
   teamId?: string,
 ): void {
-  const fxDir = join(testHome, ".fx");
+  const fxDir = join(testHome, ".ffx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
   const authPath = join(fxDir, "auth.json");
@@ -1209,7 +1209,7 @@ function startFakeGrokResourceRecovery() {
 }
 
 for (const provider of ["gateway", "codex", "grok"] as const) {
-  tmuxTest(`pending ${provider} prompt retries repaired credential storage without changing accounts`, async () => {
+  tmuxTest(`profile-backed ${provider} prompt uses persisted credentials without Keychain`, async () => {
     home = mkdtempSync(join(tmpdir(), "fx-prompt-storage-retry-"));
     stderrPath = join(home, "stderr.log");
     gateway = startFakeGateway([fakeGatewayFinalText("GATEWAY_STORAGE_RECOVERED")]);
@@ -1220,14 +1220,11 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
       writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
       writeSeededChatGptLogin(home);
       writeSeededGrokLogin(home, grok.initialAccessToken);
-      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+      writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({
         provider,
         credential_source: "fx_login",
         models: { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.6-sol", grok: "grok-4.20" },
       }));
-      const name = provider === "gateway" ? "auth.json" : provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json";
-      const alias = join(home, "auth.alias");
-      linkSync(join(home, ".fx", name), alias);
       session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
         FX_MODEL: undefined,
         ...chatgptOauth.env,
@@ -1236,16 +1233,6 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
       await session.waitForComposer(TIMEOUT);
       const prompt = `STORAGE_RETRY_${provider}`;
       await session.sendText(prompt);
-      await session.waitForPane((pane) => pane.includes(prompt) && pane.slice(pane.lastIndexOf(prompt) + prompt.length).includes("Auth:"), TIMEOUT);
-      const scrollback = await session.captureFullScrollback();
-      expect(scrollback.slice(scrollback.lastIndexOf(prompt) + prompt.length)).toContain("Saved credential storage is unavailable");
-      expect(gateway.requests).toHaveLength(0);
-      expect(oauth.requests).toHaveLength(0);
-      expect(chatgptOauth.requests).toHaveLength(0);
-      expect(grok.requests).toHaveLength(0);
-
-      unlinkSync(alias);
-      await session.sendKeys("Enter");
       await session.waitForText(provider === "gateway" ? "GATEWAY_STORAGE_RECOVERED" : provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
       const requests = provider === "gateway" ? gateway.requests : provider === "codex"
         ? chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses")
@@ -1257,7 +1244,7 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
       } else {
         expect(gateway.requests).toHaveLength(0);
       }
-      expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe(provider);
+      expect(JSON.parse(readFileSync(join(home, ".ffx", "settings.json"), "utf8")).provider).toBe(provider);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       grok.stop();
@@ -1277,7 +1264,7 @@ for (const provider of ["codex", "grok"] as const) {
     try {
       writeSeededChatGptLogin(home, chatgptOauth.accessToken);
       writeSeededGrokLogin(home, grok.initialAccessToken);
-      const settingsPath = join(home, ".fx", "settings.json");
+      const settingsPath = join(home, ".ffx", "settings.json");
       writeFileSync(settingsPath, JSON.stringify({
         provider, models: { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.6-sol", grok: "grok-4.6" },
       }), { mode: 0o600 });
@@ -1292,7 +1279,7 @@ for (const provider of ["codex", "grok"] as const) {
       await session.waitForText(`Signed out of ${provider === "codex" ? "Codex" : "Grok"}.`, TIMEOUT);
       await openProviderPicker(session);
       expect(await session.capturePane()).toContain("vercel · current");
-      expect(existsSync(join(home, ".fx", provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json"))).toBe(false);
+      expect(existsSync(join(home, ".ffx", provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json"))).toBe(false);
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
       await session.sendKeys("Escape");
       await session.sendKeys("C-u");
@@ -1354,7 +1341,7 @@ for (const provider of ["codex", "grok"] as const) {
       await session.sendText("Use the subscription immediately after sign-in.");
       await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
       expect(gateway.requests).toHaveLength(1);
-      expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe(provider);
+      expect(JSON.parse(readFileSync(join(home, ".ffx", "settings.json"), "utf8")).provider).toBe(provider);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       release();
@@ -1374,7 +1361,7 @@ for (const gatewayState of ["absent", "rejected"] as const) {
     try {
       writeSeededChatGptLogin(home, chatgptOauth.accessToken);
       writeSeededGrokLogin(home, grok.initialAccessToken);
-      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+      writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({
         provider: "codex", models: { codex: "gpt-5.6-sol", grok: "grok-4.6" },
       }), { mode: 0o600 });
       session = await startFx(home, stderrPath, gateway, undefined, undefined, {
@@ -1390,7 +1377,7 @@ for (const gatewayState of ["absent", "rejected"] as const) {
       await session.sendKeys("C-u");
       await session.sendText("Use the remaining subscription.");
       await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
-      expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("grok");
+      expect(JSON.parse(readFileSync(join(home, ".ffx", "settings.json"), "utf8")).provider).toBe("grok");
       expect(grok.requests.filter((request) => request.path === "/oauth2/token")).toHaveLength(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
@@ -1409,16 +1396,16 @@ for (const otherProvider of ["codex", "grok"] as const) {
     writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
     if (otherProvider === "codex") writeSeededChatGptLogin(home);
     else writeSeededGrokLogin(home, "other-grok-token");
-    const otherPath = join(home, ".fx", otherProvider === "codex" ? "chatgpt-auth.json" : "grok-auth.json");
+    const otherPath = join(home, ".ffx", otherProvider === "codex" ? "chatgpt-auth.json" : "grok-auth.json");
     const otherCredential = readFileSync(otherPath, "utf8");
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "gateway", credential_source: "fx_login" }));
+    writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({ provider: "gateway", credential_source: "fx_login" }));
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
       AI_GATEWAY_API_KEY: undefined,
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/status");
     await session.waitForText("auth=fx login", TIMEOUT);
-    const authPath = join(home, ".fx", "auth.json");
+    const authPath = join(home, ".ffx", "auth.json");
     linkSync(authPath, join(home, "login.alias"));
     await session.sendText("/logout");
     const result = await session.waitForPane(
@@ -1440,7 +1427,7 @@ tmuxTest("provider recovery stays signed out when no replacement is connected", 
   gateway = startFakeGateway([]);
   chatgptOauth = startFakeChatGptOAuth();
   writeSeededChatGptLogin(home, chatgptOauth.accessToken);
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+  writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({
     provider: "codex", models: { codex: "gpt-5.6-sol" },
   }), { mode: 0o600 });
   session = await startFx(home, stderrPath, gateway, undefined, undefined, {
@@ -1454,7 +1441,7 @@ tmuxTest("provider recovery stays signed out when no replacement is connected", 
   expect(pane).not.toContain("codex · current");
   expect(pane).not.toContain("vercel · current");
   expect(pane).not.toContain("grok · current");
-  expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+  expect(existsSync(join(home, ".ffx", "chatgpt-auth.json"))).toBe(false);
   expect(gateway.requests).toHaveLength(0);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, 60_000);
@@ -1466,8 +1453,8 @@ tmuxTest("provider recovery refuses active logout before deleting a busy subscri
   gateway = startFakeGateway([]);
   chatgptOauth = startFakeChatGptOAuth({ responseDelayMs: 10_000 });
   writeSeededChatGptLogin(home, chatgptOauth.accessToken);
-  const authPath = join(home, ".fx", "chatgpt-auth.json");
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+  const authPath = join(home, ".ffx", "chatgpt-auth.json");
+  writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({
     provider: "codex", models: { codex: "gpt-5.6-sol" },
   }), { mode: 0o600 });
   session = await startFx(home, stderrPath, gateway, undefined, undefined, {
@@ -1533,8 +1520,8 @@ tmuxTest("provider recovery validates a Gateway team after a cancelled turn", as
 
 tmuxTest("pending Gateway prompt waits for valid saved preferences and a repaired login", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-prompt-preference-retry-"));
-  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
-  const settingsPath = join(home, ".fx", "settings.json");
+  mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
+  const settingsPath = join(home, ".ffx", "settings.json");
   const settings = JSON.stringify({ provider: "gateway", credential_source: "fx_login", models: { gateway: FAKE_GATEWAY_MODEL } });
   writeFileSync(settingsPath, settings);
   stderrPath = join(home, "stderr.log");
@@ -1583,7 +1570,7 @@ test("Vercel CLI keeps an issuer authorization denial distinct from persistence 
   expect(result.code).toBe(1);
   expect(result.stderr).toContain("authorization denied");
   expect(result.stderr).not.toContain("Credential could not be saved");
-  expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+  expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
   expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
 }, TIMEOUT);
 
@@ -1595,7 +1582,7 @@ test("Vercel CLI reports a post-authorization save failure without claiming auth
     teams: [{ id: "team_fixture", slug: "fixture", name: "Fixture" }],
   });
   writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
-  const authPath = join(home, ".fx", "auth.json");
+  const authPath = join(home, ".ffx", "auth.json");
   const previous = readFileSync(authPath, "utf8");
   const login = runFx(["login", "vercel"], { env: {
     HOME: home,
@@ -1637,12 +1624,12 @@ tmuxTest(
         writeSeededGrokLogin(home, grok.initialAccessToken);
         if (damage === "malformed") {
           for (const name of ["auth.json", "chatgpt-auth.json", "grok-auth.json"]) {
-            writeFileSync(join(home, ".fx", name), "not-json", { mode: 0o600 });
+            writeFileSync(join(home, ".ffx", name), "not-json", { mode: 0o600 });
           }
         } else {
           for (const name of ["auth.lock", "chatgpt-auth.lock", "grok-auth.lock"]) {
-            writeFileSync(join(home, ".fx", name), "");
-            chmodSync(join(home, ".fx", name), 0o400);
+            writeFileSync(join(home, ".ffx", name), "");
+            chmodSync(join(home, ".ffx", name), 0o400);
           }
         }
         session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
@@ -1797,7 +1784,7 @@ tmuxTest(
     writeSeededChatGptLogin(home);
     writeSeededGrokLogin(home, grok.initialAccessToken);
     for (const name of ["auth.json", "chatgpt-auth.json", "grok-auth.json"]) {
-      linkSync(join(home, ".fx", name), join(home, `${name}.alias`));
+      linkSync(join(home, ".ffx", name), join(home, `${name}.alias`));
     }
     const env = {
       HOME: home,
@@ -1814,7 +1801,7 @@ tmuxTest(
     };
     try {
       for (const provider of ["gateway", "codex", "grok"]) {
-        writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({
           provider,
           credential_source: "fx_login",
           models: { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.6-sol", grok: "grok-4.20" },
@@ -1884,7 +1871,7 @@ tmuxTest(
         if (provider === "codex") writeSeededChatGptLogin(home);
         else writeSeededGrokLogin(home, grok.initialAccessToken);
         const name = provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json";
-        const original = join(home, ".fx", name);
+        const original = join(home, ".ffx", name);
         linkSync(original, join(home, `${name}.alias`));
         await completeDisplayedSubscriptionLogin(
           session,
@@ -1921,7 +1908,7 @@ tmuxTest(
     writeSeededChatGptLogin(home);
     writeSeededGrokLogin(home, grok.initialAccessToken);
     for (const name of ["auth.json", "chatgpt-auth.json", "grok-auth.json"]) {
-      linkSync(join(home, ".fx", name), join(home, `${name}.alias`));
+      linkSync(join(home, ".ffx", name), join(home, `${name}.alias`));
     }
     const env = {
       HOME: home,
@@ -1954,7 +1941,7 @@ tmuxTest(
       expect(await session.captureFullScrollback()).not.toContain("Sign in with Vercel");
       for (const name of ["auth.json", "chatgpt-auth.json", "grok-auth.json"]) {
         unlinkSync(join(home, `${name}.alias`));
-        chmodSync(join(home, ".fx", name), 0o400);
+        chmodSync(join(home, ".ffx", name), 0o400);
       }
       for (const provider of ["vercel", "codex", "grok"]) {
         const result = await runFx(["login", provider], { env, timeoutMs: 3000 });
@@ -1983,7 +1970,7 @@ tmuxTest(
     writeSeededChatGptLogin(home);
     writeSeededGrokLogin(home, "grok-initial-access-token");
     for (const name of ["chatgpt-auth.json", "grok-auth.json"]) {
-      linkSync(join(home, ".fx", name), join(home, `${name}.alias`));
+      linkSync(join(home, ".ffx", name), join(home, `${name}.alias`));
     }
     gateway = startFakeGateway([fakeGatewayFinalText("GATEWAY_WITH_UNAVAILABLE_SUBSCRIPTIONS")]);
     session = await startFx(home, stderrPath, gateway);
@@ -2003,7 +1990,7 @@ tmuxTest(
     await session.sendText("Keep using the working Gateway credential.");
     await session.waitForText("GATEWAY_WITH_UNAVAILABLE_SUBSCRIPTIONS", TIMEOUT);
     for (const name of ["chatgpt-auth.json", "grok-auth.json"]) {
-      expect(statSync(join(home, ".fx", name)).nlink).toBe(2);
+      expect(statSync(join(home, ".ffx", name)).nlink).toBe(2);
     }
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2019,7 +2006,7 @@ tmuxTest(
     writeSeededChatGptLogin(home);
     writeSeededGrokLogin(home, "grok-initial-access-token");
     for (const name of ["chatgpt-auth.json", "grok-auth.json"]) {
-      linkSync(join(home, ".fx", name), join(home, `${name}.alias`));
+      linkSync(join(home, ".ffx", name), join(home, `${name}.alias`));
     }
     gateway = startFakeGateway([]);
     chatgptOauth = startFakeChatGptOAuth();
@@ -2040,7 +2027,7 @@ tmuxTest(
         await session.waitForComposer(TIMEOUT);
 
         const name = provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json";
-        const original = join(home, ".fx", name);
+        const original = join(home, ".ffx", name);
         expect(statSync(original).nlink).toBe(2);
         expect(readFileSync(original, "utf8")).toBe(readFileSync(join(home, `${name}.alias`), "utf8"));
         unlinkSync(join(home, `${name}.alias`));
@@ -2051,7 +2038,7 @@ tmuxTest(
         await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
       }
       for (const name of ["chatgpt-auth.json", "grok-auth.json"]) {
-        expect(statSync(join(home, ".fx", name)).nlink).toBe(1);
+        expect(statSync(join(home, ".ffx", name)).nlink).toBe(1);
       }
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2101,7 +2088,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
 
     expect(session.isAlive()).toBe(true);
-    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
     expect(await session.captureFullScrollback()).not.toContain("Signed in to Vercel.");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -2153,7 +2140,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
 
     expect(session.isAlive()).toBe(true);
-    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".ffx", "chatgpt-auth.json"))).toBe(false);
     expect(await session.captureFullScrollback()).not.toContain("Signed in with Codex.");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -2186,7 +2173,7 @@ for (const [provider, previousProvider] of [
           const models = { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.6-sol", grok: "grok-4.20" };
           const model = models[provider];
           const otherModel = provider === "codex" ? "gpt-5.4-mini" : provider === "grok" ? "grok-4.6" : model;
-          const settingsPath = join(home, ".fx", "settings.json");
+          const settingsPath = join(home, ".ffx", "settings.json");
           writeFileSync(settingsPath, JSON.stringify({ provider, credential_source: "fx_login", models }) + "\n", { mode: 0o600 });
           const env = {
             HOME: home,
@@ -2311,7 +2298,7 @@ tmuxTest(
     writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
     writeSeededChatGptLogin(home, chatgptOauth.accessToken);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
+      join(home, ".ffx", "settings.json"),
       JSON.stringify({ credential_source: "fx_login" }) + "\n",
       { mode: 0o600 },
     );
@@ -2374,7 +2361,7 @@ tmuxTest(
     await completeDisplayedCodexLogin(session, chatgptOauth);
     await session.waitForText("Switched to Codex subscription with gpt-5.6-sol.", TIMEOUT);
 
-    const authPath = join(home, ".fx", "chatgpt-auth.json");
+    const authPath = join(home, ".ffx", "chatgpt-auth.json");
     expect(existsSync(authPath)).toBe(true);
     expect(statSync(authPath).mode & 0o077).toBe(0);
 
@@ -2447,7 +2434,7 @@ tmuxTest(
     const authorizeRequestsBeforeRoundTrip = chatgptOauth.requests.filter(
       (request) => request.path === "/oauth/authorize",
     ).length;
-    const settingsPath = join(home, ".fx", "settings.json");
+    const settingsPath = join(home, ".ffx", "settings.json");
     const gatewayModelBefore = JSON.parse(readFileSync(settingsPath, "utf8")).models.gateway;
     expect(typeof gatewayModelBefore).toBe("string");
     const savedCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
@@ -2544,7 +2531,7 @@ tmuxTest(
     await completeDisplayedCodexLogin(session, chatgptOauth);
     await session.waitForText("Switched to Codex subscription with gpt-5.6-sol.", TIMEOUT);
 
-    const selected = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+    const selected = JSON.parse(readFileSync(join(home, ".ffx", "settings.json"), "utf8"));
     expect(selected.provider).toBe("codex");
     expect(selected.models.codex).toBe("gpt-5.6-sol");
     await session.sendText("/status");
@@ -2564,7 +2551,7 @@ tmuxTest(
     chatgptOauth = startFakeChatGptOAuth({ responseDelayMs: 10_000 });
     writeSeededChatGptLogin(home, chatgptOauth.accessToken);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
+      join(home, ".ffx", "settings.json"),
       JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
       { mode: 0o600 },
     );
@@ -2610,7 +2597,7 @@ tmuxTest(
     chatgptOauth = startFakeChatGptOAuth({ rejectRefresh: true });
     writeSeededChatGptLogin(home, chatgptOauth.accessToken, Date.now() - 60_000);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
+      join(home, ".ffx", "settings.json"),
       JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
       { mode: 0o600 },
     );
@@ -2636,7 +2623,7 @@ tmuxTest(
       (request) => request.path === "/chatgpt/token" && request.body?.includes('"grant_type":"refresh_token"'),
     );
     expect(refreshRequests).toHaveLength(1);
-    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".ffx", "chatgpt-auth.json"))).toBe(false);
     expect(gateway.requests).toHaveLength(0);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
@@ -2653,7 +2640,7 @@ tmuxTest(
     const grok = startFakeGrokOAuth({ rejectRefresh: true });
     writeSeededGrokLogin(home, grok.initialAccessToken, "acct_grok_e2e", Date.now() - 60_000);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
+      join(home, ".ffx", "settings.json"),
       JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
       { mode: 0o600 },
     );
@@ -2679,7 +2666,7 @@ tmuxTest(
       expect(grok.requests.filter(
         (request) => request.path === "/oauth2/token" && request.body?.includes("grant_type=refresh_token"),
       )).toHaveLength(1);
-      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(false);
+      expect(existsSync(join(home, ".ffx", "grok-auth.json"))).toBe(false);
       expect(gateway.requests).toHaveLength(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
@@ -2692,7 +2679,7 @@ tmuxTest(
 test("Codex refresh save failure retires the consumed session", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-chatgpt-refresh-save-failure-"));
   gateway = startFakeGateway([]);
-  const authPath = join(home, ".fx", "chatgpt-auth.json");
+  const authPath = join(home, ".ffx", "chatgpt-auth.json");
   chatgptOauth = startFakeChatGptOAuth({
     beforeRefreshResponse() {
       chmodSync(authPath, 0o400);
@@ -2700,7 +2687,7 @@ test("Codex refresh save failure retires the consumed session", async () => {
   });
   writeSeededChatGptLogin(home, chatgptOauth.accessToken, Date.now() - 60_000);
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
     { mode: 0o600 },
   );
@@ -2729,7 +2716,7 @@ test("Codex refresh save failure retires the consumed session", async () => {
 test("Grok refresh save failure retires the consumed session", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-grok-refresh-save-failure-"));
   gateway = startFakeGateway([]);
-  const authPath = join(home, ".fx", "grok-auth.json");
+  const authPath = join(home, ".ffx", "grok-auth.json");
   const grok = startFakeGrokOAuth({
     beforeRefreshResponse() {
       chmodSync(authPath, 0o400);
@@ -2737,7 +2724,7 @@ test("Grok refresh save failure retires the consumed session", async () => {
   });
   writeSeededGrokLogin(home, grok.initialAccessToken, "acct_grok_e2e", Date.now() - 60_000);
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
     { mode: 0o600 },
   );
@@ -2878,8 +2865,8 @@ for (const [provider, help] of [
     home = mkdtempSync(join(tmpdir(), "fx-tui-status-provider-"));
     stderrPath = join(home, "stderr.log");
     writeFileSync(stderrPath, "");
-    mkdirSync(join(home, ".fx"));
-    const settingsPath = join(home, ".fx", "settings.json");
+    mkdirSync(join(home, ".ffx"));
+    const settingsPath = join(home, ".ffx", "settings.json");
     const settings = JSON.stringify({ provider, models: { [provider]: "test-model" } });
     writeFileSync(settingsPath, settings);
     gateway = startFakeGateway([]);
@@ -2913,8 +2900,8 @@ for (const [source, help] of [
     home = mkdtempSync(join(tmpdir(), "fx-status-explicit-key-"));
     stderrPath = join(home, "stderr.log");
     writeFileSync(stderrPath, "");
-    mkdirSync(join(home, ".fx"));
-    const settingsPath = join(home, ".fx", "settings.json");
+    mkdirSync(join(home, ".ffx"));
+    const settingsPath = join(home, ".ffx", "settings.json");
     const settings = JSON.stringify({ provider: "gateway", credential_source: source });
     writeFileSync(settingsPath, settings);
     gateway = startFakeGateway([fakeGatewayFinalText("EXPLICIT_KEY_RECOVERED")]);
@@ -2946,8 +2933,8 @@ tmuxTest("/status preserves a missing selected login through explicit key recove
   home = mkdtempSync(join(tmpdir(), "fx-status-selected-login-"));
   stderrPath = join(home, "stderr.log");
   writeFileSync(stderrPath, "");
-  mkdirSync(join(home, ".fx"));
-  const settingsPath = join(home, ".fx", "settings.json");
+  mkdirSync(join(home, ".ffx"));
+  const settingsPath = join(home, ".ffx", "settings.json");
   const settings = JSON.stringify({
     provider: "gateway",
     models: { gateway: FAKE_GATEWAY_MODEL },
@@ -2995,9 +2982,9 @@ for (const provider of ["codex", "grok"] as const) {
     writeFileSync(stderrPath, "");
     if (provider === "codex") writeSeededChatGptLogin(home);
     else writeSeededGrokLogin(home, "unreadable-grok-token");
-    const credentialPath = join(home, ".fx", provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json");
+    const credentialPath = join(home, ".ffx", provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json");
     linkSync(credentialPath, join(home, "credential.alias"));
-    const settingsPath = join(home, ".fx", "settings.json");
+    const settingsPath = join(home, ".ffx", "settings.json");
     const settings = JSON.stringify({ provider, models: { [provider]: "test-model" } });
     writeFileSync(settingsPath, settings);
     gateway = startFakeGateway([]);
@@ -3147,7 +3134,7 @@ async function selectEnvKeyCredential(pickerSession: TmuxSession): Promise<void>
 }
 
 function savedCredentialSource(testHome: string): string | undefined {
-  const settingsPath = join(testHome, ".fx", "settings.json");
+  const settingsPath = join(testHome, ".ffx", "settings.json");
   if (!existsSync(settingsPath)) return undefined;
   return (JSON.parse(readFileSync(settingsPath, "utf8")) as { credential_source?: string })
     .credential_source;
@@ -3188,7 +3175,7 @@ profileStoredKeyTmuxTest(
     await session.waitForText("auth=stored API key (profile file)", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("stored_key");
 
-    const keyPath = join(home, ".fx", "api-key");
+    const keyPath = join(home, ".ffx", "api-key");
     expect(readFileSync(keyPath, "utf8")).toBe(STORED_TOKEN);
     expect(statSync(keyPath).mode & 0o777).toBe(0o600);
 
@@ -3325,7 +3312,7 @@ tmuxTest(
     await session.waitForText("auth=fx login", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("fx_login");
 
-    const savedAuth = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as {
+    const savedAuth = JSON.parse(readFileSync(join(home, ".ffx", "auth.json"), "utf8")) as {
       team_id?: string;
       team_slug?: string;
     };
@@ -3352,7 +3339,7 @@ tmuxTest(
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-lifecycle-"));
     stderrPath = join(home, "stderr.log");
     writeFileSync(stderrPath, "");
-    const authPath = join(home, ".fx", "auth.json");
+    const authPath = join(home, ".ffx", "auth.json");
     gateway = startFakeGateway([
       fakeGatewayFinalText(ENV_RESPONSE),
       fakeGatewayFinalText(LOGIN_RESPONSE),
@@ -3675,7 +3662,7 @@ test(
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-login-client-fallback-"));
     writeSeededFxLogin(home);
-    const authPath = join(home, ".fx", "auth.json");
+    const authPath = join(home, ".ffx", "auth.json");
     gateway = startFakeGateway([]);
     oauth = startFakeOAuth(
       ACQUIRED_LOGIN_TOKEN,
@@ -3786,7 +3773,7 @@ test(
     expect(result.stdout).toContain("Selected Vercel team: Vercel Labs (vercel-labs).");
     expect(savedCredentialSource(home)).toBe("fx_login");
     const persisted = JSON.parse(
-      readFileSync(join(home, ".fx", "auth.json"), "utf8"),
+      readFileSync(join(home, ".ffx", "auth.json"), "utf8"),
     ) as {
       team_id?: string;
       team_slug?: string;
@@ -3838,7 +3825,7 @@ test(
     expect(result.stderr).toContain("selected team could not access AI Gateway");
     expect(savedCredentialSource(home)).toBeUndefined();
     const persisted = JSON.parse(
-      readFileSync(join(home, ".fx", "auth.json"), "utf8"),
+      readFileSync(join(home, ".ffx", "auth.json"), "utf8"),
     ) as {
       team_id?: string;
     };
@@ -3852,7 +3839,7 @@ test("fx logout clears a remembered fx login source", async () => {
   oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN);
   writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({ credential_source: "fx_login" }) + "\n",
     { mode: 0o600 },
   );
@@ -3873,14 +3860,14 @@ test("fx logout clears a remembered fx login source", async () => {
   expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
   expect(result.stdout).toContain("Signed out of fx.");
   expect(savedCredentialSource(home)).toBeUndefined();
-  expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+  expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
 });
 
 test("fx models does not retry anonymously for an explicit credential", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-cli-models-explicit-auth-"));
   writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, "https://vercel.com", "team_123");
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({ credential_source: "fx_login" }) + "\n",
     { mode: 0o600 },
   );
@@ -3915,9 +3902,9 @@ test("fx models does not retry anonymously for an explicit credential", async ()
 
 test("status never substitutes an environment key for a missing explicit login", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-cli-status-strict-source-"));
-  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({ credential_source: "fx_login" }) + "\n",
     { mode: 0o600 },
   );
@@ -3965,10 +3952,10 @@ test(
     expect(login.stdout).not.toContain("Code:");
     expect(login.stderr).toBe("");
 
-    const authPath = join(home, ".fx", "chatgpt-auth.json");
+    const authPath = join(home, ".ffx", "chatgpt-auth.json");
     expect(existsSync(authPath)).toBe(true);
     expect(statSync(authPath).mode & 0o077).toBe(0);
-    const settingsPath = join(home, ".fx", "settings.json");
+    const settingsPath = join(home, ".ffx", "settings.json");
     const selected = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(selected.provider).toBe("codex");
     expect(selected.models.codex).toBe("gpt-5.6-sol");
@@ -4063,10 +4050,10 @@ test(
       expect(login.stdout).toContain("Signed in with Grok.");
       expect(login.stderr).toBe("");
 
-      const authPath = join(home, ".fx", "grok-auth.json");
+      const authPath = join(home, ".ffx", "grok-auth.json");
       expect(existsSync(authPath)).toBe(true);
       expect(statSync(authPath).mode & 0o077).toBe(0);
-      const settings = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+      const settings = JSON.parse(readFileSync(join(home, ".ffx", "settings.json"), "utf8"));
       expect(settings.provider).toBe("grok");
       expect(settings.models.grok).toBe("grok-4.20");
 
@@ -4157,7 +4144,7 @@ test(
       expect(result.stdout).not.toContain("grok-code");
       expect(result.stderr).toBe("");
       expect(grok.tokenCalls()).toBe(1);
-      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+      expect(existsSync(join(home, ".ffx", "grok-auth.json"))).toBe(true);
     } finally {
       grok.stop();
     }
@@ -4171,11 +4158,11 @@ test("Grok logout removes local credentials when remote revocation fails", async
   try {
     writeSeededGrokLogin(home, grok.initialAccessToken);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
+      join(home, ".ffx", "settings.json"),
       JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
       { mode: 0o600 },
     );
-    const authPath = join(home, ".fx", "grok-auth.json");
+    const authPath = join(home, ".ffx", "grok-auth.json");
     const result = await runFx(["logout", "grok"], {
       env: {
         HOME: home,
@@ -4189,7 +4176,7 @@ test("Grok logout removes local credentials when remote revocation fails", async
     expect(result.stdout).toContain("Signed out of Grok.");
     expect(result.stderr).toContain("remote revocation could not be confirmed");
     expect(existsSync(authPath)).toBe(false);
-    expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider)
+    expect(JSON.parse(readFileSync(join(home, ".ffx", "settings.json"), "utf8")).provider)
       .toBe("grok");
     const ask = await runFx(["ask", "--json", "--no-save", "Still Grok?"], {
       env: { HOME: home, FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0" },
@@ -4206,7 +4193,7 @@ test("Grok logout removes malformed and unsafe local credentials", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-grok-logout-unreadable-"));
   const grok = startFakeGrokOAuth();
   try {
-    const authPath = join(home, ".fx", "grok-auth.json");
+    const authPath = join(home, ".ffx", "grok-auth.json");
     for (const failure of ["malformed", "unsafe"]) {
       writeSeededGrokLogin(home, grok.initialAccessToken);
       if (failure === "malformed") writeFileSync(authPath, "{invalid-json");
@@ -4240,7 +4227,7 @@ test("Grok 401 replay refuses a different account before the second provider sen
   try {
     writeSeededGrokLogin(home, grok.initialAccessToken);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
+      join(home, ".ffx", "settings.json"),
       JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
       { mode: 0o600 },
     );
@@ -4260,7 +4247,7 @@ test("Grok 401 replay refuses a different account before the second provider sen
     });
     expect(ask.code).toBe(1);
     expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(1);
-    expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".ffx", "grok-auth.json"))).toBe(false);
     for (const request of [...gateway.requests, ...gateway.modelRequests]) {
       expect(request.headers.get("authorization")).not.toContain("grok-");
     }
@@ -4276,7 +4263,7 @@ test("Grok CLI sends verified images directly without advertising the vision fal
   try {
     writeSeededGrokLogin(home, grok.initialAccessToken);
     writeFileSync(
-      join(home, ".fx", "settings.json"),
+      join(home, ".ffx", "settings.json"),
       JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
       { mode: 0o600 },
     );
@@ -4371,7 +4358,7 @@ tmuxTest(
       }
       await session.sendKeys("Escape");
       await session.waitForComposer(TIMEOUT);
-      const settingsPath = join(home, ".fx", "settings.json");
+      const settingsPath = join(home, ".ffx", "settings.json");
       const persistenceDeadline = Date.now() + TIMEOUT;
       let saved: { provider: string; models: { grok: string } } | undefined;
       while (Date.now() < persistenceDeadline) {
@@ -4449,7 +4436,7 @@ tmuxTest(
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).not.toContain("grok-code");
       expect(grok.tokenCalls()).toBe(1);
-      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+      expect(existsSync(join(home, ".ffx", "grok-auth.json"))).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       grok.stop();
@@ -4468,7 +4455,7 @@ tmuxTest(
     try {
       writeSeededGrokLogin(home, grok.initialAccessToken);
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ provider: "grok", grok_model: "grok-4.20", statusLine: { context: true } }) + "\n",
         { mode: 0o600 },
       );
@@ -4496,7 +4483,7 @@ tmuxTest(
       expect(body.model).toBe("grok-4.6");
       expect(body.reasoning?.effort).toBe("xhigh");
       expect(await session.capturePane()).toContain("/500k");
-      expect(readFileSync(join(home, ".fx", "settings.json"), "utf8")).toContain('"effort":"xhigh"');
+      expect(readFileSync(join(home, ".ffx", "settings.json"), "utf8")).toContain('"effort":"xhigh"');
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       grok.stop();
@@ -4515,7 +4502,7 @@ tmuxTest(
     try {
       writeSeededGrokLogin(home, grok.accessToken, "acct_resource_limit");
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
         { mode: 0o600 },
       );
@@ -4589,7 +4576,7 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
       try {
         if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
         else writeSeededGrokLogin(profile, direct.accessToken);
-        writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+        writeFileSync(join(profile, ".ffx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
         const env = {
           HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
           FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
@@ -4671,7 +4658,7 @@ test("native assistant messages keep their boundaries and phases through tools a
     try {
       if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
       else writeSeededGrokLogin(profile, direct.accessToken);
-      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, ".ffx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
       writeFileSync(join(profile, "notes.txt"), "42\n");
       const env = {
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
@@ -4738,7 +4725,7 @@ test("native reasoning snapshots survive tools and saved resume exactly once", a
     try {
       if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
       else writeSeededGrokLogin(profile, direct.accessToken);
-      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, ".ffx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
       writeFileSync(join(profile, "notes.txt"), "SETTLED_READ_RESULT\n");
       const env = {
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
@@ -4762,7 +4749,7 @@ test("native reasoning snapshots survive tools and saved resume exactly once", a
       expect(result.output).toBe("REASONING_SNAPSHOT_OK");
       expect(first.stderr).toMatch(/^(?:● Reading\x1b\[0m\n)?Reading notes\.txt\n$/);
       expect(direct.bodies).toHaveLength(2);
-      const saved = readFileSync(join(profile, ".fx", "sessions", result.session_id, "events.jsonl"), "utf8");
+      const saved = readFileSync(join(profile, ".ffx", "sessions", result.session_id, "events.jsonl"), "utf8");
       expect(saved).toContain(signature);
       const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Continue without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
@@ -4812,7 +4799,7 @@ test("native final snapshots preserve completed items and reject conflicting kin
     try {
       if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
       else writeSeededGrokLogin(profile, direct.accessToken);
-      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, ".ffx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
       writeFileSync(join(profile, "notes.txt"), "SNAPSHOT_READ_RESULT\n");
       const tracePath = join(profile, "trace.log");
       const env = {
@@ -4897,7 +4884,7 @@ test("native discarded prose keeps tool continuation and saved resume valid", as
     try {
       if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
       else writeSeededGrokLogin(profile, direct.accessToken);
-      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, ".ffx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
       writeFileSync(join(profile, "notes.txt"), "FILTERED_READ_RESULT\n");
       const tracePath = join(profile, "trace.log");
       const env = {
@@ -4975,8 +4962,8 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
     try {
       if (provider === "codex") writeSeededChatGptLogin(profile, direct!.accessToken);
       else if (provider === "grok") writeSeededGrokLogin(profile, direct!.accessToken);
-      mkdirSync(join(profile, ".fx"), { recursive: true });
-      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [native ? provider + "_model" : "model"]: model }));
+      mkdirSync(join(profile, ".ffx"), { recursive: true });
+      writeFileSync(join(profile, ".ffx", "settings.json"), JSON.stringify({ provider, [native ? provider + "_model" : "model"]: model }));
       const env = {
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: native ? undefined : model,
         FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
@@ -4993,7 +4980,7 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
       const output = JSON.parse(result.stdout);
       expect(output.tool_calls).toEqual([]);
       if (native && !limited) {
-        const usage = JSON.parse(readFileSync(join(profile, ".fx", "sessions", output.session_id, "usage-v2.json"), "utf8"));
+        const usage = JSON.parse(readFileSync(join(profile, ".ffx", "sessions", output.session_id, "usage-v2.json"), "utf8"));
         expect(usage.snapshot.billing).toBe("incomplete");
       }
       if (rejected) {
@@ -5073,8 +5060,8 @@ test("provider SSE framing preserves saved and resumed answers", async () => {
     try {
       if (provider === "codex") writeSeededChatGptLogin(profile, direct!.accessToken);
       else if (provider === "grok") writeSeededGrokLogin(profile, direct!.accessToken);
-      mkdirSync(join(profile, ".fx"), { recursive: true });
-      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [native ? provider + "_model" : "model"]: model }));
+      mkdirSync(join(profile, ".ffx"), { recursive: true });
+      writeFileSync(join(profile, ".ffx", "settings.json"), JSON.stringify({ provider, [native ? provider + "_model" : "model"]: model }));
       const env = {
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: native ? undefined : model,
         FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
@@ -5151,7 +5138,7 @@ test("direct providers reconcile final text before saving or releasing tools", a
     try {
       if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
       else writeSeededGrokLogin(profile, direct.accessToken);
-      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, ".ffx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
       const env = {
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
         FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
@@ -5214,7 +5201,7 @@ test("direct providers keep images with their users through tools and resume", a
     try {
       if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
       else writeSeededGrokLogin(profile, direct.accessToken);
-      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, ".ffx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
       writeFileSync(join(profile, "fixture.txt"), "fixture text");
       const firstImage = readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"));
       const secondImage = readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png"));
@@ -5272,7 +5259,7 @@ test("direct providers keep images with their users through tools and resume", a
       const history = JSON.parse(detail.stdout).history;
       expect(history).toHaveLength(3);
       expect(history.map((turn: { user: { images?: unknown[] } }) => turn.user.images?.length ?? 0)).toEqual([1, 1, 0]);
-      const imageDir = join(profile, ".fx", "sessions", sessionId, "images");
+      const imageDir = join(profile, ".ffx", "sessions", sessionId, "images");
       const snapshotName = readdirSync(imageDir).find(name => name.endsWith(".bin") && readFileSync(join(imageDir, name)).equals(firstImage));
       expect(snapshotName).toBeDefined();
       writeFileSync(join(imageDir, snapshotName!), secondImage);
@@ -5309,10 +5296,10 @@ test("provider context accounting is independent of image encoding size", async 
       const direct = provider === "codex" ? startFakeCodexToolLoop({ responses, model, inputModalities: ["text", "image"] })
         : provider === "grok" ? startFakeGrokToolLoop({ responses, model }) : null;
       try {
-        mkdirSync(join(profile, ".fx"), { recursive: true });
+        mkdirSync(join(profile, ".ffx"), { recursive: true });
         if (provider === "codex") writeSeededChatGptLogin(profile, direct!.accessToken);
         if (provider === "grok") writeSeededGrokLogin(profile, direct!.accessToken);
-        writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+        writeFileSync(join(profile, ".ffx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
         const path = join(profile, "image.png"), trace = join(profile, "trace.log");
         writeFileSync(path, bytes);
         const result = await runFx(["ask", "--json", "--auto", "--no-save", "--image", path, "Describe the attached image."], {
@@ -5365,7 +5352,7 @@ test("direct provider tool identities obey the session boundary before execution
         else writeSeededGrokLogin(profile, direct.accessToken);
         const catalog = await (await fetch(direct.modelsUrl)).json();
         const model = provider === "codex" ? catalog.models[0].slug : catalog.data[0].id;
-        writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [`${provider}_model`]: model }), { mode: 0o600 });
+        writeFileSync(join(profile, ".ffx", "settings.json"), JSON.stringify({ provider, [`${provider}_model`]: model }), { mode: 0o600 });
         const env = {
           HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
           FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
@@ -5409,7 +5396,7 @@ test(
     try {
       writeSeededChatGptLogin(home, codex.accessToken);
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
         { mode: 0o600 },
       );
@@ -5456,7 +5443,7 @@ tmuxTest(
     try {
       writeSeededChatGptLogin(home, codex.accessToken);
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
         { mode: 0o600 },
       );
@@ -5492,7 +5479,7 @@ test(
     try {
       writeSeededGrokLogin(home, grok.accessToken, "acct_tool_loop");
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
         { mode: 0o600 },
       );
@@ -5553,8 +5540,8 @@ test(
     expect(login.code).toBe(1);
     expect(login.stdout).not.toContain("Signed in with Codex.");
     expect(login.stderr).toContain("fx login: could not load the target model catalog (malformed_response)");
-    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(true);
-    const settingsPath = join(home, ".fx", "settings.json");
+    expect(existsSync(join(home, ".ffx", "chatgpt-auth.json"))).toBe(true);
+    const settingsPath = join(home, ".ffx", "settings.json");
     expect(existsSync(settingsPath)).toBe(false);
   },
   60_000,
@@ -5585,8 +5572,8 @@ test(
       expect(login.code).toBe(1);
       expect(login.stdout).not.toContain("Signed in with Grok.");
       expect(login.stderr).toContain("fx login: target model catalog is empty");
-      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
-      expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
+      expect(existsSync(join(home, ".ffx", "grok-auth.json"))).toBe(true);
+      expect(existsSync(join(home, ".ffx", "settings.json"))).toBe(false);
     } finally {
       grok.stop();
     }
@@ -5608,7 +5595,7 @@ test(
     try {
       writeSeededChatGptLogin(home, codex.accessToken);
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
         { mode: 0o600 },
       );
@@ -5664,7 +5651,7 @@ test(
     try {
       writeSeededGrokLogin(home, grok.accessToken, "acct_vision");
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
         { mode: 0o600 },
       );
@@ -5774,7 +5761,7 @@ test(
         FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
         FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
       };
-      const settingsPath = join(home, ".fx", "settings.json");
+      const settingsPath = join(home, ".ffx", "settings.json");
       const routes = [
         { settings: { provider: "gateway", model: FAKE_GATEWAY_MODEL }, text: "GATEWAY_USAGE_OK" },
         { settings: { provider: "codex", codex_model: "gpt-5.6-sol" }, text: "CODEX_USAGE_OK" },
@@ -5834,7 +5821,7 @@ test(
     try {
       writeSeededChatGptLogin(home, codex.accessToken);
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
         { mode: 0o600 },
       );
@@ -5907,7 +5894,7 @@ test(
           writeSeededGrokLogin(testHome, direct.accessToken);
         }
         writeFileSync(
-          join(testHome, ".fx", "settings.json"),
+          join(testHome, ".ffx", "settings.json"),
           JSON.stringify(provider === "codex"
             ? { provider, codex_model: direct.workingModel }
             : { provider, grok_model: direct.workingModel }) + "\n",
@@ -5973,7 +5960,7 @@ test(
     try {
       writeSeededGrokLogin(home, grok.accessToken, "acct_auto_review");
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
         { mode: 0o600 },
       );
@@ -6047,7 +6034,7 @@ test(
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-login-client-fallback-failure-"));
     writeSeededFxLogin(home);
-    const authPath = join(home, ".fx", "auth.json");
+    const authPath = join(home, ".ffx", "auth.json");
     const seededAuthFile = readFileSync(authPath, "utf8");
     oauth = startFakeOAuth(
       ACQUIRED_LOGIN_TOKEN,
@@ -6098,7 +6085,7 @@ test(
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-login-client-no-fallback-"));
     writeSeededFxLogin(home);
-    const authPath = join(home, ".fx", "auth.json");
+    const authPath = join(home, ".ffx", "auth.json");
     const seededAuthFile = readFileSync(authPath, "utf8");
     oauth = startFakeOAuth(
       ACQUIRED_LOGIN_TOKEN,
@@ -6217,7 +6204,7 @@ tmuxTest(
     expect(
       loggedOut.match(/remote session could not be revoked/g) ?? [],
     ).toHaveLength(1);
-    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
 
     await session.sendText("/status");
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
@@ -6268,7 +6255,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
     await session.waitForText("Signed out of fx.", TIMEOUT);
-    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
 
     await session.sendText("/status");
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
@@ -6290,7 +6277,7 @@ tmuxTest(
     gateway = startFakeGateway([]);
     oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN);
     writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl);
-    const authPath = join(home, ".fx", "auth.json");
+    const authPath = join(home, ".ffx", "auth.json");
     chmodSync(authPath, 0o644);
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
@@ -6323,7 +6310,7 @@ tmuxTest(
     gateway = startFakeGateway([fakeGatewayFinalText(LOGIN_RESPONSE)]);
     oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN);
     writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl);
-    const fxDir = join(home, ".fx");
+    const fxDir = join(home, ".ffx");
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
       AI_GATEWAY_API_KEY: undefined,
@@ -6479,9 +6466,9 @@ tmuxTest(
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
     expect(JSON.parse(gateway.requests[2].body).tools ?? []).toHaveLength(0);
-    const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
+    const sessionIds = readdirSync(join(home, ".ffx", "sessions")).filter((id) => existsSync(join(home!, ".ffx", "sessions", id, "session.json")));
     expect(sessionIds).toHaveLength(1);
-    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
+    const historyPath = join(home, ".ffx", "sessions", sessionIds[0], "events.jsonl");
     const records = readFileSync(historyPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
     await session.sendKeys("C-u");
@@ -6513,7 +6500,7 @@ for (const outcome of ["failure", "cancel"] as const) {
     });
     const expiresAt = Date.now() + 80_000;
     writeSeededFxLogin(home, expiresAt, oauth.issuerUrl, "team_123");
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ credential_source: "fx_login" }));
+    writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({ credential_source: "fx_login" }));
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
       FX_TRACE_SCOPES: "auth,input,worker,context_compaction,session",
     }, home);
@@ -6522,9 +6509,9 @@ for (const outcome of ["failure", "cancel"] as const) {
     await session.waitForText("AUTH_BOUNDARY_FIRST_REPLY", TIMEOUT);
     await session.sendText("Remember AUTH_BOUNDARY_SECOND.");
     await session.waitForText("AUTH_BOUNDARY_SECOND_REPLY", TIMEOUT);
-    const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
+    const sessionIds = readdirSync(join(home, ".ffx", "sessions")).filter((id) => existsSync(join(home!, ".ffx", "sessions", id, "session.json")));
     expect(sessionIds).toHaveLength(1);
-    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
+    const historyPath = join(home, ".ffx", "sessions", sessionIds[0], "events.jsonl");
     const before = readFileSync(historyPath, "utf8");
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
@@ -6781,7 +6768,7 @@ tmuxTest(
     stderrPath = join(home, "stderr.log");
     writeFileSync(stderrPath, "");
     gateway = startFakeGateway([]);
-    const authPath = join(home, ".fx", "auth.json");
+    const authPath = join(home, ".ffx", "auth.json");
     oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
       tokenDelayMs: 5_000,
       beforeRefreshResponse() {
@@ -7163,7 +7150,7 @@ tmuxTest(
     expect(firstFailure).not.toContain("Choose another source");
     expect(gateway.requests).toHaveLength(0);
     expect(gateway.modelRequests).toHaveLength(1);
-    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
       "GET /.well-known/openid-configuration",
       "POST /oauth/token",
@@ -7538,7 +7525,7 @@ tmuxTest("Codex discovers upstream versions and refreshes models in an open sess
   stderrPath = join(home, "stderr.log");
   gateway = startFakeGateway([]);
   writeSeededChatGptLogin(home);
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+  writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({
     provider: "codex",
     models: { codex: "gpt-5.6-luna" },
   }) + "\n", { mode: 0o600 });
@@ -7629,7 +7616,7 @@ test("Grok refreshes upstream versions for catalogs and responses and survives l
   });
   try {
     writeSeededGrokLogin(home, grok.initialAccessToken);
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+    writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({
       provider: "grok", models: { grok: "grok-4.20" },
     }) + "\n", { mode: 0o600 });
     const env = {
@@ -7642,7 +7629,7 @@ test("Grok refreshes upstream versions for catalogs and responses and survives l
       FX_E2E_GROK_VERSION_URL: `http://127.0.0.1:${releases.port}/stable`,
       FX_E2E_GROK_CLIENT_VERSION: undefined,
     };
-    const cachePath = join(home, ".fx", "provider-versions", "grok.json");
+    const cachePath = join(home, ".ffx", "provider-versions", "grok.json");
     const expireCache = () => {
       const cached = JSON.parse(readFileSync(cachePath, "utf8"));
       cached.checked_at_ms = 0;
@@ -7673,7 +7660,7 @@ test("Grok refreshes upstream versions for catalogs and responses and survives l
     const malformed = await runFx(["models", "--json"], { env });
     expect(malformed.code).toBe(1);
     expect(existsSync(cachePath)).toBe(false);
-    expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+    expect(existsSync(join(home, ".ffx", "grok-auth.json"))).toBe(true);
     failure = "slow";
     const started = Date.now();
     const timedOut = await runFx(["models", "--json"], { env, timeoutMs: 8000 });
@@ -7711,7 +7698,7 @@ for (const provider of ["codex", "grok"] as const) {
       try {
         writeSeededChatGptLogin(home, chatgptOauth.accessToken);
         writeSeededGrokLogin(home, grok.initialAccessToken);
-        const settingsPath = join(home, ".fx", "settings.json");
+        const settingsPath = join(home, ".ffx", "settings.json");
         writeFileSync(settingsPath, JSON.stringify({ provider: "gateway", models: { gateway: FAKE_GATEWAY_MODEL } }));
         session = await startFx(home, stderrPath, gateway, undefined, join(home, "trace.log"), {
           ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,prompt,input,provider",
@@ -7828,8 +7815,8 @@ for (const outcome of ["cancel", "failure"] as const) {
     chatgptOauth = startFakeChatGptOAuth();
     writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_previous");
     writeSeededChatGptLogin(home, chatgptOauth.accessToken);
-    const settingsPath = join(home, ".fx", "settings.json");
-    const authPath = join(home, ".fx", "auth.json");
+    const settingsPath = join(home, ".ffx", "settings.json");
+    const authPath = join(home, ".ffx", "auth.json");
     writeFileSync(settingsPath, JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol", gateway: "openai/gpt-5.6-sol" } }));
     const beforeAuth = readFileSync(authPath, "utf8");
     try {
@@ -7895,7 +7882,7 @@ tmuxTest("provider preparation cancellation stops logout fallback", async () => 
   try {
     writeSeededChatGptLogin(home, chatgptOauth.accessToken);
     writeSeededGrokLogin(home, grok.initialAccessToken);
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+    writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
     session = await startFx(home, stderrPath, gateway, undefined, undefined, { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0" });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
@@ -7905,8 +7892,8 @@ tmuxTest("provider preparation cancellation stops logout fallback", async () => 
     release();
     await Bun.sleep(100);
     expect(grok.requests.filter((request) => request.path === "/v1/models")).toHaveLength(0);
-    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
-    expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+    expect(existsSync(join(home, ".ffx", "chatgpt-auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".ffx", "grok-auth.json"))).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     await session.sendText("/quit");
     await session.waitForSessionEnd(3000);
@@ -7931,7 +7918,7 @@ tmuxTest("provider recovery continues after a held prompt and failed catalog", a
   try {
     writeSeededChatGptLogin(home, chatgptOauth.accessToken);
     writeSeededGrokLogin(home, grok.initialAccessToken);
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+    writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
     const trace = join(home, "trace.log");
     session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
     await session.waitForComposer(TIMEOUT);
@@ -7941,7 +7928,7 @@ tmuxTest("provider recovery continues after a held prompt and failed catalog", a
     await waitForTrace(trace, "pending_prompt_adopted", 3000);
     release();
     await session.waitForText("GROK_DIRECT_RESPONSE", 5000);
-    expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("grok");
+    expect(JSON.parse(readFileSync(join(home, ".ffx", "settings.json"), "utf8")).provider).toBe("grok");
     expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(1);
     expect(gateway.requests).toHaveLength(0);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -7996,8 +7983,8 @@ tmuxTest("provider preparation completes existing-key recovery for a held prompt
   gateway = startFakeGateway([fakeGatewayFinalText("KEY_RECOVERY_OK")]);
   chatgptOauth = startFakeChatGptOAuth();
   writeSeededChatGptLogin(home, chatgptOauth.accessToken);
-  linkSync(join(home, ".fx", "chatgpt-auth.json"), join(home, "auth-alias"));
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+  linkSync(join(home, ".ffx", "chatgpt-auth.json"), join(home, "auth-alias"));
+  writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
   const trace = join(home, "trace.log");
   session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
   await session.waitForComposer(TIMEOUT);
@@ -8013,7 +8000,7 @@ tmuxTest("provider preparation completes existing-key recovery for a held prompt
   await session.sendLiteral("env");
   await session.sendKeys("Enter");
   await session.waitForText("KEY_RECOVERY_OK", 5000);
-  expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("gateway");
+  expect(JSON.parse(readFileSync(join(home, ".ffx", "settings.json"), "utf8")).provider).toBe("gateway");
   expect(gateway.requests).toHaveLength(1);
   expect(JSON.stringify(gateway.requests[0]!.body)).toContain("Use the Gateway after repair.");
   expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);

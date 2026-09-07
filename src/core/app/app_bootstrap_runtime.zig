@@ -225,6 +225,7 @@ pub fn Runtime(comptime App: type) type {
             if (startup_auth_view.active_source == null and !startup_auth_view.onboarding_skipped) {
                 app.auth.openOnboardingPicker(app.alloc);
             }
+            _ = app.auth.view();
             if (comptime @hasField(App, "terminal_input_runtime") and @hasField(App, "terminal")) {
                 // Own theme protocol bytes even under FX_THEME; probing stays gated.
                 app.terminal_input_runtime.terminal_theme_monitor.start();
@@ -259,7 +260,14 @@ pub fn Runtime(comptime App: type) type {
             var selected_model = startup.takeSelectedModel();
             defer if (selected_model.len > 0) app.alloc.free(selected_model);
             if (comptime @hasField(App, "provider_selection")) {
-                app.provider_selection.adoptOwned(startup.provider, &selected_model);
+                if (startup.provider_key.len > 0)
+                    try app.provider_selection.adoptOwnedKey(startup.provider_key, startup.provider, &selected_model)
+                else
+                    app.provider_selection.adoptOwned(startup.provider, &selected_model);
+                if (startup.takeCustomProvider()) |custom| {
+                    var owned_custom = custom;
+                    if (comptime @hasDecl(App, "installCustomProvider")) app.installCustomProvider(&owned_custom) else owned_custom.deinit();
+                }
             } else {
                 try provider_runtime.replaceModel(app, selected_model);
             }
@@ -275,6 +283,9 @@ pub fn Runtime(comptime App: type) type {
                 startup.fast_mode_model_bound,
             );
             app.permission_engine.mode = startup.permission_mode;
+            if (comptime @hasField(App, "model_cache")) {
+                try app.model_cache.setFavoriteModels(startup.favorite_models.items);
+            }
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
             app.agent_step_limit = startup.agent_step_limit;
             app.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;

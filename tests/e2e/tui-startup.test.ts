@@ -173,12 +173,12 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       const workspace = join(repository, "packages", "status-root");
       const headPath = join(repository, ".git", "HEAD");
       const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(join(repository, ".git"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(headPath, "ref: refs/heads/initial-branch\n");
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         `${JSON.stringify({ statusLine: { workspace: true }, fast_mode: false })}\n`,
       );
       writeFileSync(stderrPath, "");
@@ -304,7 +304,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-startup-")));
       const home = join(root, "home");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
 
       let discoveryRequests = 0;
       const server = Bun.serve({
@@ -317,7 +317,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         },
       });
       writeFileSync(
-        join(home, ".fx", "mcp.json"),
+        join(home, ".ffx", "mcp.json"),
         JSON.stringify({
           mcp: {
             pending: {

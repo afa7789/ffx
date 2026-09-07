@@ -791,7 +791,7 @@ fn answerUrl(
 
     const failure_question = try std.fmt.allocPrint(
         alloc,
-        "fx could not open the browser for {s}. The URL was not fetched. Continue manually, retry the browser, or cancel?",
+        "ffx could not open the browser for {s}. The URL was not fetched. Continue manually, retry the browser, or cancel?",
         .{display_host},
     );
     defer alloc.free(failure_question);

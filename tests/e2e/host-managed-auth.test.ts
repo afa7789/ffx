@@ -146,7 +146,7 @@ describe("host-managed authentication", () => {
       expect(result.stderr).toBe("");
       expect(result.stdout).toBe("Authentication is managed by the host.\n");
     }
-    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
 
     for (const [provider, marker] of [
       ["gateway", "GATEWAY_HOST_MANAGED_OK"],
@@ -189,7 +189,7 @@ describe("host-managed authentication", () => {
       expect(request.headers.get("x-grok-user-id"), request.path).toBeNull();
       expect(request.headers.get("x-userid"), request.path).toBeNull();
     }
-    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
   }, TIMEOUT);
 
   test("rejects malformed auth mode before provider I/O", async () => {
@@ -223,7 +223,7 @@ describe("host-managed authentication", () => {
     expect(asked.code).toBe(1);
     const after = requests.filter((request) => request.path === "/codex/responses").length;
     expect(after - before).toBe(1);
-    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
   }, TIMEOUT);
 
   test("interactive host-managed session streams through the same authority", async () => {

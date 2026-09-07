@@ -45,14 +45,16 @@ const InlinePickerSuppression = union(enum) {
 
 pub const model_picker_fast_options = [_][]const u8{ "normal", "fast" };
 
-/// `/login` and `/setup` are aliases of `/provider`: all open the same
+/// `/login`, `/setup`, `/connect-provider`, and `/switch-provider` are aliases of `/provider`: all open the same
 /// columnar picker. Typed text keeps whichever spelling the user wrote;
 /// executing the bare command reseeds the composer with the canonical
 /// `/provider ` prefix.
 pub const provider_prefix = "/provider ";
 pub const login_prefix = "/login ";
 const setup_prefix = "/setup ";
-pub const provider_picker_prefixes = [_][]const u8{ provider_prefix, login_prefix, setup_prefix };
+const connect_provider_prefix = "/connect-provider ";
+const switch_provider_prefix = "/switch-provider ";
+pub const provider_picker_prefixes = [_][]const u8{ provider_prefix, login_prefix, setup_prefix, connect_provider_prefix, switch_provider_prefix };
 
 pub fn providerPickerPrefix(input: []const u8) ?[]const u8 {
     const trimmed = std.mem.trimStart(u8, input, " \t\r\n");
@@ -461,7 +463,7 @@ fn suppressionAfterEdit(
 pub fn isBareModelCommandAtCursor(editor: *const editor_state.State) bool {
     if (editor.cursor != editor.input.items.len) return false;
     const trimmed = std.mem.trimStart(u8, editor.input.items, " \t");
-    return std.ascii.eqlIgnoreCase(trimmed, "/model");
+    return std.ascii.eqlIgnoreCase(trimmed, "/model") or std.ascii.eqlIgnoreCase(trimmed, "/models");
 }
 
 pub fn filterCompletionLabels(query: []const u8, options: []const []const u8, out: [][]const u8) usize {

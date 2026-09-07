@@ -117,6 +117,7 @@ pub const ModelMenuItem = struct {
     id: []u8,
     provider: []const u8,
     capabilities: model_capabilities.Capabilities,
+    favorite: bool = false,
 
     fn deinit(self: ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
@@ -128,6 +129,9 @@ pub const ModelMenu = struct {
     load_state: ModelMenuLoadState = .loading,
     catalog_state: ModelMenuCatalogState = .{},
     items: std.ArrayList(ModelMenuItem) = .empty,
+    /// Provider labels are borrowed from the hydrated model items. The first
+    /// two logical tabs are Favorites and All; provider tabs follow them.
+    provider_tabs: std.ArrayList([]const u8) = .empty,
     provider_index: usize = 0,
     selected_index: usize = 0,
     window_start: usize = 0,
@@ -136,6 +140,7 @@ pub const ModelMenu = struct {
 
     pub fn deinit(self: *ModelMenu, alloc: Allocator) void {
         self.clearSnapshot(alloc);
+        self.provider_tabs.deinit(alloc);
         self.* = .{};
     }
 
@@ -152,14 +157,32 @@ pub const ModelMenu = struct {
     }
 
     pub fn providerFilter(self: *const ModelMenu) ModelProviderFilter {
+        if (self.provider_tabs.items.len > 0) return .all;
         return @enumFromInt(@min(self.provider_index, model_provider_filter_count - 1));
     }
 
     pub fn filteredItemCount(self: *const ModelMenu) usize {
+        if (self.provider_tabs.items.len > 0) {
+            return modelMenuDynamicFilteredItemCount(
+                self.items.items,
+                self.provider_tabs.items,
+                self.provider_index,
+                self.query(),
+            );
+        }
         return modelMenuFilteredItemCount(self.items.items, self.providerFilter(), self.query());
     }
 
     pub fn itemAt(self: *const ModelMenu, display_index: usize) ?*const ModelMenuItem {
+        if (self.provider_tabs.items.len > 0) {
+            return modelMenuDynamicItemAt(
+                self.items.items,
+                self.provider_tabs.items,
+                self.provider_index,
+                self.query(),
+                display_index,
+            );
+        }
         return modelMenuItemAt(self.items.items, self.providerFilter(), self.query(), display_index);
     }
 
@@ -183,6 +206,20 @@ pub const ModelMenu = struct {
 
     pub fn moveProvider(self: *ModelMenu, delta: i32) bool {
         if (!self.active or self.load_state != .ready or delta == 0) return false;
+        if (self.provider_tabs.items.len > 0) {
+            const tab_count = self.provider_tabs.items.len + 2;
+            if (tab_count <= 1) return false;
+            const current = @min(self.provider_index, tab_count - 1);
+            var next: i32 = @intCast(current);
+            next += if (delta < 0) -1 else 1;
+            if (next < 0) next = @as(i32, @intCast(tab_count)) - 1;
+            if (next >= @as(i32, @intCast(tab_count))) next = 0;
+            if (@as(usize, @intCast(next)) == current) return false;
+            self.provider_index = @intCast(next);
+            self.selected_index = 0;
+            self.window_start = 0;
+            return true;
+        }
         const filter_count = model_provider_filter_count;
         if (filter_count <= 1) return false;
 
@@ -214,6 +251,7 @@ pub const ModelMenu = struct {
         for (self.items.items) |item| item.deinit(alloc);
         self.items.deinit(alloc);
         self.items = .empty;
+        self.provider_tabs.clearRetainingCapacity();
         self.provider_index = 0;
         self.selected_index = 0;
         self.window_start = 0;
@@ -230,6 +268,68 @@ pub fn modelMenuFilteredItemCount(
         if (modelMenuItemMatches(item, provider_filter, query)) count += 1;
     }
     return count;
+}
+
+pub fn modelMenuDynamicTabCount(provider_tabs: []const []const u8) usize {
+    return if (provider_tabs.len == 0) 0 else provider_tabs.len + 2;
+}
+
+pub fn modelMenuDynamicTabLabel(provider_tabs: []const []const u8, tab_index: usize) []const u8 {
+    if (provider_tabs.len == 0) return "";
+    if (tab_index == 0) return "Favorites";
+    if (tab_index == 1) return "All";
+    const provider_index = tab_index - 2;
+    return if (provider_index < provider_tabs.len) provider_tabs[provider_index] else "";
+}
+
+pub fn modelMenuDynamicFilteredItemCount(
+    items: []const ModelMenuItem,
+    provider_tabs: []const []const u8,
+    tab_index: usize,
+    query: []const u8,
+) usize {
+    if (provider_tabs.len == 0) return 0;
+    var count: usize = 0;
+    for (items) |item| {
+        if (!modelMenuDynamicItemMatches(item, provider_tabs, tab_index, query)) continue;
+        count += 1;
+    }
+    return count;
+}
+
+pub fn modelMenuDynamicItemAt(
+    items: []const ModelMenuItem,
+    provider_tabs: []const []const u8,
+    tab_index: usize,
+    query: []const u8,
+    display_index: usize,
+) ?*const ModelMenuItem {
+    var current: usize = 0;
+    for (items) |*item| {
+        if (!modelMenuDynamicItemMatches(item.*, provider_tabs, tab_index, query)) continue;
+        if (current == display_index) return item;
+        current += 1;
+    }
+    return null;
+}
+
+fn modelMenuDynamicItemMatches(
+    item: ModelMenuItem,
+    provider_tabs: []const []const u8,
+    tab_index: usize,
+    query: []const u8,
+) bool {
+    if (tab_index == 0) {
+        if (!item.favorite) return false;
+    } else if (tab_index >= 2) {
+        const provider_index = tab_index - 2;
+        if (provider_index >= provider_tabs.len or
+            !std.ascii.eqlIgnoreCase(item.provider, provider_tabs[provider_index])) return false;
+    }
+    const query_text = std.mem.trim(u8, query, " \t\r\n");
+    return query_text.len == 0 or
+        text_utils.containsIgnoreCase(item.id, query_text) or
+        text_utils.containsIgnoreCase(item.provider, query_text);
 }
 
 pub fn modelMenuItemAt(
@@ -291,6 +391,7 @@ pub const Runtime = struct {
 
     alloc: Allocator,
     models_path: []const u8,
+    provider_label: []const u8 = "",
     catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
     mutex: std.Io.Mutex = .init,
     thread: ?std.Thread = null,
@@ -301,6 +402,7 @@ pub const Runtime = struct {
     requested_access: ?model_catalog.AccessMetadata = null,
     outcome: CatalogOutcome = .{},
     menu: ModelMenu = .{},
+    favorite_models: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -312,7 +414,69 @@ pub const Runtime = struct {
     pub fn deinit(self: *Self) void {
         self.cancelAndJoin();
         self.menu.deinit(self.alloc);
+        var favorites = self.favorite_models.iterator();
+        while (favorites.next()) |entry| self.alloc.free(entry.key_ptr.*);
+        self.favorite_models.deinit(self.alloc);
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+    }
+
+    pub fn setProviderLabel(self: *Self, label: []const u8) void {
+        self.provider_label = label;
+    }
+
+    pub fn setFavoriteModels(self: *Self, models: []const []u8) !void {
+        var next: std.StringHashMapUnmanaged(void) = .empty;
+        errdefer {
+            var iterator = next.iterator();
+            while (iterator.next()) |entry| self.alloc.free(entry.key_ptr.*);
+            next.deinit(self.alloc);
+        }
+        for (models) |model| {
+            if (next.contains(model)) continue;
+            const key = try self.alloc.dupe(u8, model);
+            errdefer self.alloc.free(key);
+            try next.put(self.alloc, key, {});
+        }
+        var old = self.favorite_models;
+        self.favorite_models = next;
+        var iterator = old.iterator();
+        while (iterator.next()) |entry| self.alloc.free(entry.key_ptr.*);
+        old.deinit(self.alloc);
+    }
+
+    pub fn isFavorite(self: *Self, model: []const u8) bool {
+        return self.favorite_models.contains(model);
+    }
+
+    /// Toggles one model and returns its new favorite state. The caller owns
+    /// persistence; this runtime only updates the live menu immediately.
+    pub fn toggleFavorite(self: *Self, model: []const u8) !bool {
+        const now_favorite = if (self.favorite_models.fetchRemove(model)) |removed| blk: {
+            self.alloc.free(removed.key);
+            break :blk false;
+        } else blk: {
+            const key = try self.alloc.dupe(u8, model);
+            errdefer self.alloc.free(key);
+            try self.favorite_models.put(self.alloc, key, {});
+            break :blk true;
+        };
+        if (self.menu.active) {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            try self.refreshMenuLocked(&self.menu);
+        }
+        return now_favorite;
+    }
+
+    pub fn favoriteModels(self: *Self, alloc: Allocator) !std.ArrayList([]u8) {
+        var result: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (result.items) |model| alloc.free(model);
+            result.deinit(alloc);
+        }
+        var iterator = self.favorite_models.iterator();
+        while (iterator.next()) |entry| try result.append(alloc, try alloc.dupe(u8, entry.key_ptr.*));
+        return result;
     }
 
     pub fn startWarmup(
@@ -730,7 +894,13 @@ pub const Runtime = struct {
                 menu.clearSnapshot(self.alloc);
                 menu.load_state = .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
+            .ready => try hydrateMenuSnapshot(
+                self.alloc,
+                menu,
+                self.catalog.items,
+                self.provider_label,
+                &self.favorite_models,
+            ),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome);
     }
@@ -768,6 +938,8 @@ fn hydrateMenuSnapshot(
     alloc: Allocator,
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
+    fallback_provider: []const u8,
+    favorites: *const std.StringHashMapUnmanaged(void),
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
@@ -780,13 +952,15 @@ fn hydrateMenuSnapshot(
         const item = item: {
             const id = try alloc.dupe(u8, entry.id);
             errdefer alloc.free(id);
+            const provider = modelProvider(id);
             break :item ModelMenuItem{
                 .id = id,
-                .provider = modelProvider(id),
+                .provider = if (provider.len > 0) provider else fallback_provider,
                 .capabilities = model_capabilities.resolveCapabilities(
                     id,
                     model_catalog_metadata.fromCatalogEntry(entry),
                 ),
+                .favorite = favorites.contains(entry.id),
             };
         };
         items.append(alloc, item) catch |err| {
@@ -797,6 +971,28 @@ fn hydrateMenuSnapshot(
 
     menu.clearSnapshot(alloc);
     menu.items = items;
+    if (fallback_provider.len > 0) {
+        for (menu.items.items) |item| {
+            const provider = if (item.provider.len > 0) item.provider else fallback_provider;
+            if (provider.len == 0) continue;
+            var present = false;
+            for (menu.provider_tabs.items) |existing| {
+                if (std.ascii.eqlIgnoreCase(existing, provider)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) try menu.provider_tabs.append(alloc, provider);
+        }
+        if (menu.provider_index == 0) {
+            var has_favorite = false;
+            for (menu.items.items) |item| if (item.favorite) {
+                has_favorite = true;
+                break;
+            };
+            if (!has_favorite) menu.provider_index = 1;
+        }
+    }
     menu.load_state = .ready;
 }
 
@@ -1393,7 +1589,8 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries);
+    var favorites: std.StringHashMapUnmanaged(void) = .empty;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, "", &favorites);
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -1440,7 +1637,8 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var mixed: ModelMenu = .{};
     defer mixed.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries);
+    var mixed_favorites: std.StringHashMapUnmanaged(void) = .empty;
+    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries, "", &mixed_favorites);
     mixed.active = true;
 
     try std.testing.expect(mixed.moveProvider(1));
@@ -1456,7 +1654,8 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var codex: ModelMenu = .{};
     defer codex.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &codex, &codex_entries);
+    var codex_favorites: std.StringHashMapUnmanaged(void) = .empty;
+    try hydrateMenuSnapshot(alloc, &codex, &codex_entries, "", &codex_favorites);
     codex.active = true;
 
     try std.testing.expect(!codex.moveProvider(1));
@@ -1472,14 +1671,16 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries);
+    var probe_favorites: std.StringHashMapUnmanaged(void) = .empty;
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, "", &probe_favorites);
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries)) {
+        var failing_favorites: std.StringHashMapUnmanaged(void) = .empty;
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, "", &failing_favorites)) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);

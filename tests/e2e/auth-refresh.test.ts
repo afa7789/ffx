@@ -30,7 +30,7 @@ function writeFxLogin(
   issuer = "https://vercel.com",
   expiresAtMs = Date.now() - 60_000,
 ): void {
-  const fxDir = join(home, ".fx");
+  const fxDir = join(home, ".ffx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
   const authPath = join(fxDir, "auth.json");
@@ -128,7 +128,7 @@ async function waitForFileText(path: string, text: string): Promise<void> {
 }
 
 function sessionIdsFromHome(home: string): string[] {
-  return readdirSync(join(home, ".fx", "sessions"), {
+  return readdirSync(join(home, ".ffx", "sessions"), {
     withFileTypes: true,
   })
     .filter((entry) => entry.isDirectory() && entry.name !== "latest")
@@ -140,7 +140,7 @@ test(
   "logout cannot be undone by an in-flight login refresh",
   async () => {
     const home = mkdtempSync(join(tmpdir(), "fx-auth-refresh-logout-race-e2e-"));
-    const contentionPath = join(home, ".fx", "auth-lock-contention");
+    const contentionPath = join(home, ".ffx", "auth-lock-contention");
     let releaseRefresh = () => {};
     const refreshMayFinish = new Promise<void>((resolve) => {
       releaseRefresh = resolve;
@@ -203,7 +203,7 @@ test(
       ).toBe(0);
       expect(logoutResult.stdout).toBe("Signed out of fx.\n");
       expect(tokenRequestCount).toBe(1);
-      expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+      expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
       const revocations = oauth.requests.filter(
         (request) => request.path === "/oauth/revoke",
       );
@@ -287,7 +287,7 @@ test(
       expect(oauth.requests[3].body).toContain("refresh_token=first-rotated-refresh-token");
 
       const persisted = JSON.parse(
-        readFileSync(join(home, ".fx", "auth.json"), "utf8"),
+        readFileSync(join(home, ".ffx", "auth.json"), "utf8"),
       );
       expect(persisted.access_token).toBe(RETRY_REFRESH_TOKEN);
       expect(persisted.refresh_token).toBe("second-rotated-refresh-token");
@@ -310,7 +310,7 @@ test(
     const home = mkdtempSync(join(tmpdir(), "fx-auth-expired-report-e2e-"));
     const oauth = startFakeOAuth([EXPIRED_REFRESH_TOKEN]);
     writeFxLogin(home, oauth.issuerUrl);
-    const authPath = join(home, ".fx", "auth.json");
+    const authPath = join(home, ".ffx", "auth.json");
     const seededAuthFile = readFileSync(authPath, "utf8");
     const env = {
       HOME: home,
@@ -579,7 +579,7 @@ test(
       expect(teams.stderr).toBe("");
 
       const persisted = JSON.parse(
-        readFileSync(join(home, ".fx", "auth.json"), "utf8"),
+        readFileSync(join(home, ".ffx", "auth.json"), "utf8"),
       );
       expect(persisted).toMatchObject({
         issuer: issuerA.issuerUrl,

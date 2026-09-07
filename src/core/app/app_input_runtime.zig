@@ -122,15 +122,22 @@ fn projectMcpPromptMayOwnInput(state: ProjectMcpPromptInputState) bool {
         !state.authentication_active;
 }
 
+fn modelCommandPrefix(input: []const u8) ?[]const u8 {
+    if (std.ascii.startsWithIgnoreCase(input, "/models") and
+        (input.len == "/models".len or input["/models".len] == ' ' or input["/models".len] == '\t')) return "/models";
+    if (std.ascii.startsWithIgnoreCase(input, "/model") and
+        (input.len == "/model".len or input["/model".len] == ' ' or input["/model".len] == '\t')) return "/model";
+    return null;
+}
+
 fn parseExplicitModelSelection(input: []const u8) ExplicitModelSelectionParse {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
-    if (!std.ascii.startsWithIgnoreCase(trimmed, "/model")) return .none;
-    if (trimmed.len == "/model".len) return .none;
-    if (trimmed["/model".len] != ' ' and trimmed["/model".len] != '\t') return .none;
+    const prefix = modelCommandPrefix(trimmed) orelse return .none;
+    if (trimmed.len == prefix.len) return .none;
 
     var tokens: [4][]const u8 = undefined;
     var token_count: usize = 0;
-    var iterator = std.mem.tokenizeAny(u8, trimmed["/model".len..], " \t\r\n");
+    var iterator = std.mem.tokenizeAny(u8, trimmed[prefix.len..], " \t\r\n");
     while (iterator.next()) |token| {
         if (token_count == tokens.len) return .invalid;
         tokens[token_count] = token;
@@ -1203,6 +1210,17 @@ pub fn Runtime(comptime App: type) type {
                         .limit_exceeded => try input_limit_feedback.report(App, app, .approval_amendment, 1),
                     }
                 }
+                return true;
+            }
+            if (modelMenuActive(app) and byte == 25) {
+                const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse return true;
+                defer app.alloc.free(selected);
+                if (comptime @hasDecl(App, "toggleModelFavorite")) {
+                    _ = app.toggleModelFavorite(selected) catch |err| {
+                        debug_trace.logf("model", "favorite toggle failed err={s}", .{@errorName(err)});
+                    };
+                }
+                app.shell.render_requests.request(.footer);
                 return true;
             }
             if (mcpMenuActive(app)) {
@@ -3117,7 +3135,7 @@ const routing_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "clear the terminal transcript", .presentation_category = .general },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
-    .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose a model", .presentation_category = .model, .has_args = true, .accepts_payload = true, .requires_prompt_credential = true },
+    .{ .kind = .model, .command = "/model", .aliases = &.{"/models"}, .help_entry = "/model (/models) <id-or-query>", .completion_description = "choose a model", .presentation_category = .model, .has_args = true, .accepts_payload = true, .requires_prompt_credential = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
 };

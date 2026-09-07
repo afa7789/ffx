@@ -60,9 +60,9 @@ async function launch(options: {
   const tapePath = join(workDir, "render.fxtape");
   const goldenPath = join(workDir, "grid.txt");
   const tracePath = join(workDir, "trace.log");
-  mkdirSync(join(workDir, ".fx"), { recursive: true });
+  mkdirSync(join(workDir, ".ffx"), { recursive: true });
   writeFileSync(
-    join(workDir, ".fx", "settings.json"),
+    join(workDir, ".ffx", "settings.json"),
     JSON.stringify({}),
   );
 
@@ -105,9 +105,9 @@ async function launchAutomaticRecording(options: {
   const workDir = mkdtempSync("/tmp/fx-render-auto-replay-");
   workDirs.push(workDir);
   const home = join(workDir, "home");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({}),
   );
 
@@ -133,7 +133,7 @@ async function launchAutomaticRecording(options: {
     await s.waitForText("visual terminal capture:", 10_000);
   }
   await s.waitForComposer(10_000);
-  const recordingsDir = join(home, ".fx", "recordings");
+  const recordingsDir = join(home, ".ffx", "recordings");
   const tapes = readdirSync(recordingsDir).filter((name) =>
     name.endsWith(".fxtape")
   );
@@ -422,7 +422,7 @@ describe("tui: render record/replay", () => {
       const launched = await launchAutomaticRecording();
       session = launched.session;
 
-      expect(launched.tapePath.startsWith(join(launched.home, ".fx", "recordings"))).toBe(true);
+      expect(launched.tapePath.startsWith(join(launched.home, ".ffx", "recordings"))).toBe(true);
       expect(statSync(launched.tapePath).mode & 0o077).toBe(0);
       expect(await session.captureFullScrollback()).toContain(
         "visual terminal capture:",

@@ -137,13 +137,13 @@ function gatewayEnv(home: string, gateway: ReturnType<typeof startFakeGateway>) 
 }
 
 function prepareFilesystem(paths: Paths, config: Config): void {
-  mkdirSync(join(paths.home, ".fx"), { recursive: true });
+  mkdirSync(join(paths.home, ".ffx"), { recursive: true });
   mkdirSync(paths.workspace);
   mkdirSync(paths.foreignWorkspace);
   writeFileSync(paths.stderr, "");
   writeFileSync(paths.trace, "");
   writeFileSync(
-    join(paths.home, ".fx", "settings.json"),
+    join(paths.home, ".ffx", "settings.json"),
     JSON.stringify({
       sandbox: "none",
       permission_mode: "auto",
@@ -252,7 +252,7 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
     await session.waitForPane((pane) =>
       stripAnsi(pane).includes(FINAL_MARKER) && hasEmptyComposer(pane),
     TIMEOUT * 20);
-    const savedSessionsRoot = join(paths.home, ".fx", "sessions");
+    const savedSessionsRoot = join(paths.home, ".ffx", "sessions");
     await session.waitForPane(() => readdirSync(savedSessionsRoot).some((id) => {
       const path = join(savedSessionsRoot, id, "events.jsonl");
       return existsSync(path) && readFileSync(path, "utf8").includes('"turn_completed"');
@@ -265,7 +265,7 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
   }
   expect(readFileSync(paths.stderr, "utf8")).toBe("");
 
-  const sessionsRoot = join(paths.home, ".fx", "sessions");
+  const sessionsRoot = join(paths.home, ".ffx", "sessions");
   const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name);
@@ -309,7 +309,7 @@ function installLargeCatalog(
   config: Config,
   real: IndexedSummary,
 ): void {
-  const sessionsRoot = join(paths.home, ".fx", "sessions");
+  const sessionsRoot = join(paths.home, ".ffx", "sessions");
   const base = Math.max(Date.now(), real.updated_at_ms + config.catalogEntries + 10);
   const entries: IndexedSummary[] = [{
     id: "resume-foreign-newest",
@@ -532,7 +532,7 @@ async function runStress(config: Config): Promise<Paths> {
   let passed = false;
   let cacheBuildMs = 0;
   try {
-    const cachePath = join(paths.home, ".fx", "sessions", ".resume-catalog");
+    const cachePath = join(paths.home, ".ffx", "sessions", ".resume-catalog");
     rmSync(cachePath, { force: true });
     const buildStarted = performance.now();
     session = await TmuxSession.create({
@@ -616,7 +616,7 @@ async function runStress(config: Config): Promise<Paths> {
 
     const report = {
       config,
-      catalogEntries: readdirSync(join(paths.home, ".fx", "sessions"), {
+      catalogEntries: readdirSync(join(paths.home, ".ffx", "sessions"), {
         withFileTypes: true,
       }).filter((entry) => entry.isDirectory()).length,
       transitions: {

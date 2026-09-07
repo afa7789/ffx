@@ -146,13 +146,13 @@ fn formatMcpIssuerMismatch(
             try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
             try out.writer.writeAll(". Add \"oauth\":{\"issuer\":");
             try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
-            try out.writer.writeAll("} to this server's entry in ~/.fx/mcp.json and retry.");
+            try out.writer.writeAll("} to this server's entry in ~/.ffx/mcp.json and retry.");
         },
         .authorization_response => {
             try out.writer.writeAll(" but the authorization response returned issuer ");
             try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
             try out.writer.writeAll(
-                ". fx stopped before token exchange. Contact the MCP server provider; changing oauth.issuer is not a safe workaround.",
+                ". ffx stopped before token exchange. Contact the MCP server provider; changing oauth.issuer is not a safe workaround.",
             );
         },
     }
@@ -554,14 +554,14 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "",
                     .tone = .neutral,
-                    .body = "Opened https://fx.sh/feedback.",
+                    .body = "Opened https://ffx.sh/feedback.",
                 }, true);
                 return;
             }
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .@"error",
-                .body = "Could not open https://fx.sh/feedback. Open it manually.",
+                .body = "Could not open https://ffx.sh/feedback. Open it manually.",
             }, true);
         }
 
@@ -2146,7 +2146,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(app.alloc);
     defer out.deinit();
 
-    try out.writer.writeAll("# fx trace\n\n");
+    try out.writer.writeAll("# ffx trace\n\n");
     try out.writer.writeAll("Private diagnostic report. It may include prompts, file paths, command output, and file snippets.\n\n");
 
     try out.writer.writeAll("## Summary\n");
@@ -3848,7 +3848,7 @@ const McpCommandFakeApp = struct {
             .display = .{
                 .line = try alloc.dupe(
                     u8,
-                    "Waiting for MCP authentication for 'fixture'. You can continue using fx while the browser flow completes.",
+                    "Waiting for MCP authentication for 'fixture'. You can continue using ffx while the browser flow completes.",
                 ),
             },
         };
@@ -4206,7 +4206,7 @@ test "trace auth summary preserves missing and loaded status text" {
     defer loaded.deinit();
     try writeAuthStateSummary(&loaded.writer, &app);
     try std.testing.expectEqualStrings(
-        "auth: source=fx login refreshable=true gateway_team=unset\n",
+        "auth: source=ffx login refreshable=true gateway_team=unset\n",
         loaded.written(),
     );
 }
@@ -4269,7 +4269,7 @@ test "trace successful tool calls use compact result previews" {
     var call: diagnostics.ToolCallMetric = .{ .started_at_ms = 3000, .duration_ms = 1, .outcome = .succeeded };
     call.setName("read_file");
     call.setArgs("{\"path\":\"README.md\"}");
-    call.setResult("<path>README.md</path>\n<content>\n# fx\n\nlong body line\n</content>");
+    call.setResult("<path>README.md</path>\n<content>\n# ffx\n\nlong body line\n</content>");
     diagnostics.recordToolCall(call);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -4278,7 +4278,7 @@ test "trace successful tool calls use compact result previews" {
     const text = out.written();
 
     try std.testing.expect(std.mem.find(u8, text, "recent successes (compact):") != null);
-    try std.testing.expect(std.mem.find(u8, text, "result_preview: # fx") != null);
+    try std.testing.expect(std.mem.find(u8, text, "result_preview: # ffx") != null);
     try std.testing.expect(std.mem.find(u8, text, "<path>README.md</path>") == null);
     try std.testing.expect(std.mem.find(u8, text, "long body line") == null);
 }
@@ -4869,12 +4869,12 @@ test "skills remove prefers a managed match after a workspace duplicate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeTempSkillFile(&tmp, "home/.fx/skills/review/SKILL.md", "---\nname: review\n---\nmanaged body\n");
+    try writeTempSkillFile(&tmp, "home/.ffx/skills/review/SKILL.md", "---\nname: review\n---\nmanaged body\n");
     try writeTempSkillFile(&tmp, "home/workspace/.agents/skills/review/SKILL.md", "---\nname: review\n---\nworkspace body\n");
 
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.ffx/skills");
     defer alloc.free(managed_root);
-    const managed_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills/review");
+    const managed_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.ffx/skills/review");
     defer alloc.free(managed_skill);
     const workspace_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace/.agents/skills/review");
     defer alloc.free(workspace_skill);
@@ -4906,7 +4906,7 @@ test "skills remove prefers a managed match after a workspace duplicate" {
     try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectError(
         error.FileNotFound,
-        tmp.dir.access(io_mod.getIo(), "home/.fx/skills/review", .{}),
+        tmp.dir.access(io_mod.getIo(), "home/.ffx/skills/review", .{}),
     );
     try tmp.dir.access(io_mod.getIo(), "home/workspace/.agents/skills/review/SKILL.md", .{});
 }

@@ -213,10 +213,10 @@ function createIsolatedRoot() {
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   const external = join(root, "external");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   mkdirSync(external, { recursive: true });
-  writeFileSync(join(home, ".fx", "settings.json"), "{}");
+  writeFileSync(join(home, ".ffx", "settings.json"), "{}");
   return {
     root,
     home: realpathSync(home),
@@ -614,7 +614,7 @@ describe("filesystem path handling", () => {
       const root = createIsolatedRoot();
       try {
         writeFileSync(
-          join(root.home, ".fx", "settings.json"),
+          join(root.home, ".ffx", "settings.json"),
           JSON.stringify({ sandbox: "none" }),
         );
         const cases = [
@@ -782,7 +782,7 @@ describe("filesystem path handling", () => {
         }
 
         writeFileSync(
-          join(root.home, ".fx", "settings.json"),
+          join(root.home, ".ffx", "settings.json"),
           JSON.stringify({
             permission: {
               edit: {
@@ -1095,7 +1095,7 @@ describe("filesystem path handling", () => {
         const editTarget = join(root.external, "edit.txt");
         writeFileSync(editTarget, "BEFORE_EDIT\n");
         writeFileSync(
-          join(root.home, ".fx", "settings.json"),
+          join(root.home, ".ffx", "settings.json"),
           JSON.stringify({
             permission: {
               edit: {

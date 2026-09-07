@@ -15,10 +15,10 @@ function createIsolatedRoot() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-web-search-live-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({
       model: OUTER_MODEL,
       permission: { web_search: { "*": "allow" } },

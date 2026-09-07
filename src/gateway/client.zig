@@ -2039,6 +2039,7 @@ fn spawn_gateway_cancel_watcher(
     if (builtin.is_test) {
         if (test_cancel_watcher_spawn_error) |err| return err;
     }
+    if (builtin.single_threaded) return error.Unsupported;
     return std.Thread.spawn(.{}, GatewayCancelWatcher.run, .{
         done,
         cancel_flag,

@@ -46,7 +46,7 @@ esac
 
 if [ "$SKIP_BUILD" = false ]; then
   echo "Building fx (ReleaseSafe)..."
-  (cd "$REPO_ROOT" && zig build -Doptimize=ReleaseSafe)
+  (cd "$REPO_ROOT" && zig build --release=safe)
 fi
 
 if [ ! -x "$FX_BIN" ]; then
@@ -57,12 +57,12 @@ fi
 mkdir -p "$RESULTS_DIR"
 rm -f "${RESULTS_DIR}/tasks.json"
 mkdir -p "$SESSION_FIXTURE_HOME" "$SESSION_FIXTURE_WORKSPACE" "$GENERAL_FIXTURE_HOME"
-mkdir -p "$GENERAL_FIXTURE_HOME/.fx"
-chmod 700 "$GENERAL_FIXTURE_HOME/.fx"
+mkdir -p "$GENERAL_FIXTURE_HOME/.ffx"
+chmod 700 "$GENERAL_FIXTURE_HOME/.ffx"
 printf '%s\n' \
   '{"model":"openai/gpt-5.4","effort":"high","fast_mode":false,"startup_scrollback":true,"prompt_history":{"enabled":true},"statusLine":{"sandbox":true,"context":true},"permission":{"bash":{"git status *":"allow"}}}' \
-  > "$GENERAL_FIXTURE_HOME/.fx/settings.json"
-chmod 600 "$GENERAL_FIXTURE_HOME/.fx/settings.json"
+  > "$GENERAL_FIXTURE_HOME/.ffx/settings.json"
+chmod 600 "$GENERAL_FIXTURE_HOME/.ffx/settings.json"
 python3 "${REPO_ROOT}/benchmarks/session_list_fixture.py" \
   --home "$SESSION_FIXTURE_HOME" \
   --workspace "$SESSION_FIXTURE_WORKSPACE"

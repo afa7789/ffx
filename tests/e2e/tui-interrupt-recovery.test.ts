@@ -71,9 +71,9 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
       const tapePath = join(root, "render.fxtape");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
 
       const held: HoldState = { started: false, cancelled: false, cancelCount: 0, released: false };
       gateway = startFakeGateway([
@@ -144,9 +144,9 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
       const tapePath = join(root, "render.fxtape");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       writeFileSync(join(workspace, "probe.txt"), "CANCEL_FOLLOW_UP_READ\n");
 
       const held: HoldState = { started: false, cancelled: false, cancelCount: 0, released: false };
@@ -233,9 +233,9 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
 
       const held: HoldState = {
         started: false,
@@ -307,7 +307,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
 
-      const sessionRoot = join(home, ".fx", "sessions");
+      const sessionRoot = join(home, ".ffx", "sessions");
       let eventsPath: string | undefined;
       await waitForCondition(() => {
         eventsPath = readdirSync(sessionRoot, { withFileTypes: true })
@@ -335,9 +335,9 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      const settingsPath = join(home, ".fx", "settings.json");
+      const settingsPath = join(home, ".ffx", "settings.json");
       writeFileSync(
         settingsPath,
         JSON.stringify({ model: FAKE_GATEWAY_MODEL }) + "\n",
@@ -467,7 +467,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(finalScrollback).not.toContain("HTTP 400");
 
-      const sessionRoot = join(home, ".fx", "sessions");
+      const sessionRoot = join(home, ".ffx", "sessions");
       const sessionIds = readdirSync(sessionRoot, { withFileTypes: true })
         .filter((entry) => entry.isDirectory())
         .map((entry) => entry.name)
@@ -507,7 +507,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const shared = join(root, "shared");
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       mkdirSync(observed, { recursive: true });
       mkdirSync(shared, { recursive: true });
@@ -515,7 +515,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const observedRoot = realpathSync(observed);
       const sharedRoot = realpathSync(shared);
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({
           sandbox: "none",
           permission_mode: "auto",
@@ -603,7 +603,7 @@ while :; do sleep 1; done
         TIMEOUT,
       );
       const beforeRetry = JSON.parse(
-        readFileSync(join(home, ".fx", "settings.json"), "utf8"),
+        readFileSync(join(home, ".ffx", "settings.json"), "utf8"),
       );
       expect(beforeRetry.workspaces[workspaceRoot].additional_directories).toEqual([
         observedRoot,
@@ -622,7 +622,7 @@ while :; do sleep 1; done
       await session.sendText(command);
       await session.waitForText("runtime_changed=true", TIMEOUT);
 
-      const stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+      const stored = JSON.parse(readFileSync(join(home, ".ffx", "settings.json"), "utf8"));
       expect(stored.workspaces[workspaceRoot].additional_directories).toEqual([
         observedRoot,
         sharedRoot,
@@ -646,9 +646,9 @@ while :; do sleep 1; done
       const tracePath = join(root, "trace.log");
       const pattern = "LATE_SUCCESS_NEEDLE";
       const callId = "late_success_grep";
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(corpus, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       for (let index = 0; index < 30_000; index += 1) {
         writeFileSync(
           join(corpus, `candidate-${String(index).padStart(5, "0")}.txt`),

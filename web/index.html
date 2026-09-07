@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ffx — native coding agent for the terminal</title>
+  <meta name="description" content="ffx is an open, native coding agent written in Zig with direct and custom AI provider support.">
+  <link rel="icon" href="ffx-favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="ffx home">
+      <img class="brand-mark" src="ffx-mark.svg" alt="">
+    </a>
+    <nav class="topnav" aria-label="Main navigation">
+      <a href="https://fx.sh">fx</a>
+      <a href="https://github.com/afa7789/ffx">source</a>
+    </nav>
+  </header>
+
+  <main id="main-content">
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <h1 id="hero-title">Tiny, open, native coding agent.</h1>
+      <a class="hero-command" href="#install"><span class="command-prefix"><span aria-hidden="true">$</span> curl -fsSL</span> <span class="command-url">https://raw.githubusercontent.com/<br class="mobile-break">afa7789/ffx/main/setup.sh</span> <span class="command-suffix">| bash</span></a>
+      <p class="hero-meta">v0.0.8 <span aria-hidden="true">·</span> Zig <span aria-hidden="true">·</span> status: experimental <span aria-hidden="true">(i)</span></p>
+
+      <div class="terminal-window" aria-label="ffx terminal preview">
+        <div class="terminal-chrome">
+          <span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>ffx</span>
+          <span aria-hidden="true">⌗</span>
+        </div>
+        <div class="terminal-body">
+          <p><span class="terminal-brand">𝒇𝒇x</span> v0.0.8 · Run /help for commands</p>
+          <p class="terminal-caret" aria-hidden="true">|</p>
+          <p class="terminal-status">auto · kimi-k3</p>
+        </div>
+      </div>
+
+      <p class="hero-sub">A coding agent written in Zig for your terminal. Open, embeddable, and free from mandatory Vercel login.</p>
+    </section>
+
+    <section class="differentiator" id="providers" aria-labelledby="providers-title">
+      <p class="section-label">01 / providers</p>
+      <h2 id="providers-title">Use the models you already pay for.</h2>
+      <p>ffx is a community fork of fx focused on provider freedom. Connect direct providers with your own credentials, or add any OpenAI-compatible, Anthropic, self-hosted, or custom endpoint.</p>
+      <ul>
+        <li>OpenAI, Anthropic, DeepSeek, OpenRouter, PPQ, MiniMax, Zhipu/GLM, Z.AI, and OpenCode</li>
+        <li>Persistent configuration in <code>~/.ffx/settings.json</code></li>
+        <li>Dynamic provider tabs, model discovery, and favorites in <code>/models</code></li>
+        <li>No mandatory Vercel account for direct providers</li>
+      </ul>
+      <div class="command-row">
+        <code>/connect-provider</code>
+        <code>/switch-provider</code>
+        <code>/models</code>
+      </div>
+    </section>
+
+    <section class="capability" id="docs" aria-labelledby="docs-title">
+      <p class="section-label">02 / capabilities</p>
+      <h2 id="docs-title">A small runtime with room to grow.</h2>
+      <div class="capability-grid">
+        <article>
+          <h3>Skills</h3>
+          <p>Discover skills without loading every instruction into every prompt.</p>
+          <pre><code>/skills
+/skills show &lt;name&gt;
+/skills install owner/repo --skill name</code></pre>
+        </article>
+        <article>
+          <h3>Subagents</h3>
+          <p>Create one-off or persistent child sessions with their own model, permissions, and history.</p>
+          <pre><code>ctrl+x  open subagent manager</code></pre>
+        </article>
+        <article>
+          <h3>MCP</h3>
+          <p>Connect local and remote MCP servers while keeping project trust and permission boundaries explicit.</p>
+          <pre><code>/mcp list
+/mcp add &lt;name&gt; &lt;command&gt;
+/mcp reload</code></pre>
+        </article>
+        <article>
+          <h3>Project instructions</h3>
+          <p>Load scoped <code>AGENTS.md</code> guidance for workspace conventions, security, and verification.</p>
+          <pre><code>project/
+├── AGENTS.md
+└── apps/web/AGENTS.md</code></pre>
+        </article>
+      </div>
+    </section>
+
+    <section class="cli-section" id="cli" aria-labelledby="cli-title">
+      <p class="section-label">03 / cli</p>
+      <h2 id="cli-title">Unix-like by design.</h2>
+      <p>Run an interactive session in a workspace or make one request and exit.</p>
+      <pre class="large-code"><code>ffx
+ffx ask "explain the changes in this repository"
+ffx sessions
+ffx status --json</code></pre>
+      <p>Inside a session, use <code>/help</code> to discover commands. The current directory is the primary workspace.</p>
+    </section>
+
+    <section class="install" id="install" aria-labelledby="install-title">
+      <p class="section-label">04 / try it</p>
+      <h2 id="install-title">Build it. Run it. Make it yours.</h2>
+      <pre class="large-code"><code>git clone https://github.com/afa7789/ffx.git
+cd ffx
+zig build -Doptimize=ReleaseSafe
+./zig-out/bin/ffx</code></pre>
+      <p class="install-note">Requires Zig 0.16 or newer. The binary is written to <code>./zig-out/bin/ffx</code>.</p>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p><a href="https://github.com/afa7789/ffx">Source</a> · <a href="https://github.com/afa7789/ffx/blob/main/CHANGELOG.md">Changelog</a> · <a href="https://github.com/vercel-labs/fx">Based on fx</a></p>
+    <p>Apache-2.0 · Built in Zig.</p>
+  </footer>
+</body>
+</html>

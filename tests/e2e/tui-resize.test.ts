@@ -70,8 +70,8 @@ async function createResizeSession(
     env.HOME = home;
   }
 
-  const settingsPath = join(home, ".fx", "settings.json");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  const settingsPath = join(home, ".ffx", "settings.json");
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   const settings = existsSync(settingsPath)
     ? JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>
     : {};
@@ -122,7 +122,7 @@ async function launchRecordedSurfaceSession(
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   const stderrPath = join(root, "stderr.log");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(join(workspace, "AGENTS.md"), "# Test workspace\n");
   writeFileSync(stderrPath, "");
@@ -716,7 +716,7 @@ function createSkillFixture(
   );
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  const skillsRoot = join(home, ".fx", "skills");
+  const skillsRoot = join(home, ".ffx", "skills");
   mkdirSync(skillsRoot, { recursive: true });
   mkdirSync(workspace, { recursive: true });
   if (!KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
@@ -999,10 +999,10 @@ function createFileApprovalRoot() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resize-file-approval-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
   );
   tempDirs.push(root);
@@ -1556,7 +1556,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
       tempDirs.push(root);
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(stderrPath, "");
 
@@ -1636,10 +1636,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const preFxMarker = "PRE_FX_RESIZE_STREAM_MARKER";
       const finalResponse = "RESIZE_STREAM_FINAL_RESPONSE";
       tempDirs.push(root);
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
       );
       writeFileSync(stderrPath, "");
@@ -1718,10 +1718,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
       tempDirs.push(root);
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
       );
       writeFileSync(stderrPath, "");
@@ -1857,10 +1857,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const approvalQuestion = "Would you like to run the following command?";
       const stableCommitTrace = "transcript_transition_commit state=stable";
       if (!KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(
-        join(home, ".fx", "settings.json"),
+        join(home, ".ffx", "settings.json"),
         JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
       );
       writeFileSync(stderrPath, "");
@@ -2031,7 +2031,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
       tempDirs.push(root);
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(stderrPath, "");
 
@@ -2118,7 +2118,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const tracePath = join(root, "trace.log");
       const tapePath = join(root, "session.fxtape");
       tempDirs.push(root);
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(stderrPath, "");
 
@@ -2279,7 +2279,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
       tempDirs.push(root);
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(stderrPath, "");
 
@@ -2402,9 +2402,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const tracePath = join(root, "trace.log");
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "session.fxtape");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       writeFileSync(stderrPath, "");
       if (!KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
 
@@ -2545,9 +2545,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const tracePath = join(root, "trace.log");
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "session.fxtape");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       writeFileSync(stderrPath, "");
       if (!KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
       writeFileSync(
@@ -2692,7 +2692,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       writeFileSync(stderrPath, "");
       tempDirs.push(root);
@@ -3656,7 +3656,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const secondMarker = "RESIZE_PREPAINT_TURN_B_COMPLETE";
       const launchCommand =
         `printf ${quoteShellPath(`${preFxMarker}\n`)}; exec ${quoteShellPath(FX_BIN)}`;
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
       tempDirs.push(root);
       const gateway = startFakeGateway([
@@ -4147,10 +4147,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
         const marker = `PRE_FX_MARKER_${startupScrollback ? "ON" : "OFF"}_6179`;
-        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(join(home, ".ffx"), { recursive: true });
         mkdirSync(workspace, { recursive: true });
         writeFileSync(
-          join(home, ".fx", "settings.json"),
+          join(home, ".ffx", "settings.json"),
           JSON.stringify({ startup_scrollback: startupScrollback }),
         );
         tempDirs.push(root);
@@ -4200,9 +4200,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "theme-reset.fxtape");
       tempDirs.push(root);
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       writeFileSync(stderrPath, "");
 
       const inlineMarker = "THEME_RESET_INLINE_CODE";

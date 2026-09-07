@@ -64,9 +64,9 @@ function createFixtureRoot(label: string): FixtureRoot {
   const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-gateway-lifecycle-${label}-`)));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
-  writeFileSync(join(home, ".fx", "settings.json"), "{}");
+  writeFileSync(join(home, ".ffx", "settings.json"), "{}");
   return { root, home, workspace: realpathSync(workspace) };
 }
 
@@ -87,7 +87,7 @@ function writeContextLimitFixture(root: FixtureRoot) {
     `---\nname: oversized-context\ndescription: ${"description-".repeat(12)}\n---\n\nSKILL_FIRST_LINE\n${"skill-body-line\n".repeat(12)}SKILL_TAIL_SENTINEL\n`,
   );
   writeFileSync(
-    join(root.home, ".fx", "settings.json"),
+    join(root.home, ".ffx", "settings.json"),
     JSON.stringify({
       context_limits: {
         project_instruction_file_bytes: 96,
@@ -570,7 +570,7 @@ process.stdin.on("data", (chunk) => {
 `,
   );
   writeFileSync(
-    join(root.home, ".fx", "mcp.json"),
+    join(root.home, ".ffx", "mcp.json"),
     JSON.stringify({
       mcp: {
         fixture: {
@@ -730,7 +730,7 @@ describe("gateway stream lifecycle", () => {
       expect(restored.code).toBe(0);
       expect(parseAskJson(restored.stdout).tool_calls).toEqual([]);
       expect(gateway.requestCount()).toBe(4);
-      const resultDirectory = join(root.home, ".fx", "sessions", output.session_id, "tool-results");
+      const resultDirectory = join(root.home, ".ffx", "sessions", output.session_id, "tool-results");
       const mainArtifacts = readdirSync(resultDirectory).filter((name) =>
         readFileSync(join(resultDirectory, name), "utf8").includes("MAIN_RESOURCE_TAIL"));
       expect(mainArtifacts).toHaveLength(1);
@@ -1005,7 +1005,7 @@ describe("gateway stream lifecycle", () => {
   test("removed memory tool is absent and stale calls cannot touch persisted bytes", async () => {
     const root = createFixtureRoot("memory-removed");
     const tracePath = join(root.root, "trace.log");
-    const memoriesPath = join(root.home, ".fx", "memories.json");
+    const memoriesPath = join(root.home, ".ffx", "memories.json");
     const legacyStore = '["must survive removal"]\n';
     writeFileSync(memoriesPath, legacyStore);
     writeFileSync(join(root.workspace, "surviving.txt"), "surviving tool works\n");
@@ -1119,7 +1119,7 @@ describe("gateway stream lifecycle", () => {
       const probePath = join(root.workspace, "permission-mode-probe.txt");
       writeFileSync(probePath, "permission mode probe\n");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", sandbox: "none" }),
       );
       const responses = [
@@ -1374,7 +1374,7 @@ describe("gateway stream lifecycle", () => {
       const root = createFixtureRoot("source-context-limits-tui");
       writeContextLimitFixture(root);
       writeLargeSkillCatalog(root.workspace);
-      const settingsPath = join(root.home, ".fx", "settings.json");
+      const settingsPath = join(root.home, ".ffx", "settings.json");
       const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
       settings.workspaces[root.workspace].context_limits.skill_description_bytes = 1_024;
       writeFileSync(settingsPath, JSON.stringify(settings));
@@ -1633,7 +1633,7 @@ describe("gateway stream lifecycle", () => {
         `---\nname: ${skillName}\ndescription: tool-time context fixture\n---\n\n${"bounded skill instruction line\n".repeat(16)}`,
       );
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({
           context_limits: {
             skill_chunk_bytes: 96,
@@ -1727,7 +1727,7 @@ describe("gateway stream lifecycle", () => {
     const largeBody = "bounded body line\n".repeat(240_000);
     mkdirSync(join(skillDirectory, "assets"), { recursive: true });
     writeFileSync(
-      join(root.home, ".fx", "settings.json"),
+      join(root.home, ".ffx", "settings.json"),
       JSON.stringify({ context_limits: { skill_chunk_bytes: 160 } }),
     );
     writeFileSync(
@@ -1810,12 +1810,12 @@ describe("gateway stream lifecycle", () => {
       expect(installOutput).toContain(`- ${skillName}\n`);
       expect(installOutput).not.toContain(bodySentinel);
       expect(installOutput).not.toContain(companionSentinel);
-      expect(installOutput).not.toContain(join(root.home, ".fx", "skills"));
+      expect(installOutput).not.toContain(join(root.home, ".ffx", "skills"));
       expect(promptText(gateway.requests[1]!.body)).not.toContain(
         "<loaded_skill_context>",
       );
 
-      const installedDirectory = join(root.home, ".fx", "skills", skillName);
+      const installedDirectory = join(root.home, ".ffx", "skills", skillName);
       expect(readFileSync(join(installedDirectory, "SKILL.md"), "utf8")).toBe(
         readFileSync(join(skillDirectory, "SKILL.md"), "utf8"),
       );
@@ -1851,7 +1851,7 @@ describe("gateway stream lifecycle", () => {
     );
     const skillDirectoryB = join(
       root.home,
-      ".fx",
+      ".ffx",
       "skills",
       "exact-duplicate-b",
     );
@@ -2041,7 +2041,7 @@ describe("gateway stream lifecycle", () => {
       "skills",
       "TOKEN=runtime-location-secret",
     );
-    const safeDirectory = join(root.home, ".fx", "skills", "mail-helper");
+    const safeDirectory = join(root.home, ".ffx", "skills", "mail-helper");
     const safeBody = "SAFE_SKILL_SEARCH_BODY_SENTINEL";
     mkdirSync(unsafeDirectory, { recursive: true });
     mkdirSync(safeDirectory, { recursive: true });
@@ -2165,7 +2165,7 @@ describe("gateway stream lifecycle", () => {
     const root = createFixtureRoot("skill-resource-progress");
     const tracePath = join(root.root, "trace.log");
     const skillName = "system-design-fixture";
-    const skillDirectory = join(root.home, ".fx", "skills", skillName);
+    const skillDirectory = join(root.home, ".ffx", "skills", skillName);
     mkdirSync(join(skillDirectory, "references"), { recursive: true });
     writeFileSync(
       join(skillDirectory, "SKILL.md"),
@@ -2232,13 +2232,13 @@ describe("gateway stream lifecycle", () => {
     const binary = process.env.FX_TEST_PRODUCT_EXE ?? FX_BIN;
     const root = createFixtureRoot("skill-location-labels");
     const skillName = "visible-workflow";
-    const skillDirectory = join(root.home, ".fx", "skills", "different-directory");
+    const skillDirectory = join(root.home, ".ffx", "skills", "different-directory");
     mkdirSync(join(skillDirectory, "references"), { recursive: true });
     writeFileSync(join(skillDirectory, "SKILL.md"), `---\nname: ${skillName}\ndescription: Label fixture\n---\nMAIN_LABEL_BODY\n${"Required instructions.\n".repeat(1200)}`);
     writeFileSync(join(skillDirectory, "references", "rules.md"), "REFERENCE_LABEL_BODY\n");
     const additionalSkills = ["second-workflow", "third-workflow"];
     for (const name of additionalSkills) {
-      const directory = join(root.home, ".fx", "skills", name);
+      const directory = join(root.home, ".ffx", "skills", name);
       mkdirSync(directory, { recursive: true });
       writeFileSync(join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: Label fixture\n---\n${name} INSTRUCTIONS\n`);
     }
@@ -2285,7 +2285,7 @@ describe("gateway stream lifecycle", () => {
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
       tui = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      const sessionsDirectory = join(root.home, ".fx", "sessions");
+      const sessionsDirectory = join(root.home, ".ffx", "sessions");
       const sessionIds = readdirSync(sessionsDirectory, { withFileTypes: true })
         .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
       expect(sessionIds).toHaveLength(1);
@@ -3094,7 +3094,7 @@ describe("gateway stream lifecycle", () => {
   test("saved ask resumes configured model without process override", async () => {
     const root = createFixtureRoot("configured-model-resume");
     writeFileSync(
-      join(root.home, ".fx", "settings.json"),
+      join(root.home, ".ffx", "settings.json"),
       JSON.stringify({ model: MODEL }),
     );
     const firstTracePath = join(root.root, "first-trace.log");
@@ -3148,7 +3148,7 @@ describe("gateway stream lifecycle", () => {
       expect(firstJson.session_id).toMatch(/^[A-Za-z0-9_-]{12}$/);
       const eventsPath = join(
         root.home,
-        ".fx",
+        ".ffx",
         "sessions",
         firstJson.session_id,
         "events.jsonl",
@@ -3220,7 +3220,7 @@ describe("gateway stream lifecycle", () => {
         expect(seeded.code).toBe(0);
         expect(seeded.stderr).toBe("");
         const seed = parseAskJson(seeded.stdout);
-        const path = join(root.home, ".fx", "sessions", seed.session_id, "events.jsonl");
+        const path = join(root.home, ".ffx", "sessions", seed.session_id, "events.jsonl");
         const events = readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line));
         const user = events.find((event) => event.event.user);
         const completed = events.find((event) => event.event.turn_completed);
@@ -3326,14 +3326,14 @@ describe("gateway stream lifecycle", () => {
       };
       const sessionPath = join(
         root.home,
-        ".fx",
+        ".ffx",
         "sessions",
         firstJson.session_id,
         "session.json",
       );
       const eventsPath = join(
         root.home,
-        ".fx",
+        ".ffx",
         "sessions",
         firstJson.session_id,
         "events.jsonl",
@@ -3556,14 +3556,14 @@ describe("gateway stream lifecycle", () => {
       };
       const sessionPath = join(
         root.home,
-        ".fx",
+        ".ffx",
         "sessions",
         firstJson.session_id,
         "session.json",
       );
       const eventsPath = join(
         root.home,
-        ".fx",
+        ".ffx",
         "sessions",
         firstJson.session_id,
         "events.jsonl",
@@ -4009,7 +4009,7 @@ describe("gateway stream lifecycle", () => {
         },
       );
       const json = parseAskJson(result.stdout);
-      const sessionRoot = join(root.home, ".fx", "sessions", json.session_id);
+      const sessionRoot = join(root.home, ".ffx", "sessions", json.session_id);
 
       expect(result.code).toBe(0);
       expect(json.error).toBeUndefined();
@@ -4327,7 +4327,7 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(4);
       expect(elapsedMs).toBeLessThan(5_000);
       expect(existsSync(markerPath)).toBe(false);
-      expect(existsSync(join(root.home, ".fx", "sessions"))).toBe(false);
+      expect(existsSync(join(root.home, ".ffx", "sessions"))).toBe(false);
       const childPid = Number.parseInt(readFileSync(childPidPath, "utf8"), 10);
       expect(Number.isInteger(childPid)).toBe(true);
       await waitForProcessExit(childPid);
@@ -4821,7 +4821,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         name.startsWith(".fx-command-replay-") && !before.has(name)
       );
       expect(after).toEqual([]);
-      expect(existsSync(join(root.home, ".fx", "sessions"))).toBe(false);
+      expect(existsSync(join(root.home, ".ffx", "sessions"))).toBe(false);
     } finally {
       if (proc.exitCode === null) proc.kill("SIGKILL");
       gateway.stop();
@@ -5113,7 +5113,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       });
       expect(latest.code).toBe(0);
       const sessionId = JSON.parse(latest.stdout).id as string;
-      const sessionRoot = join(root.home, ".fx", "sessions", sessionId);
+      const sessionRoot = join(root.home, ".ffx", "sessions", sessionId);
       expect(
         readdirSync(join(sessionRoot, "logs", "commands")).filter((name) =>
           name.endsWith(".bin")
@@ -5398,7 +5398,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const latest = await runFx(["session", "last", "--json"], { cwd: root.workspace, env });
           expect(latest.code).toBe(0);
           const sessionId = JSON.parse(latest.stdout).id;
-          const sessionDir = join(root.home, ".fx", "sessions", sessionId);
+          const sessionDir = join(root.home, ".ffx", "sessions", sessionId);
           const snapshot = readFileSync(join(sessionDir, "tool-results", snapshotHandle), "utf8");
           expect(Buffer.byteLength(snapshot)).toBeGreaterThan(65536);
           expect(snapshot).toContain(token);
@@ -5511,7 +5511,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           },
         );
         expect(beforeResume.code).toBe(0);
-        const sessionsRoot = join(root.home, ".fx", "sessions");
+        const sessionsRoot = join(root.home, ".ffx", "sessions");
         const sessionFiles = readdirSync(join(sessionsRoot, sessionId));
         expect(JSON.parse(readFileSync(join(sessionsRoot, sessionId, "session.json"), "utf8")).schema_version).toBe(4);
         expect(sessionFiles).not.toContain("checkpoint.json");
@@ -5734,7 +5734,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(gateway.requests).toHaveLength(2);
           await tui.sendKeys("C-c");
           await tui.waitForPane((pane) => pane.includes("cancelled") && hasEmptyComposer(pane), 15000);
-          const sessionsRoot = join(root.home, ".fx", "sessions");
+          const sessionsRoot = join(root.home, ".ffx", "sessions");
           const sessionId = readdirSync(sessionsRoot).find((id) => {
             const path = join(sessionsRoot, id, "session.json");
             return existsSync(path) && !JSON.parse(readFileSync(path, "utf8")).subagent_child;
@@ -5908,7 +5908,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const tracePath = join(root.root, "trace.log");
       const stderrPath = join(root.root, "stderr.log");
       const skillName = "compaction-explicit";
-      const skillDirectory = join(root.home, ".fx", "skills", skillName);
+      const skillDirectory = join(root.home, ".ffx", "skills", skillName);
       const bodySentinel = "COMPACTION_EXPLICIT_BODY_SENTINEL";
       const tailSentinel = "COMPACTION_COMPLETE_SKILL_TAIL";
       mkdirSync(skillDirectory, { recursive: true });
@@ -6630,7 +6630,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const tracePath = join(root.root, "trace.log");
     const mcp = writeMcpFixture(root, { initializeDelayMs });
     writeFileSync(
-      join(root.home, ".fx", "settings.json"),
+      join(root.home, ".ffx", "settings.json"),
       JSON.stringify({ permission: { [DYNAMIC_MCP_TOOL_NAME]: "allow" } }),
     );
     const childPrompt = "Select and call the inherited MCP echo fixture.";
@@ -6905,7 +6905,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(parseAskJson(result.stdout).output).toContain(
         "MANAGED_SUBAGENT_OK",
       );
-      expect(existsSync(join(root.home, ".fx", "agents"))).toBe(false);
+      expect(existsSync(join(root.home, ".ffx", "agents"))).toBe(false);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -6959,7 +6959,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         childRequests++;
         if (hasCurrentToolResult(body, "child_effect")) {
           expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
-          const sessions = join(root.home, ".fx", "sessions");
+          const sessions = join(root.home, ".ffx", "sessions");
           childId = readdirSync(sessions).find((id) => existsSync(join(sessions, id, "subagent", "owner.json")))!;
           expect(childId).toBeTruthy();
           const owner = JSON.parse(readFileSync(join(sessions, childId, "subagent", "owner.json"), "utf8"));
@@ -6984,7 +6984,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(0);
       expect(failureObserved).toBe(true);
       expect(parseAskJson(result.stdout).output).toContain("SUBAGENT_FAILURE_REPORTED");
-      const events = readFileSync(join(root.home, ".fx", "sessions", parseAskJson(result.stdout).session_id, "events.jsonl"), "utf8")
+      const events = readFileSync(join(root.home, ".ffx", "sessions", parseAskJson(result.stdout).session_id, "events.jsonl"), "utf8")
         .trim().split("\n").map((line) => JSON.parse(line));
       const persisted = events.find((entry) => entry.event.tool_result?.call_id === "delegate")?.event.tool_result;
       expect(persisted?.status).toBe("failure");
@@ -7019,7 +7019,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       if (hasCurrentToolResult(body, "http_delegate")) {
         failed = JSON.parse(toolResultOutput(body, "http_delegate"));
-        const sessions = join(root.home, ".fx", "sessions");
+        const sessions = join(root.home, ".ffx", "sessions");
         const parentId = readdirSync(sessions).find((id) => existsSync(join(sessions, id, "subagent", "children.json")))!;
         registryPath = join(sessions, parentId, "subagent", "children.json");
         failedChild = JSON.parse(readFileSync(registryPath, "utf8")).children[0];
@@ -7114,7 +7114,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(seen).toHaveLength(2);
       expect(seen[0]).toEqual({ ok: true, result: "REPLAY_CHILD_DONE", error_code: null });
       expect(seen[1]).toEqual(seen[0]);
-      const registryPath = join(root.home, ".fx", "sessions", sessionId, "subagent", "children.json");
+      const registryPath = join(root.home, ".ffx", "sessions", sessionId, "subagent", "children.json");
       const registry = JSON.parse(readFileSync(registryPath, "utf8"));
       expect(registry.children).toHaveLength(1);
       registry.children[0].last_outcome = "failed";
@@ -7363,7 +7363,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const firstJson = parseAskJson(first.stdout);
       expect(firstJson.output).toContain("PARENT_FIRST_COMPLETE");
       const childRegistry = JSON.parse(readFileSync(
-        join(root.home, ".fx", "sessions", firstJson.session_id, "subagent", "children.json"),
+        join(root.home, ".ffx", "sessions", firstJson.session_id, "subagent", "children.json"),
         "utf8",
       )) as { children: Array<{ id: string }> };
       expect(childRegistry.children).toHaveLength(1);
@@ -7514,7 +7514,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(latest.code).toBe(0);
       const latestId = (JSON.parse(latest.stdout) as { id: string }).id;
 
-      const sessionsRoot = join(root.home, ".fx", "sessions");
+      const sessionsRoot = join(root.home, ".ffx", "sessions");
       const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
         .filter((entry) =>
           entry.isDirectory() &&
@@ -7523,7 +7523,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         .map((entry) => entry.name);
       expect(sessionIds).toHaveLength(2);
       const parentId = sessionIds.find((id) =>
-        existsSync(join(root.home, ".fx", "sessions", id, "subagent", "children.json"))
+        existsSync(join(root.home, ".ffx", "sessions", id, "subagent", "children.json"))
       );
       const childId = sessionIds.find((id) => id !== parentId);
       expect(parentId).toBeDefined();

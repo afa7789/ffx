@@ -108,14 +108,9 @@ fn storageBackend(
     alloc: Allocator,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !StorageBackend {
-    const disabled = native_keychain.isDisabled();
-    const available = if (builtin.os.tag == .macos and !disabled) blk: {
-        break :blk if (cancel_flag) |flag|
-            try native_keychain.userDefaultKeychainAvailableCancellable(alloc, flag)
-        else
-            try native_keychain.userDefaultKeychainAvailable(alloc);
-    } else false;
-    return selectStorageBackend(builtin.os.tag, disabled, available);
+    _ = alloc;
+    _ = cancel_flag;
+    return .profile_file;
 }
 
 fn selectReadDecision(
@@ -1443,7 +1438,7 @@ test "credential store is private atomic and supports restart deletion" {
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("access-secret", loaded.access_token);
 
-    var root = try tmp.dir.openDir(std.testing.io, "home/.fx", .{ .iterate = true });
+    var root = try tmp.dir.openDir(std.testing.io, "home/.ffx", .{ .iterate = true });
     defer root.close(std.testing.io);
     const root_stat = try root.stat(std.testing.io);
     try std.testing.expectEqual(

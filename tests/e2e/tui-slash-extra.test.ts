@@ -74,7 +74,7 @@ describe.skipIf(!tmuxAvailable())("tui: skills command recovery", () => {
         );
         expect(session.isAlive()).toBe(true);
         expect(hasEmptyComposer(rejected)).toBe(true);
-        expect(existsSync(join(home, ".fx", "escape-attempt"))).toBe(false);
+        expect(existsSync(join(home, ".ffx", "escape-attempt"))).toBe(false);
 
         await session.sendText("/skills path");
         const recovered = await session.waitForText("fx managed install root:", 5_000);
@@ -313,9 +313,9 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
       const workDir = mkdtempSync(join(tmpdir(), "fx-row03-clear-"));
       const homeDir = mkdtempSync(join(tmpdir(), "fx-row03-clear-home-"));
       const tracePath = join(workDir, "trace.log");
-      mkdirSync(join(homeDir, ".fx"), { recursive: true });
+      mkdirSync(join(homeDir, ".ffx"), { recursive: true });
       writeFileSync(
-        join(homeDir, ".fx", "settings.json"),
+        join(homeDir, ".ffx", "settings.json"),
         JSON.stringify({ permission: { ask_user_question: "deny" } }),
       );
       const gateway = startDynamicFakeGateway(() =>
@@ -448,8 +448,8 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
     const root = mkdtempSync(join(tmpdir(), "fx-mcp-menu-http-"));
     const home = join(root, "home");
     const fixture = startModernMcpHttpFixture("json");
-    mkdirSync(join(home, ".fx"), { recursive: true });
-    writeFileSync(join(home, ".fx", "settings.json"), "{}");
+    mkdirSync(join(home, ".ffx"), { recursive: true });
+    writeFileSync(join(home, ".ffx", "settings.json"), "{}");
     try {
       session = await TmuxSession.create({
         isolated: true, cwd: root, width: 110, height: 32,
@@ -466,7 +466,7 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
       await session.waitForText("> URL", 5_000);
       await session.sendText(fixture.url);
       await session.waitForPane((pane) => /menu_http\s+Ready/.test(pane), 15_000);
-      const profilePath = join(home, ".fx", "mcp.json");
+      const profilePath = join(home, ".ffx", "mcp.json");
       const profile = JSON.parse(readFileSync(profilePath, "utf8"));
       expect(profile.mcp.menu_http.type).toBe("http");
       expect(profile.mcp.menu_http.url).toBe(fixture.url);
@@ -491,11 +491,11 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
     const fixture = join(import.meta.dir, "fixtures", "mcp-legacy-stdio.mjs");
     const profilePid = join(root, "profile.pid");
     const names = ["alpha", "beta"];
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace);
-    const settingsPath = join(home, ".fx", "settings.json");
+    const settingsPath = join(home, ".ffx", "settings.json");
     writeFileSync(settingsPath, "{}");
-    writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({ mcp: {
+    writeFileSync(join(home, ".ffx", "mcp.json"), JSON.stringify({ mcp: {
       profile_fixture: { command: [process.execPath, fixture], environment: { FX_MCP_PID_PATH: profilePid } },
     } }));
     writeFileSync(join(workspace, ".mcp.json"), JSON.stringify({ mcpServers:
@@ -542,8 +542,8 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
       const root = mkdtempSync(join(tmpdir(), "fx-mcp-menu-empty-"));
       const home = join(root, "home");
       const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      mkdirSync(join(home, ".ffx"), { recursive: true });
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
 
       try {
         session = await TmuxSession.create({
@@ -565,7 +565,7 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
         expect(menu).not.toContain("MCP: no servers configured");
 
         await session.sendKeys("C");
-        const info = await session.waitForText("~/.fx/mcp.json", 5_000);
+        const info = await session.waitForText("~/.ffx/mcp.json", 5_000);
         expect(info).toContain("<workspace>/.mcp.json");
         expect(info).toContain("P Approve all");
         expect(info).toContain("Z Reset");
@@ -608,9 +608,9 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
       const stderrPath = join(root, "stderr.log");
       const wireLogPath = join(root, "mcp-wire.jsonl");
       const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("Unexpected submission."));
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       writeFileSync(
-        join(home, ".fx", "mcp.json"),
+        join(home, ".ffx", "mcp.json"),
         JSON.stringify({
           mcp: {
             fixture: {
@@ -817,8 +817,8 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
       const root = mkdtempSync(join(tmpdir(), "fx-mcp-menu-mutate-"));
       const home = join(root, "home");
       const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      mkdirSync(join(home, ".ffx"), { recursive: true });
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       const fixture = join(import.meta.dir, "fixtures", "mcp-legacy-stdio.mjs");
 
       try {
@@ -842,7 +842,7 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
 
         const added = await session.waitForText("MCP configuration reloaded.", 15_000);
         expect(added).toContain("fixture");
-        const profile = JSON.parse(readFileSync(join(home, ".fx", "mcp.json"), "utf8"));
+        const profile = JSON.parse(readFileSync(join(home, ".ffx", "mcp.json"), "utf8"));
         expect(profile.mcp.fixture.command).toEqual([process.execPath, fixture]);
 
         await session.sendKeys("Enter");
@@ -878,9 +878,9 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace);
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(home, ".ffx", "settings.json"), "{}");
       writeFileSync(
         join(workspace, ".mcp.json"),
         JSON.stringify({
@@ -929,7 +929,7 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
         await session.sendKeys("X");
         await session.waitForText("Reject this project MCP server?", 5_000);
         await session.sendKeys("Enter");
-        const settingsPath = join(home, ".fx", "settings.json");
+        const settingsPath = join(home, ".ffx", "settings.json");
         await session.waitForPane(() => {
           const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
           return Object.values(settings.workspaces ?? {}).some(

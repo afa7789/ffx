@@ -42,6 +42,17 @@ pub const entries = [_]Entry{
         .subscription = true,
         .login_source = .grok_subscription,
     },
+    .{ .id = .openai, .slug = "openai", .name = "OpenAI", .route_name = "OpenAI", .description = "OpenAI API key", .subscription = false, .login_source = .direct_provider },
+    .{ .id = .anthropic, .slug = "anthropic", .name = "Anthropic", .route_name = "Anthropic", .description = "Anthropic API key", .subscription = false, .login_source = .direct_provider },
+    .{ .id = .deepseek, .slug = "deepseek", .name = "DeepSeek", .route_name = "DeepSeek", .description = "DeepSeek API key", .subscription = false, .login_source = .direct_provider },
+    .{ .id = .openrouter, .slug = "openrouter", .name = "OpenRouter", .route_name = "OpenRouter", .description = "OpenRouter API key", .subscription = false, .login_source = .direct_provider },
+    .{ .id = .ppq, .slug = "ppq", .name = "PPQ", .route_name = "PPQ", .description = "PPQ API key", .subscription = false, .login_source = .direct_provider },
+    .{ .id = .minimax, .slug = "minimax", .name = "MiniMax", .route_name = "MiniMax", .description = "MiniMax API key", .subscription = false, .login_source = .direct_provider },
+    .{ .id = .zhipu, .slug = "zhipu", .name = "Zhipu (GLM)", .route_name = "Zhipu (GLM)", .description = "Zhipu API key", .subscription = false, .login_source = .direct_provider },
+    .{ .id = .opencode_go, .slug = "opencode", .name = "OpenCode", .route_name = "OpenCode", .description = "OpenCode API key", .subscription = false, .login_source = .direct_provider },
+    .{ .id = .zai, .slug = "zai", .aliases = &.{"z.ai"}, .name = "Z.AI", .route_name = "Z.AI", .description = "Z.AI API key", .subscription = false, .login_source = .direct_provider },
+    .{ .id = .alibaba_cloud, .slug = "alibaba-cloud", .aliases = &.{"alibaba"}, .name = "Alibaba Cloud", .route_name = "Alibaba Cloud", .description = "Alibaba Cloud API key", .subscription = false, .login_source = .direct_provider },
+    .{ .id = .custom, .slug = "custom", .name = "Custom provider", .route_name = "Custom provider", .description = "Configured custom provider", .subscription = false, .login_source = .direct_provider },
 };
 
 pub fn parse(value: []const u8) ?model_provider.ProviderId {
@@ -71,4 +82,8 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expect(parse("unknown") == null);
     try std.testing.expect(find(.codex).subscription);
     try std.testing.expect(find(.grok).subscription);
+    try std.testing.expectEqual(model_provider.ProviderId.openai, parse("openai").?);
+    try std.testing.expectEqual(model_provider.ProviderId.opencode_go, parse("opencode").?);
+    try std.testing.expectEqual(model_provider.ProviderId.zai, parse("z.ai").?);
+    try std.testing.expectEqual(types.CredentialSource.direct_provider, find(.anthropic).login_source);
 }

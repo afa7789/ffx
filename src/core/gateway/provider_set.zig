@@ -51,12 +51,16 @@ pub const Set = struct {
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
+    custom: Bundle = .{},
+    direct_selection_fn: ?*const fn (model_provider.ProviderId) Bundle = null,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .custom => self.custom,
+            else => if (self.direct_selection_fn) |select_direct| select_direct(provider) else .{},
         };
     }
 

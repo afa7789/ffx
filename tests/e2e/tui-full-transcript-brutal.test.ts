@@ -134,7 +134,7 @@ function countOccurrences(text: string, needle: string): number {
 }
 
 function committedAssistantOccurrences(home: string, assistant: string): number {
-  const sessionsRoot = join(home, ".fx", "sessions");
+  const sessionsRoot = join(home, ".ffx", "sessions");
   let count = 0;
   for (const entry of readdirSync(sessionsRoot, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.name === "latest") continue;
@@ -342,14 +342,14 @@ function prepareFixture(config: StressConfig): {
   totalTools: number;
 } {
   const paths = makeRoot(config.label);
-  mkdirSync(join(paths.home, ".fx"), { recursive: true });
+  mkdirSync(join(paths.home, ".ffx"), { recursive: true });
   mkdirSync(paths.workspace);
   writeFileSync(paths.stderrPath, "");
   writeFileSync(paths.resumedStderrPath, "");
   writeFileSync(paths.tracePath, "");
   writeFileSync(paths.resumedTracePath, "");
   writeFileSync(
-    join(paths.home, ".fx", "settings.json"),
+    join(paths.home, ".ffx", "settings.json"),
     JSON.stringify({
       sandbox: "none",
       permission_mode: "auto",
@@ -1287,7 +1287,7 @@ test.skipIf(!tmuxAvailable())(
   "Ctrl-O keeps saved tool output intact across window replacement",
   async () => {
     const paths = makeRoot("saved-result-lifetime");
-    mkdirSync(join(paths.home, ".fx"), { recursive: true });
+    mkdirSync(join(paths.home, ".ffx"), { recursive: true });
     mkdirSync(paths.workspace);
     const lines = Array.from({ length: 300 }, (_, i) =>
       `SAVED_ROW_${String(i + 1).padStart(4, "0")} original tool output`,
@@ -1351,7 +1351,7 @@ test.skipIf(!tmuxAvailable())(
   "Ctrl-O fills a viewport taller than the prepared overscan cache",
   async () => {
     const paths = makeRoot("tall-viewport");
-    mkdirSync(join(paths.home, ".fx"), { recursive: true });
+    mkdirSync(join(paths.home, ".ffx"), { recursive: true });
     mkdirSync(paths.workspace);
     writeFileSync(paths.stderrPath, "");
     const tallTail = "TALL_TRANSCRIPT_TAIL";
@@ -1401,7 +1401,7 @@ test.skipIf(!tmuxAvailable())(
   "Ctrl-O resized close preserves long history within ordinary resize cost",
   async () => {
     const paths = makeRoot("resize-recovery-cost");
-    mkdirSync(join(paths.home, ".fx"), { recursive: true });
+    mkdirSync(join(paths.home, ".ffx"), { recursive: true });
     mkdirSync(paths.workspace);
     const paragraphs = Array.from({ length: 4_000 }, (_, index) =>
       `ROW${pad(index + 1)} ALPHA_abcdefghijklmnopqrstuvwxyz0123456789 ` +

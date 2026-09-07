@@ -71,14 +71,14 @@ function createRoot(
   cleanupRoot = root;
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
-    join(home, ".fx", "settings.json"),
+    join(home, ".ffx", "settings.json"),
     JSON.stringify({}),
   );
   writeFileSync(
-    join(home, ".fx", "mcp.json"),
+    join(home, ".ffx", "mcp.json"),
     JSON.stringify({
       mcp: {
         fixture: {
@@ -100,10 +100,10 @@ function createEmptyRoot(label: string) {
   cleanupRoot = root;
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
-  writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({ mcp: {} }));
+  writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({}));
+  writeFileSync(join(home, ".ffx", "mcp.json"), JSON.stringify({ mcp: {} }));
   return { root, home, workspace, traceLogPath: join(root, "fx-trace.log") };
 }
 
@@ -223,7 +223,7 @@ describe("modern MCP Streamable HTTP", () => {
       },
     });
     const root = createRoot("oauth-server-failure", { url: `http://127.0.0.1:${failing.port}/mcp` });
-    writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({
+    writeFileSync(join(root.home, ".ffx", "mcp.json"), JSON.stringify({
       mcp: {
         fixture: {
           type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
@@ -479,7 +479,7 @@ describe("modern MCP Streamable HTTP", () => {
       );
 
       const profile = JSON.parse(
-        readFileSync(join(root.home, ".fx", "mcp.json"), "utf8"),
+        readFileSync(join(root.home, ".ffx", "mcp.json"), "utf8"),
       );
       expect(profile.mcp.prisma).toMatchObject({
         type: "http",
@@ -760,7 +760,7 @@ describe("modern MCP Streamable HTTP", () => {
     const second = startModernMcpHttpFixture("features", "SECOND_SERVER_RESOURCE");
     try {
       const root = createRoot("private-server-isolation", fixture);
-      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profilePath = join(root.home, ".ffx", "mcp.json");
       const profile = JSON.parse(readFileSync(profilePath, "utf8"));
       profile.mcp.fixture.bearer_token_env = "FX_TEST_SHARED_MCP_TOKEN";
       profile.mcp.second = { ...profile.mcp.fixture, url: second.url };
@@ -1557,7 +1557,7 @@ describe("modern MCP Streamable HTTP", () => {
     fixture = startModernMcpHttpFixture("json");
     const root = createRoot("environment-headers", fixture);
     writeFileSync(
-      join(root.home, ".fx", "mcp.json"),
+      join(root.home, ".ffx", "mcp.json"),
       JSON.stringify({
         mcp: {
           fixture: {
@@ -1594,7 +1594,7 @@ describe("modern MCP Streamable HTTP", () => {
     }
     expect(result.stdout).not.toContain("environment-bearer-secret");
     expect(result.stderr).not.toContain("environment-bearer-secret");
-    expect(readFileSync(join(root.home, ".fx", "mcp.json"), "utf8")).not
+    expect(readFileSync(join(root.home, ".ffx", "mcp.json"), "utf8")).not
       .toContain("environment-bearer-secret");
   }, 30_000);
 
@@ -1602,7 +1602,7 @@ describe("modern MCP Streamable HTTP", () => {
     fixture = startModernMcpHttpFixture("json");
     const root = createRoot("workspace-expanded-headers", fixture);
     writeFileSync(
-      join(root.home, ".fx", "mcp.json"),
+      join(root.home, ".ffx", "mcp.json"),
       JSON.stringify({ mcp: {} }),
     );
     writeFileSync(

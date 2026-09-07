@@ -258,9 +258,9 @@ function createIsolatedRoot() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-vision-route-e2e-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ permission: {} }));
+  writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({ permission: {} }));
   return { root, home, workspace: realpathSync(workspace) };
 }
 
@@ -295,7 +295,7 @@ function writeLegacyZeroImageSession(
   sessionId: string,
   imagePaths: [string, string, string, string],
 ) {
-  const sessionDir = join(root.home, ".fx", "sessions", sessionId);
+  const sessionDir = join(root.home, ".ffx", "sessions", sessionId);
   mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
   writeFileSync(
     join(sessionDir, "session.json"),
@@ -436,7 +436,7 @@ async function expectChangedCanonicalVisionPathFailure(
   writeMarkedImage(targetPath, "TMUX_APPROVED_TARGET_A");
   symlinkSync(targetPath, approvedPath);
   writeFileSync(
-    join(root.home, ".fx", "settings.json"),
+    join(root.home, ".ffx", "settings.json"),
     JSON.stringify({ permission_mode: "ask", permission: {} }),
   );
   const gateway = startImageGateway([
@@ -960,7 +960,7 @@ describe("Vision route fake Gateway", () => {
             for (const imagePath of fixture.paths) expect(request.body).not.toContain(imagePath);
             expect(request.body).not.toContain("data:image");
             expect(request.body).not.toContain("fx-image-snapshots");
-            expect(request.body).not.toContain(".fx/sessions");
+            expect(request.body).not.toContain(".ffx/sessions");
           }
         } finally {
           gateway.stop();
@@ -1368,7 +1368,7 @@ describe("Vision route fake Gateway", () => {
           expect(savedJson.output).toContain(`saved ${entry.name}`);
           expect(gateway.chatRequests).toHaveLength(1);
 
-          const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
+          const imageDir = join(root.home, ".ffx", "sessions", savedJson.session_id, "images");
           const snapshotNames = readdirSync(imageDir).filter((name) => name.endsWith(".bin"));
           expect(snapshotNames).toHaveLength(1);
           entry.damage(join(imageDir, snapshotNames[0]));
@@ -1643,7 +1643,7 @@ describe("Vision route fake Gateway", () => {
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "fx ask: Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.\n",
+          "ffx ask: Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.\n",
         );
         expect(result.stderr).not.toContain("ModelImageCapabilityUnavailable");
         expect(gateway.catalogRequests).toBe(1);
@@ -2258,7 +2258,7 @@ describe("Vision route fake Gateway", () => {
           },
         );
         const savedJson = parseFxJson(saved);
-        const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
+        const imageDir = join(root.home, ".ffx", "sessions", savedJson.session_id, "images");
         const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
         expect(firstSnapshot).toBeDefined();
         writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
@@ -2344,7 +2344,7 @@ describe("Vision route fake Gateway", () => {
           },
         );
         const savedJson = parseFxJson(saved);
-        const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
+        const imageDir = join(root.home, ".ffx", "sessions", savedJson.session_id, "images");
         const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
         expect(firstSnapshot).toBeDefined();
         writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
@@ -2476,7 +2476,7 @@ describe("Vision route fake Gateway", () => {
       const imagePath = join(desktop, "test.png");
       writeMarkedImage(imagePath, "TMUX_AT_HOME_IMAGE");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const gateway = startImageGateway([
@@ -2591,7 +2591,7 @@ describe("Vision route fake Gateway", () => {
       const imagePath = join(desktop, "test.png");
       writeMarkedImage(imagePath, "TMUX_PATH_SOURCE_APPROVAL");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const gateway = startImageGateway([
@@ -2660,7 +2660,7 @@ describe("Vision route fake Gateway", () => {
       const payload = writeMarkedImage(sourcePath, "TMUX_HARD_LINKED_IMAGE");
       linkSync(sourcePath, approvedPath);
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const gateway = startImageGateway([
@@ -2731,7 +2731,7 @@ describe("Vision route fake Gateway", () => {
       const payloadB = writeMarkedImage(targetB, "TMUX_RETARGETED_TARGET_B");
       symlinkSync(targetA, approvedPath);
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const gateway = startImageGateway([
@@ -2931,7 +2931,7 @@ describe("Vision route fake Gateway", () => {
       const imagePath = join(root.workspace, "feedback.png");
       writeMarkedImage(imagePath, "TMUX_PERMISSION_FEEDBACK");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const feedback = "Do not modify any more files.";
@@ -2977,7 +2977,7 @@ describe("Vision route fake Gateway", () => {
         expect(selectedFollowup).toContain(rootRequest);
         expect(selectedFollowup).not.toContain(imagePath);
 
-        const sessionsRoot = join(root.home, ".fx", "sessions");
+        const sessionsRoot = join(root.home, ".ffx", "sessions");
         const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
           .filter((entry) => entry.isDirectory() && entry.name !== "latest")
           .map((entry) => entry.name);
@@ -3009,7 +3009,7 @@ describe("Vision route fake Gateway", () => {
       const firstMutatedPayload = writeMarkedImage(firstMutatedPath, "TMUX_PERMISSION_B");
       writeMarkedImage(secondImagePath, "TMUX_OUTAGE_A");
       writeFileSync(
-        join(root.home, ".fx", "settings.json"),
+        join(root.home, ".ffx", "settings.json"),
         JSON.stringify({ permission_mode: "ask", permission: {} }),
       );
       const gateway = startImageGateway([

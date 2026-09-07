@@ -32,7 +32,7 @@ function createIsolatedRoot(prefix: string) {
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   const external = join(root, "external");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".ffx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   mkdirSync(external, { recursive: true });
   return {
@@ -89,7 +89,7 @@ describe("external file permissions", () => {
       try {
         const target = join(root.external, "yolo-write.txt");
         const tracePath = join(root.root, "permission-trace.log");
-        const settingsPath = join(root.home, ".fx", "settings.json");
+        const settingsPath = join(root.home, ".ffx", "settings.json");
         writeFileSync(
           settingsPath,
           JSON.stringify({
@@ -158,7 +158,7 @@ describe("external file permissions", () => {
         const tracePath = join(root.root, "permission-trace.log");
         writeFileSync(readTarget, "FX_E2E_EXTERNAL_READ\n");
         writeFileSync(classifiedTarget, "before");
-        writeFileSync(join(root.home, ".fx", "settings.json"), "{}");
+        writeFileSync(join(root.home, ".ffx", "settings.json"), "{}");
 
         const { result: readResult } = await runWithFakeGateway(
           root,
@@ -210,7 +210,7 @@ describe("external file permissions", () => {
         expect(readFileSync(classifiedTarget, "utf-8")).toBe("FX_E2E_EXTERNAL_CLASSIFIED");
 
         writeFileSync(
-          join(root.home, ".fx", "settings.json"),
+          join(root.home, ".ffx", "settings.json"),
           JSON.stringify({
             permission: {
               edit: {

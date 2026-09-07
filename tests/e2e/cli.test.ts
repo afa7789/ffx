@@ -39,7 +39,7 @@ const NO_GATEWAY_AUTH = {
   VERCEL_OIDC_TOKEN: undefined,
 };
 const MISSING_AUTH_MESSAGE =
-  "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
+  "ffx needs access to Vercel AI Gateway. Run ffx login to sign in, ffx setup to use an API key, or set AI_GATEWAY_API_KEY.";
 const MODERN_MCP_FIXTURE = join(
   import.meta.dirname,
   "fixtures",
@@ -77,7 +77,7 @@ function writeSeededFxAuth(
   issuer = "https://vercel.com",
   expiresAtMs = Date.now() + 60 * 60 * 1000,
 ): void {
-  const fxDir = join(home, ".fx");
+  const fxDir = join(home, ".ffx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
   const authPath = join(fxDir, "auth.json");
@@ -224,10 +224,10 @@ function writeLegacySession(
     historyLen?: number;
   } = {},
 ): void {
-  const sessionDir = join(home, ".fx", "sessions", sessionId);
+  const sessionDir = join(home, ".ffx", "sessions", sessionId);
   mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
-  chmodSync(join(home, ".fx"), 0o700);
-  chmodSync(join(home, ".fx", "sessions"), 0o700);
+  chmodSync(join(home, ".ffx"), 0o700);
+  chmodSync(join(home, ".ffx", "sessions"), 0o700);
   chmodSync(sessionDir, 0o700);
   const historyLen = opts.historyLen ?? 0;
   writeFileSync(
@@ -260,10 +260,10 @@ function writeConversationSession(
     turns?: string[];
   } = {},
 ): void {
-  const sessionDir = join(home, ".fx", "sessions", sessionId);
+  const sessionDir = join(home, ".ffx", "sessions", sessionId);
   mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
-  chmodSync(join(home, ".fx"), 0o700);
-  chmodSync(join(home, ".fx", "sessions"), 0o700);
+  chmodSync(join(home, ".ffx"), 0o700);
+  chmodSync(join(home, ".ffx", "sessions"), 0o700);
   chmodSync(sessionDir, 0o700);
   writeFileSync(
     join(sessionDir, "session.json"),
@@ -330,18 +330,18 @@ describe("cli: help", () => {
       expect(stdout).not.toContain("\x1b[");
       expect(stdout).not.toContain("\x1b]2;");
       expect(stdout).toStartWith(
-        `𝒇x v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
+        `𝒇𝒇x v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
       );
-      expect(stdout.match(/𝒇x/g) ?? []).toHaveLength(1);
-      expect(stdout).toContain("fx starts an interactive session by default.");
+      expect(stdout.match(/𝒇𝒇x/g) ?? []).toHaveLength(1);
+      expect(stdout).toContain("ffx starts an interactive session by default.");
       expect(stdout).toContain("Commands:\n");
       expect(stdout).toContain("Run one noninteractive request");
-      expect(stdout).toContain("Sign in to a model provider");
-      expect(stdout).toContain("Sign out of a model provider");
+      expect(stdout).toContain("Sign in with Codex or Grok");
+      expect(stdout).toContain("Sign out of a Codex or Grok session");
       expect(stdout).toContain("Choose the active model provider");
-      expect(stdout).toContain("Configure a Vercel AI Gateway API key");
-      expect(stdout).toContain("Choose a Vercel AI Gateway team");
-      expect(stdout).toContain("Show Vercel AI Gateway credits");
+      expect(stdout).toContain("Configure a provider API key");
+      expect(stdout).toContain("Choose a Gateway team");
+      expect(stdout).toContain("Show Gateway credits");
       expect(stdout).not.toContain("Sign in to Vercel or a selected provider");
       expect(stdout).toContain("credits|balance");
       expect(stdout).toContain("Flags:\n");
@@ -356,38 +356,38 @@ describe("cli: help", () => {
       expect(stdout).toContain("--resume-last");
       expect(stdout).toContain("session resume [last|id]");
       expect(stdout).toContain("-v, --version");
-      expect(stdout).toContain("Print the fx version and exit");
+      expect(stdout).toContain("Print the ffx version and exit");
       expect(stdout).not.toContain("Must appear before the command");
       expect(stdout).toContain("Examples:\n");
-      expect(stdout).toContain("https://fx.sh/docs");
-      expect(stdout).toContain("run `/feedback` inside fx");
+      expect(stdout).toContain("https://ffx.sh/docs");
+      expect(stdout).toContain("run `/feedback` inside ffx");
       expect(stdout).toContain(
-        "Run `fx <command> --help` for command-specific usage and options.",
+        "Run `ffx <command> --help` for command-specific usage and options.",
       );
       expect(stdout).not.toContain("command-specific options and examples");
       expect(stdout).not.toContain("  Work      ");
-      expect(stdout).not.toContain("\n\n\nRun `fx <command> --help`");
+      expect(stdout).not.toContain("\n\n\nRun `ffx <command> --help`");
     },
     TIMEOUT,
   );
 
   test(
-    "fx ask help renders documented options through both aliases",
+    "ffx ask help renders documented options through both aliases",
     async () => {
       const env = {
         ...NO_GATEWAY_AUTH,
         FX_DISABLE_KEYCHAIN: "1",
       };
-      const expected = `fx ask
+      const expected = `ffx ask
 
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--full-access] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  ffx ask [--auto|--full-access] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
   --auto                Automatically review unresolved permission requests
-  --full-access         Disable fx permission checks
+  --full-access         Disable ffx permission checks
   --yolo                Alias for --full-access
   --image PATH          Attach an image file; repeat for multiple images
   --system TEXT         Replace the built-in system prompt for this request
@@ -420,7 +420,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx session help documents inspect resume migrate and recover",
+    "ffx session help documents inspect resume migrate and recover",
     async () => {
       for (const args of [
         ["session", "--help"],
@@ -440,14 +440,14 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx acp help documents accepted options",
+    "ffx acp help documents accepted options",
     async () => {
       for (const alias of ["--help", "-h"]) {
         const r = await runFx(["acp", alias]);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain(
-          "Usage:\n  fx acp [--model <id>] [--log-file <path>]",
+          "Usage:\n  ffx acp [--model <id>] [--log-file <path>]",
         );
         expect(r.stdout).toContain("--model <id>");
         expect(r.stdout).toContain("--log-file <path>");
@@ -457,7 +457,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx replay help describes golden output",
+    "ffx replay help describes golden output",
     async () => {
       const r = await runFx(["replay", "--help"]);
       expect(r.code).toBe(0);
@@ -470,14 +470,14 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx acp rejects unknown options and missing option values",
+    "ffx acp rejects unknown options and missing option values",
     async () => {
       for (const args of [["--bogus"], ["--model"], ["--log-file"]]) {
         const result = await runFx(["acp", ...args]);
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: fx acp [--model <id>] [--log-file <path>]\n",
+          "usage: ffx acp [--model <id>] [--log-file <path>]\n",
         );
       }
     },
@@ -486,7 +486,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
 
   for (const alias of ["help", "--help", "-h"]) {
     test(
-      `fx ${alias} respects COLUMNS=60`,
+      `ffx ${alias} respects COLUMNS=60`,
       async () => {
         const r = await runFx([alias], { env: { COLUMNS: "60" } });
         expect(r.code).toBe(0);
@@ -504,7 +504,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
 
   for (const alias of ["help", "--help", "-h"]) {
     test(
-      `fx ${alias} hides developer recording surfaces`,
+      `ffx ${alias} hides developer recording surfaces`,
       async () => {
         const r = await runFx([alias]);
         expect(r.code).toBe(0);
@@ -517,11 +517,11 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   }
 
   test(
-    "fx rejects the removed record flag as unknown input",
+    "ffx rejects the removed record flag as unknown input",
     async () => {
       const r = await runFx(["--record"]);
       expect(r.code).not.toBe(0);
-      expect(r.stderr).toContain("fx: unknown subcommand: --record");
+      expect(r.stderr).toContain("ffx: unknown subcommand: --record");
       expect(r.stderr).not.toContain("visual terminal capture:");
     },
     TIMEOUT,
@@ -531,7 +531,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
 describe("cli: version", () => {
   for (const alias of ["--version", "-v"]) {
     test(
-      `fx ${alias} prints the source version`,
+      `ffx ${alias} prints the source version`,
       async () => {
         const r = await runFx([alias]);
         expect(r.code).toBe(0);
@@ -547,10 +547,10 @@ describe("cli: status", () => {
   test(
     "status and doctor expose the MCP profile error that blocks ask startup",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-mcp-config-diagnostic-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-mcp-config-diagnostic-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
-      const fxDir = join(home, ".fx");
+      const fxDir = join(home, ".ffx");
       mkdirSync(fxDir, { recursive: true, mode: 0o700 });
       mkdirSync(workspace);
       writeFileSync(join(fxDir, "mcp.json"), "{invalid json", { mode: 0o600 });
@@ -590,7 +590,7 @@ describe("cli: status", () => {
           mcp_config_error: "McpConfigInvalidJson",
         });
         expect(doctorText.stdout).toContain(
-          "[fail] mcp_config: failed to load ~/.fx/mcp.json: McpConfigInvalidJson\n",
+          "[fail] mcp_config: failed to load ~/.ffx/mcp.json: McpConfigInvalidJson\n",
         );
         const doctorJson = JSON.parse(doctorJsonResult.stdout);
         expect(doctorJson.fail_count).toBe(1);
@@ -602,7 +602,7 @@ describe("cli: status", () => {
           {
             name: "mcp_config",
             status: "fail",
-            detail: "failed to load ~/.fx/mcp.json: McpConfigInvalidJson",
+            detail: "failed to load ~/.ffx/mcp.json: McpConfigInvalidJson",
           },
         ]);
         expect(ask.code).toBe(1);
@@ -661,7 +661,7 @@ describe("cli: status", () => {
   test(
     "status and doctor share the missing auth snapshot",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-noauth-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-status-noauth-"));
       try {
         const env = {
           ...NO_GATEWAY_AUTH,
@@ -701,23 +701,23 @@ describe("cli: status", () => {
     { name: "automatic Gateway", provider: "gateway", source: undefined, help: MISSING_AUTH_MESSAGE },
     { name: "Gateway with a stale Codex preference", provider: "gateway", source: "chatgpt_subscription", help: MISSING_AUTH_MESSAGE },
     { name: "Gateway with a stale Grok preference", provider: "gateway", source: "grok_subscription", help: MISSING_AUTH_MESSAGE },
-    { name: "an exact Gateway login", provider: "gateway", source: "fx_login", help: "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected." },
-    { name: "an exact OIDC token", provider: "gateway", source: "vercel_oidc_token", help: "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected." },
-    { name: "an exact environment key", provider: "gateway", source: "ai_gateway_api_key", help: "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected." },
-    { name: "an exact stored key", provider: "gateway", source: "stored_key", help: "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected." },
-    { name: "Codex", provider: "codex", source: undefined, help: "fx needs a Codex subscription login for this model. Run fx login codex." },
-    { name: "Grok", provider: "grok", source: undefined, help: "fx needs a Grok subscription login for this model. Run fx login grok." },
+    { name: "an exact Gateway login", provider: "gateway", source: "fx_login", help: "ffx login is selected but unavailable. Run ffx login to reconnect; no other credential was selected." },
+    { name: "an exact OIDC token", provider: "gateway", source: "vercel_oidc_token", help: "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting ffx; no other credential was selected." },
+    { name: "an exact environment key", provider: "gateway", source: "ai_gateway_api_key", help: "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting ffx; no other credential was selected." },
+    { name: "an exact stored key", provider: "gateway", source: "stored_key", help: "A stored API key is selected but unavailable. Start ffx and open /provider to choose an available credential; no other credential was selected." },
+    { name: "Codex", provider: "codex", source: undefined, help: "ffx needs a Codex subscription login for this model. Run ffx login codex." },
+    { name: "Grok", provider: "grok", source: undefined, help: "ffx needs a Grok subscription login for this model. Run ffx login grok." },
   ]) {
     test(
       `status and doctor respect ${scenario.name} when credentials are missing`,
       async () => {
-        const root = mkdtempSync(join(tmpdir(), "fx-e2e-provider-diagnostics-"));
+        const root = mkdtempSync(join(tmpdir(), "ffx-e2e-provider-diagnostics-"));
         try {
           const home = join(root, "home");
           const workspace = join(root, "workspace");
-          mkdirSync(join(home, ".fx"), { recursive: true });
+          mkdirSync(join(home, ".ffx"), { recursive: true });
           mkdirSync(workspace);
-          const settingsPath = join(home, ".fx", "settings.json");
+          const settingsPath = join(home, ".ffx", "settings.json");
           const settings = JSON.stringify({
             provider: scenario.provider,
             models: { [scenario.provider]: "test-model" },
@@ -763,7 +763,7 @@ describe("cli: status", () => {
   }
 
   test("fresh and resumed asks retain an unavailable exact login with an environment key", async () => {
-    const root = mkdtempSync(join(tmpdir(), "fx-ask-exact-source-"));
+    const root = mkdtempSync(join(tmpdir(), "ffx-ask-exact-source-"));
     const gateway = startFakeGateway([
       fakeGatewayFinalText("SESSION_SEEDED"),
       fakeGatewayFinalText("AUTOMATIC_KEY_WORKS"),
@@ -771,9 +771,9 @@ describe("cli: status", () => {
     try {
       const home = join(root, "home");
       const workspace = join(root, "workspace");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".ffx"), { recursive: true });
       mkdirSync(workspace);
-      const settingsPath = join(home, ".fx", "settings.json");
+      const settingsPath = join(home, ".ffx", "settings.json");
       const settings = { provider: "gateway", models: { gateway: FAKE_GATEWAY_MODEL } };
       writeFileSync(settingsPath, JSON.stringify(settings));
       const options = {
@@ -799,7 +799,7 @@ describe("cli: status", () => {
       writeFileSync(settingsPath, pinned);
       const status = await runFx(["status", "--json"], options);
       const help = JSON.parse(status.stdout).auth_help;
-      expect(help).toContain("fx login is selected but unavailable");
+      expect(help).toContain("ffx login is selected but unavailable");
       for (const resumed of [false, true]) {
         for (const json of [false, true]) {
           const result = await runFx([
@@ -828,9 +828,9 @@ describe("cli: status", () => {
   }, TIMEOUT);
 
   test(
-    "status and doctor share fx login source, team, and refreshability",
+    "status and doctor share ffx login source, team, and refreshability",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-auth-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-status-auth-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -854,14 +854,14 @@ describe("cli: status", () => {
         expect(doctorText.code).toBe(0);
         expect(doctorJsonResult.code).toBe(0);
         const expectedAuth = {
-          auth: "fx login",
+          auth: "ffx login",
           auth_refreshable: true,
           team: "vercel-labs",
         };
         expect(JSON.parse(statusJsonResult.stdout.trim())).toMatchObject(expectedAuth);
         expect(JSON.parse(doctorJsonResult.stdout.trim())).toMatchObject(expectedAuth);
         for (const output of [statusText.stdout, doctorText.stdout]) {
-          expect(output).toContain("auth=fx login");
+          expect(output).toContain("auth=ffx login");
           expect(output).toContain("auth_refreshable=true");
           expect(output).toContain("team=vercel-labs");
         }
@@ -884,7 +884,7 @@ describe("cli: status", () => {
   test(
     "status and doctor inspect an expired login without refreshing it",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-expired-auth-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-status-expired-auth-"));
       const requestCatcher = startRequestCatcher();
       try {
         const home = join(root, "home");
@@ -911,7 +911,7 @@ describe("cli: status", () => {
         expect(status.code).toBe(0);
         expect(doctor.code).toBe(0);
         const expectedAuth = {
-          auth: "fx login",
+          auth: "ffx login",
           auth_refreshable: true,
           team: "vercel-labs",
         };
@@ -929,7 +929,7 @@ describe("cli: status", () => {
   test(
     "a new status process keeps normal credential precedence",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-precedence-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-status-precedence-"));
       try {
         writeSeededFxAuth(root, "team_123");
         const envToken = "preferred-environment-token";
@@ -959,7 +959,7 @@ describe("cli: status", () => {
   );
 
   test(
-    "fx status --json returns valid status JSON",
+    "ffx status --json returns valid status JSON",
     async () => {
       const r = await runFx(["status", "--json"]);
       expect(r.code).toBe(0);
@@ -978,16 +978,16 @@ describe("cli: status", () => {
   );
 
   test(
-    "fx status reports a persisted dev update channel",
+    "ffx status reports a persisted dev update channel",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-update-channel-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-update-channel-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
-        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
         mkdirSync(workspace);
         writeFileSync(
-          join(home, ".fx", "settings.json"),
+          join(home, ".ffx", "settings.json"),
           '{"update_channel":"dev"}\n',
           { mode: 0o600 },
         );
@@ -1010,7 +1010,7 @@ describe("cli: status", () => {
   );
 
   test(
-    "fx upgrade help documents release channels",
+    "ffx upgrade help documents release channels",
     async () => {
       const result = await runFx(["upgrade", "--help"]);
       expect(result.code).toBe(0);
@@ -1021,9 +1021,9 @@ describe("cli: status", () => {
   );
 
   test(
-    "fx status --json defaults permission mode to auto",
+    "ffx status --json defaults permission mode to auto",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-permission-default-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-permission-default-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -1051,7 +1051,7 @@ describe("cli: status", () => {
   test(
     "status and doctor apply an exact FX_MAX_AGENT_STEPS override",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-agent-step-limit-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-agent-step-limit-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -1091,11 +1091,11 @@ describe("cli: status", () => {
   test(
     "project profile-only settings are ignored before parsing and profile overrides win",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-profile-config-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-profile-config-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
-        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(join(home, ".ffx"), { recursive: true });
         mkdirSync(workspace);
         const homeRoot = realpathSync(home);
         const workspaceRoot = realpathSync(workspace);
@@ -1108,7 +1108,7 @@ describe("cli: status", () => {
         };
 
         writeFileSync(
-          join(home, ".fx", "settings.json"),
+          join(home, ".ffx", "settings.json"),
           JSON.stringify({
             model: "anthropic/claude-sonnet-4.6",
             permission_mode: "auto",
@@ -1136,21 +1136,21 @@ describe("cli: status", () => {
         expect(first.permission_mode).toBe("auto");
         expect(first.agent_step_limit).toBe(7);
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=model",
+          "ffx: config project: ignored_project_user_only_setting; key=model",
         );
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=permission_mode",
+          "ffx: config project: ignored_project_user_only_setting; key=permission_mode",
         );
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=permission",
+          "ffx: config project: ignored_project_user_only_setting; key=permission",
         );
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=statusLine",
+          "ffx: config project: ignored_project_user_only_setting; key=statusLine",
         );
         expect(status.stderr).not.toContain("danger");
 
         writeFileSync(
-          join(home, ".fx", "settings.json"),
+          join(home, ".ffx", "settings.json"),
           JSON.stringify({
             model: "anthropic/claude-sonnet-4.6",
             permission_mode: "auto",
@@ -1183,11 +1183,11 @@ describe("cli: status", () => {
     "special settings files fail closed without blocking CLI startup",
     async () => {
       if (platform() === "win32") return;
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-config-special-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-config-special-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
-        const fxDir = join(home, ".fx");
+        const fxDir = join(home, ".ffx");
         mkdirSync(fxDir, { recursive: true, mode: 0o700 });
         mkdirSync(workspace);
         chmodSync(fxDir, 0o700);
@@ -1210,7 +1210,7 @@ describe("cli: status", () => {
         expect(Date.now() - userStartedAt).toBeLessThan(3_000);
         expect(user.code).toBe(0);
         expect(JSON.parse(user.stdout)).toMatchObject({ kind: "status" });
-        expect(user.stderr).toContain("fx: config user: durable_path_unsafe");
+        expect(user.stderr).toContain("ffx: config user: durable_path_unsafe");
 
         rmSync(join(fxDir, "settings.json"));
         expect(spawnSync("mkfifo", [join(workspace, ".fx.json")]).status).toBe(0);
@@ -1223,7 +1223,7 @@ describe("cli: status", () => {
         expect(Date.now() - projectStartedAt).toBeLessThan(3_000);
         expect(project.code).toBe(0);
         expect(JSON.parse(project.stdout)).toMatchObject({ kind: "status" });
-        expect(project.stderr).toContain("fx: config project: durable_path_unsafe");
+        expect(project.stderr).toContain("ffx: config project: durable_path_unsafe");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -1234,12 +1234,12 @@ describe("cli: status", () => {
 
 describe("cli: usage", () => {
   test(
-    "fx usage reads rolling local facts without credentials or profile mutation",
+    "ffx usage reads rolling local facts without credentials or profile mutation",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-usage-"));
       try {
         const home = join(root, "home");
-        const fxDir = join(home, ".fx");
+        const fxDir = join(home, ".ffx");
         mkdirSync(fxDir, { recursive: true, mode: 0o700 });
         chmodSync(fxDir, 0o700);
         const now = Date.now();
@@ -1335,12 +1335,12 @@ describe("cli: usage", () => {
   );
 
   test(
-    "fx usage preserves known totals when the ledger is incomplete",
+    "ffx usage preserves known totals when the ledger is incomplete",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-incomplete-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-usage-incomplete-"));
       try {
         const home = join(root, "home");
-        const fxDir = join(home, ".fx");
+        const fxDir = join(home, ".ffx");
         mkdirSync(fxDir, { recursive: true, mode: 0o700 });
         const now = Date.now();
         const records = [
@@ -1402,9 +1402,9 @@ describe("cli: usage", () => {
   );
 
   test(
-    "fx usage distinguishes empty, invalid, corrupt, and unsafe local state",
+    "ffx usage distinguishes empty, invalid, corrupt, and unsafe local state",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-states-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-usage-states-"));
       try {
         const home = realpathSync(root);
         const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
@@ -1414,7 +1414,7 @@ describe("cli: usage", () => {
           coverage: { status: "not_started" },
           totals: null,
         });
-        expect(existsSync(join(home, ".fx"))).toBe(false);
+        expect(existsSync(join(home, ".ffx"))).toBe(false);
 
         const invalid = await runFx(
           ["usage", "--period", "session", "--json"],
@@ -1426,7 +1426,7 @@ describe("cli: usage", () => {
           code: "InvalidUsageArgs",
         });
 
-        const fxDir = join(home, ".fx");
+        const fxDir = join(home, ".ffx");
         mkdirSync(fxDir, { mode: 0o700 });
         chmodSync(fxDir, 0o700);
         writeFileSync(
@@ -1502,12 +1502,12 @@ describe("cli: usage", () => {
   );
 
   test(
-    "fx usage preserves known totals but fails closed when recovery storage is unsafe",
+    "ffx usage preserves known totals but fails closed when recovery storage is unsafe",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-recovery-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-usage-recovery-"));
       try {
         const home = join(root, "home");
-        const fxDir = join(home, ".fx");
+        const fxDir = join(home, ".ffx");
         mkdirSync(fxDir, { recursive: true, mode: 0o700 });
         chmodSync(fxDir, 0o700);
         writeFileSync(
@@ -1566,7 +1566,7 @@ describe("cli: usage", () => {
 
 describe("cli: permissions", () => {
   test(
-    "fx permissions --json returns valid permissions JSON",
+    "ffx permissions --json returns valid permissions JSON",
     async () => {
       const r = await runFx(["permissions", "--json"]);
       expect(r.code).toBe(0);
@@ -1586,9 +1586,9 @@ describe("cli: permissions", () => {
 
 describe("cli: doctor", () => {
   test(
-    "fx doctor --json returns valid doctor JSON",
+    "ffx doctor --json returns valid doctor JSON",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-doctor-json-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-doctor-json-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -1629,9 +1629,9 @@ describe("cli: doctor", () => {
   );
 
   test(
-    "fx doctor --json leaves an empty home unchanged",
+    "ffx doctor --json leaves an empty home unchanged",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-doctor-no-create-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-doctor-no-create-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -1649,7 +1649,7 @@ describe("cli: doctor", () => {
 
         expect(r.code).toBe(0);
         expect(JSON.parse(r.stdout.trim()).kind).toBe("doctor");
-        expect(existsSync(join(home, ".fx"))).toBe(false);
+        expect(existsSync(join(home, ".ffx"))).toBe(false);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -1658,9 +1658,9 @@ describe("cli: doctor", () => {
   );
 
   test(
-    "fx doctor --json bounds diagnostics while reporting the cache-free session count",
+    "ffx doctor --json bounds diagnostics while reporting the cache-free session count",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-doctor-bounded-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-doctor-bounded-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -1678,7 +1678,7 @@ describe("cli: doctor", () => {
           );
         }
 
-        expect(existsSync(join(home, ".fx", "sessions", "summary.json"))).toBe(false);
+        expect(existsSync(join(home, ".ffx", "sessions", "summary.json"))).toBe(false);
 
         const r = await runFx(["doctor", "--json"], {
           cwd: workspaceRoot,
@@ -1723,10 +1723,10 @@ describe("cli: doctor", () => {
 
 describe("cli: logout", () => {
   test(
-    "fx logout revokes refresh and access tokens after local deletion",
+    "ffx logout revokes refresh and access tokens after local deletion",
     async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-revocation-"));
-      const authPath = join(home, ".fx", "auth.json");
+      const home = mkdtempSync(join(tmpdir(), "ffx-e2e-logout-revocation-"));
+      const authPath = join(home, ".ffx", "auth.json");
       const issuer = startLogoutIssuer([200, 200], authPath);
       try {
         writeSeededFxAuth(home, undefined, issuer.issuerUrl);
@@ -1740,7 +1740,7 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("Signed out of ffx.\n");
         expect(logout.stderr).toBe("");
         expect(existsSync(authPath)).toBe(false);
         expect(issuer.requests).toEqual([
@@ -1777,10 +1777,10 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout warns once and sends no tokens without a revocation endpoint",
+    "ffx logout warns once and sends no tokens without a revocation endpoint",
     async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-no-revocation-"));
-      const authPath = join(home, ".fx", "auth.json");
+      const home = mkdtempSync(join(tmpdir(), "ffx-e2e-logout-no-revocation-"));
+      const authPath = join(home, ".ffx", "auth.json");
       const issuer = startLogoutIssuer([], authPath, null);
       try {
         writeSeededFxAuth(home, undefined, issuer.issuerUrl);
@@ -1794,7 +1794,7 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("Signed out of ffx.\n");
         expect(logout.stderr).toBe(
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
@@ -1811,10 +1811,10 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout warns once and sends no tokens to an invalid revocation endpoint",
+    "ffx logout warns once and sends no tokens to an invalid revocation endpoint",
     async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-invalid-revocation-"));
-      const authPath = join(home, ".fx", "auth.json");
+      const home = mkdtempSync(join(tmpdir(), "ffx-e2e-logout-invalid-revocation-"));
+      const authPath = join(home, ".ffx", "auth.json");
       const catcher = startRequestCatcher();
       const issuer = startLogoutIssuer([], authPath, catcher.endpoint);
       try {
@@ -1829,7 +1829,7 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("Signed out of ffx.\n");
         expect(catcher.requests).toEqual([]);
         expect(logout.stderr).toBe(
           "Warning: signed out locally, but the remote session could not be revoked.\n",
@@ -1848,11 +1848,11 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout removes an unsafe saved login and warns that it could not revoke it",
+    "ffx logout removes an unsafe saved login and warns that it could not revoke it",
     async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-rejected-login-"));
+      const home = mkdtempSync(join(tmpdir(), "ffx-e2e-logout-rejected-login-"));
       const issuer = startLogoutIssuer([200, 200]);
-      const authPath = join(home, ".fx", "auth.json");
+      const authPath = join(home, ".ffx", "auth.json");
       try {
         writeSeededFxAuth(home, undefined, issuer.issuerUrl);
         chmodSync(authPath, 0o644);
@@ -1866,7 +1866,7 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("Signed out of ffx.\n");
         expect(logout.stderr).toBe(
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
@@ -1889,11 +1889,11 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout fails when the saved login cannot be deleted",
+    "ffx logout fails when the saved login cannot be deleted",
     async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-delete-failure-"));
+      const home = mkdtempSync(join(tmpdir(), "ffx-e2e-logout-delete-failure-"));
       const issuer = startLogoutIssuer([200, 200]);
-      const fxDir = join(home, ".fx");
+      const fxDir = join(home, ".ffx");
       const authPath = join(fxDir, "auth.json");
       try {
         writeSeededFxAuth(home, undefined, issuer.issuerUrl);
@@ -1910,10 +1910,10 @@ describe("cli: logout", () => {
         expect(logout.code).toBe(1);
         expect(logout.stdout).toBe("");
         expect(logout.stderr).toBe(
-          "fx logout: failed to durably remove saved fx login\n",
+          "ffx logout: failed to durably remove saved ffx login\n",
         );
         expect(existsSync(authPath)).toBe(true);
-        expect(JSON.parse(status.stdout).auth).toBe("fx login");
+        expect(JSON.parse(status.stdout).auth).toBe("ffx login");
         expect(issuer.requests).toEqual([]);
       } finally {
         chmodSync(fxDir, 0o700);
@@ -1925,10 +1925,10 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout deletes only the saved login and keeps environment credentials available",
+    "ffx logout deletes only the saved login and keeps environment credentials available",
     async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-env-"));
-      const authPath = join(home, ".fx", "auth.json");
+      const home = mkdtempSync(join(tmpdir(), "ffx-e2e-logout-env-"));
+      const authPath = join(home, ".ffx", "auth.json");
       const issuer = startLogoutIssuer([500, 200], authPath);
       const oidcToken = "logout-oidc-token";
       const apiToken = "logout-api-key-token";
@@ -1943,11 +1943,11 @@ describe("cli: logout", () => {
 
         const logout = await runFx(["logout"], { env });
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("Signed out of ffx.\n");
         expect(logout.stderr).toBe(
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
-        expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+        expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
         expect(issuer.requests).toEqual([
           { method: "GET", path: "/.well-known/openid-configuration" },
           {
@@ -2009,9 +2009,9 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout leaves an active API key unchanged when no login exists",
+    "ffx logout leaves an active API key unchanged when no login exists",
     async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-no-login-"));
+      const home = mkdtempSync(join(tmpdir(), "ffx-e2e-logout-no-login-"));
       const apiToken = "logout-existing-api-key";
       try {
         const env = {
@@ -2024,7 +2024,7 @@ describe("cli: logout", () => {
         const status = await runFx(["status", "--json"], { env });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("No fx login session found.\n");
+        expect(logout.stdout).toBe("No ffx login session found.\n");
         expect(logout.stderr).toBe("");
         expect(JSON.parse(status.stdout)).toMatchObject({
           auth: "AI_GATEWAY_API_KEY",
@@ -2040,12 +2040,12 @@ describe("cli: logout", () => {
   );
 
   test.skipIf(platform() !== "darwin")(
-    "fx logout leaves the macOS Keychain API key untouched",
+    "ffx logout leaves the macOS Keychain API key untouched",
     async () => {
       const runId = `${process.pid}-${Date.now()}`;
-      const account = `fx-e2e-logout-${runId}`;
+      const account = `ffx-e2e-logout-${runId}`;
       const keychainToken = `vca_fake_logout_key_${runId}`;
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-logout-keychain-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-logout-keychain-"));
       const home = join(root, "home");
       mkdirSync(join(home, "Library"), { recursive: true });
       symlinkSync(
@@ -2079,10 +2079,10 @@ describe("cli: logout", () => {
 
         expect(logout.code).toBe(0);
         expect(logout.stderr).toBe("");
-        expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+        expect(existsSync(join(home, ".ffx", "auth.json"))).toBe(false);
         expect(stored.status).toBe(0);
         expect(stored.stdout.trim()).toBe(keychainToken);
-        expect(JSON.parse(status.stdout).auth).not.toBe("fx login");
+        expect(JSON.parse(status.stdout).auth).not.toBe("ffx login");
         expect(logout.stdout).not.toContain(keychainToken);
         expect(status.stdout).not.toContain(keychainToken);
       } finally {
@@ -2101,7 +2101,7 @@ describe("cli: logout", () => {
 
 describe("cli: setup", () => {
   test(
-    "fx setup is a top-level command and fails cleanly when Keychain is disabled",
+    "ffx setup is a top-level command and fails cleanly when Keychain is disabled",
     async () => {
       const r = await runFx(["setup"], {
         env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" },
@@ -2114,10 +2114,10 @@ describe("cli: setup", () => {
   );
 
   test(
-    "fx setup never invokes the configured Vercel CLI",
+    "ffx setup never invokes the configured Vercel CLI",
     async () => {
       const runId = `${process.pid}-${Date.now()}`;
-      const fakeDir = mkdtempSync(join(tmpdir(), "fx-e2e-vercel-cli-"));
+      const fakeDir = mkdtempSync(join(tmpdir(), "ffx-e2e-vercel-cli-"));
       const fakeCli = join(fakeDir, "vc");
       const invocationLog = join(fakeDir, "invoked");
 
@@ -2135,7 +2135,7 @@ exit 99
         const r = await runFx(["setup"], {
           env: {
             ...NO_GATEWAY_AUTH,
-            USER: `fx-e2e-setup-${runId}`,
+            USER: `ffx-e2e-setup-${runId}`,
             FX_VERCEL_CLI_PATH: fakeCli,
           },
           timeoutMs: TIMEOUT,
@@ -2157,8 +2157,8 @@ describe("cli: stored key file backend", () => {
   test.skipIf(platform() === "darwin")(
     "a 0600 key file resolves, and a loosened one is refused rather than reported absent",
     async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-stored-key-file-"));
-      const fxDir = join(home, ".fx");
+      const home = mkdtempSync(join(tmpdir(), "ffx-stored-key-file-"));
+      const fxDir = join(home, ".ffx");
       mkdirSync(fxDir, { recursive: true, mode: 0o700 });
       chmodSync(fxDir, 0o700);
       const keyPath = join(fxDir, "api-key");
@@ -2196,80 +2196,36 @@ describe("cli: stored key file backend", () => {
   );
 });
 
-describe("cli: Keychain authentication", () => {
-  test.skipIf(platform() !== "darwin")(
-    "fx ask reads an existing Keychain credential without onboarding",
+describe("cli: profile authentication", () => {
+  test(
+    "ffx ask reads an existing profile credential without onboarding",
     async () => {
       const runId = `${process.pid}-${Date.now()}`;
-      const account = `fx-e2e-ask-${runId}`;
       const fakeKey = `vca_fake_ask_key_${runId}`;
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-keychain-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-ask-profile-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
-      mkdirSync(join(home, "Library"), { recursive: true });
-      symlinkSync(
-        join(homedir(), "Library", "Keychains"),
-        join(home, "Library", "Keychains"),
-        "dir",
-      );
+      mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
       mkdirSync(workspace);
+      writeFileSync(join(home, ".ffx", "api-key"), `${fakeKey}\n`, { mode: 0o600 });
       const gateway = startFakeGateway([
-        fakeGatewayFinalText("Keychain ask complete"),
+        fakeGatewayFinalText("Profile ask complete"),
       ]);
 
       try {
-        const store = spawnSync(
-          "/usr/bin/security",
-          [
-            "add-generic-password",
-            "-a",
-            account,
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-U",
-            "-w",
-            fakeKey,
-          ],
-          { encoding: "utf8" },
-        );
-        expect(store.status, store.stderr).toBe(0);
-
-        const lookup = spawnSync(
-          "/usr/bin/security",
-          [
-            "find-generic-password",
-            "-a",
-            account,
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-w",
-          ],
-          {
-            encoding: "utf8",
-            env: {
-              ...process.env,
-              HOME: realpathSync(home),
-              USER: account,
-            },
-          },
-        );
-        expect(lookup.status, lookup.stderr).toBe(0);
-        expect(lookup.stdout.trim()).toBe(fakeKey);
-
         const result = await runFx(
           [
             "ask",
             "--json",
             "--auto",
             "--no-save",
-            "Say exactly: Keychain ask complete",
+            "Say exactly: Profile ask complete",
           ],
           {
             cwd: realpathSync(workspace),
             env: {
               ...NO_GATEWAY_AUTH,
               HOME: realpathSync(home),
-              USER: account,
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
               FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -2283,27 +2239,16 @@ describe("cli: Keychain authentication", () => {
         expect(result.code).toBe(0);
         expect(result.stderr).toBe("");
         expect(JSON.parse(result.stdout).output.trim()).toBe(
-          "Keychain ask complete",
+          "Profile ask complete",
         );
         expect(result.stdout).not.toContain(fakeKey);
-        expect(existsSync(join(home, ".fx"))).toBe(false);
+        expect(existsSync(join(home, ".ffx", "api-key"))).toBe(true);
         expect(gateway.requests).toHaveLength(1);
         expect(gateway.requests[0]!.headers.get("authorization")).toBe(
           `Bearer ${fakeKey}`,
         );
       } finally {
         gateway.stop();
-        spawnSync(
-          "/usr/bin/security",
-          [
-            "delete-generic-password",
-            "-a",
-            account,
-            "-s",
-            KEYCHAIN_SERVICE,
-          ],
-          { encoding: "utf8" },
-        );
         rmSync(root, { recursive: true, force: true });
       }
     },
@@ -2324,7 +2269,7 @@ describe("cli: read-only no-create matrix", () => {
     test(
       `${probe.args.join(" ")} leaves an empty home unchanged`,
       async () => {
-        const root = mkdtempSync(join(tmpdir(), "fx-e2e-no-create-"));
+        const root = mkdtempSync(join(tmpdir(), "ffx-e2e-no-create-"));
         try {
           const home = join(root, "home");
           const workspace = join(root, "workspace");
@@ -2353,7 +2298,7 @@ describe("cli: read-only no-create matrix", () => {
             expect(result.stderr).toBe("");
           }
           expect(snapshotTree(home)).toEqual(before);
-          expect(existsSync(join(home, ".fx"))).toBe(false);
+          expect(existsSync(join(home, ".ffx"))).toBe(false);
         } finally {
           rmSync(root, { recursive: true, force: true });
         }
@@ -2367,7 +2312,7 @@ describe("cli: missing durable home", () => {
   test(
     "read-only commands tolerate a nonexistent HOME and saved ask bootstraps it",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-missing-home-path-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-missing-home-path-"));
       const home = join(root, "missing-home");
       const workspace = join(root, "workspace");
       const gateway = startFakeGateway([
@@ -2424,7 +2369,7 @@ describe("cli: missing durable home", () => {
         expect(JSON.parse(asked.stdout).output.trim()).toBe(
           "missing home persisted",
         );
-        expect(existsSync(join(home, ".fx", "sessions"))).toBe(true);
+        expect(existsSync(join(home, ".ffx", "sessions"))).toBe(true);
         expect(gateway.requests).toHaveLength(1);
       } finally {
         gateway.stop();
@@ -2437,7 +2382,7 @@ describe("cli: missing durable home", () => {
   test(
     "session commands fail precisely while doctor remains available without HOME",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-no-home-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-no-home-"));
       try {
         const workspace = join(root, "workspace");
         mkdirSync(workspace);
@@ -2487,9 +2432,9 @@ describe("cli: missing durable home", () => {
 
 describe("cli: sessions", () => {
   test(
-    "fx sessions --json returns valid sessions JSON",
+    "ffx sessions --json returns valid sessions JSON",
     async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-empty-"));
+      const home = mkdtempSync(join(tmpdir(), "ffx-e2e-sessions-empty-"));
       try {
         const r = await runFx(["sessions", "--json"], { env: { HOME: home } });
         expect(r.code).toBe(0);
@@ -2505,16 +2450,16 @@ describe("cli: sessions", () => {
   );
 
   test(
-    "fx sessions text shows named, unnamed, and renamed sessions",
+    "ffx sessions text shows named, unnamed, and renamed sessions",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-names-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-session-names-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
-        const sessionsDir = join(home, ".fx", "sessions");
+        const sessionsDir = join(home, ".ffx", "sessions");
         mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
         mkdirSync(workspace);
-        chmodSync(join(home, ".fx"), 0o700);
+        chmodSync(join(home, ".ffx"), 0o700);
         chmodSync(sessionsDir, 0o700);
         const workspaceRoot = realpathSync(workspace);
         writeConversationSession(home, workspaceRoot, "named-session", {
@@ -2591,14 +2536,14 @@ describe("cli: sessions", () => {
   test(
     "session listing pages direct metadata without an index",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-pages-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-session-pages-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
-        const sessionsDir = join(home, ".fx", "sessions");
+        const sessionsDir = join(home, ".ffx", "sessions");
         mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
         mkdirSync(workspace);
-        chmodSync(join(home, ".fx"), 0o700);
+        chmodSync(join(home, ".ffx"), 0o700);
         chmodSync(sessionsDir, 0o700);
         const workspaceRoot = realpathSync(workspace);
         for (let index = 0; index < 201; index += 1) {
@@ -2680,7 +2625,7 @@ describe("cli: sessions", () => {
   test(
     "session lists use projections without opening unreadable event logs",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-projections-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-session-projections-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -2705,7 +2650,7 @@ describe("cli: sessions", () => {
         );
         expect(fixture.status).toBe(0);
 
-        const before = snapshotTree(join(home, ".fx"));
+        const before = snapshotTree(join(home, ".ffx"));
         const listed = await runFx(["sessions", "--json"], {
           cwd: workspaceRoot,
           env: { HOME: home },
@@ -2740,7 +2685,7 @@ describe("cli: sessions", () => {
             },
           ],
         });
-        expect(snapshotTree(join(home, ".fx"))).toEqual(before);
+        expect(snapshotTree(join(home, ".ffx"))).toEqual(before);
 
         const latest = await runFx(["session", "last", "--json"], {
           cwd: workspaceRoot,
@@ -2760,7 +2705,7 @@ describe("cli: sessions", () => {
           history_len: 1,
           conversation_language: "en",
         });
-        expect(snapshotTree(join(home, ".fx"))).toEqual(before);
+        expect(snapshotTree(join(home, ".ffx"))).toEqual(before);
 
         const detail = await runFx(
           ["session", "--id", "benchmark-session-00", "--json"],
@@ -2772,7 +2717,7 @@ describe("cli: sessions", () => {
         );
         expect(detail.code).not.toBe(0);
         expect(detail.stderr).toContain("AccessDenied");
-        expect(snapshotTree(join(home, ".fx"))).toEqual(before);
+        expect(snapshotTree(join(home, ".ffx"))).toEqual(before);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -2783,7 +2728,7 @@ describe("cli: sessions", () => {
   test(
     "workspace-scoped session discovery filters list and last by cwd",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-workspace-sessions-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-workspace-sessions-"));
       try {
         const home = join(root, "home");
         const workspaceA = join(root, "workspace-a");
@@ -2855,7 +2800,7 @@ describe("cli: sessions", () => {
   test(
     "session discovery reports corrupt records and distinguishes an unreadable latest session",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-corrupt-sessions-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-corrupt-sessions-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -2869,7 +2814,7 @@ describe("cli: sessions", () => {
           ["invalid-json", "{"],
           ["truncated", '{"schema_version":2,"id":"truncated"}'],
         ] as const) {
-          const directory = join(home, ".fx", "sessions", id);
+          const directory = join(home, ".ffx", "sessions", id);
           mkdirSync(directory, { recursive: true, mode: 0o700 });
           writeFileSync(join(directory, "session.json"), contents, {
             mode: 0o600,
@@ -2889,7 +2834,7 @@ describe("cli: sessions", () => {
           sessions: [{ id: "readable-session" }],
         });
 
-        rmSync(join(home, ".fx", "sessions", "readable-session"), {
+        rmSync(join(home, ".ffx", "sessions", "readable-session"), {
           recursive: true,
           force: true,
         });
@@ -2913,7 +2858,7 @@ describe("cli: sessions", () => {
   test(
     "profile-wide session discovery recovers sessions after a workspace rename",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-renamed-workspace-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-renamed-workspace-"));
       try {
         const home = join(root, "home");
         const original = join(root, "workspace-before");
@@ -2957,16 +2902,16 @@ describe("cli: sessions", () => {
   );
 
   test(
-    "fx sessions --json ignores malformed and oversized list caches",
+    "ffx sessions --json ignores malformed and oversized list caches",
     async () => {
       for (const cached of ["{", "x".repeat(4 * 1024 * 1024 + 1)]) {
-        const root = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-cache-"));
+        const root = mkdtempSync(join(tmpdir(), "ffx-e2e-sessions-cache-"));
         try {
           const home = join(root, "home");
           const workspace = join(root, "workspace");
-          mkdirSync(join(home, ".fx", "sessions"), { recursive: true });
+          mkdirSync(join(home, ".ffx", "sessions"), { recursive: true });
           mkdirSync(workspace, { recursive: true });
-          writeFileSync(join(home, ".fx", "sessions", "list.json"), cached);
+          writeFileSync(join(home, ".ffx", "sessions", "list.json"), cached);
 
           const r = await runFx(["sessions", "--json"], {
             cwd: realpathSync(workspace),
@@ -2990,7 +2935,7 @@ describe("cli: sessions", () => {
   test(
     "exact session flags address special-token and 255-byte IDs literally",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-exact-ids-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-session-exact-ids-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -3028,7 +2973,7 @@ describe("cli: sessions", () => {
   test(
     "expected json failures emit machine-readable stdout",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-json-errors-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-json-errors-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -3076,7 +3021,7 @@ describe("cli: sessions", () => {
 
 describe("cli: removed task and background commands", () => {
   test(
-    "fx task, fx tasks, and fx background are unknown commands",
+    "ffx task, ffx tasks, and ffx background are unknown commands",
     async () => {
       for (const command of ["task", "tasks", "background"]) {
         const result = await runFx([command], { env: NO_GATEWAY_AUTH });
@@ -3090,7 +3035,7 @@ describe("cli: removed task and background commands", () => {
   test(
     "legacy tasks files are ignored by ordinary session loading",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-legacy-tasks-ignored-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-legacy-tasks-ignored-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -3098,7 +3043,7 @@ describe("cli: removed task and background commands", () => {
         mkdirSync(workspace, { recursive: true });
         const workspaceRoot = realpathSync(workspace);
         writeLegacySession(home, workspaceRoot, "legacy-tasks-session");
-        const tasksDir = join(home, ".fx", "sessions", "legacy-tasks-session", "tasks");
+        const tasksDir = join(home, ".ffx", "sessions", "legacy-tasks-session", "tasks");
         mkdirSync(tasksDir, { recursive: true });
         writeFileSync(join(tasksDir, "unreadable-legacy-shape.json"), "not json\n");
 
@@ -3154,7 +3099,7 @@ describe("cli: models", () => {
     },
   ]) {
     test(
-      `fx models renders exact text for ${scenario.name}`,
+      `ffx models renders exact text for ${scenario.name}`,
       async () => {
         const home = createIsolatedTestHome();
         const gateway = startFakeGateway([], {
@@ -3194,7 +3139,7 @@ describe("cli: models", () => {
   }
 
   test(
-    "fx models retries a rejected API key exactly once without authentication",
+    "ffx models retries a rejected API key exactly once without authentication",
     async () => {
       for (const rejectedStatus of [401, 403]) {
         const home = createIsolatedTestHome();
@@ -3252,7 +3197,7 @@ describe("cli: models", () => {
   );
 
   test(
-    "fx models preserves network and 5xx failures without anonymous retry",
+    "ffx models preserves network and 5xx failures without anonymous retry",
     async () => {
       const unavailableHome = createIsolatedTestHome();
       const gateway = startFakeGateway([], {
@@ -3329,7 +3274,7 @@ describe("cli: models", () => {
     },
   ]) {
     test(
-      `fx models preserves ${scenario.name} without anonymous retry`,
+      `ffx models preserves ${scenario.name} without anonymous retry`,
       async () => {
         const home = createIsolatedTestHome();
         const gateway = startFakeGateway([], { models: scenario.response });
@@ -3353,7 +3298,7 @@ describe("cli: models", () => {
   }
 
   test(
-    "cancelling fx models does not retry anonymously",
+    "cancelling ffx models does not retry anonymously",
     async () => {
       const home = createIsolatedTestHome();
       const gateway = startFakeGateway([], {
@@ -3393,7 +3338,7 @@ describe("cli: models", () => {
   );
 
   test(
-    "fx models rejects E2E gateway redirects without contacting the target",
+    "ffx models rejects E2E gateway redirects without contacting the target",
     async () => {
       const home = createIsolatedTestHome();
       const captureRequests: string[] = [];
@@ -3456,7 +3401,7 @@ describe("cli: models", () => {
         "requested_access=public_only credential_source=none effective_access=public_only public_only_reason=no_credential anonymous_fallback=false outcome=loaded failure_category=none http_status=none retryable=none",
     },
     {
-      name: "uses the selected fx login team catalog",
+      name: "uses the selected ffx login team catalog",
       seedFxLogin: true,
       expiredFxLogin: false,
       authEnv: {},
@@ -3467,7 +3412,7 @@ describe("cli: models", () => {
         "requested_access=authenticated credential_source=fx_login effective_access=authenticated public_only_reason=none anonymous_fallback=false outcome=loaded failure_category=none http_status=none retryable=none",
     },
     {
-      name: "refreshes an expired fx login before loading the selected team catalog",
+      name: "refreshes an expired ffx login before loading the selected team catalog",
       seedFxLogin: true,
       expiredFxLogin: true,
       authEnv: {},
@@ -3499,9 +3444,9 @@ describe("cli: models", () => {
     },
   ]) {
     test(
-      `fx models --json ${scenario.name}`,
+      `ffx models --json ${scenario.name}`,
       async () => {
-        const root = mkdtempSync(join(tmpdir(), "fx-e2e-team-models-"));
+        const root = mkdtempSync(join(tmpdir(), "ffx-e2e-team-models-"));
         const requests: Array<{ headers: Headers; teamId: string | null }> = [];
         const oauthRequests: string[] = [];
         const server = Bun.serve({
@@ -3628,7 +3573,7 @@ describe("cli: models", () => {
   }
 
   test.skipIf(!HAS_API_KEY)(
-    "fx models --json returns valid models JSON",
+    "ffx models --json returns valid models JSON",
     async () => {
       const r = await runFx(["models", "--json"], { timeoutMs: 30_000 });
       expect(r.code).toBe(0);
@@ -3644,7 +3589,7 @@ describe("cli: models", () => {
 
 describe("cli: credits", () => {
   test(
-    "fx credits --json preserves Gateway HTTP denial details",
+    "ffx credits --json preserves Gateway HTTP denial details",
     async () => {
       const home = createIsolatedTestHome();
       const requests: Array<{
@@ -3703,7 +3648,7 @@ describe("cli: credits", () => {
   );
 
   test.skipIf(!HAS_API_KEY)(
-    "fx credits --json returns credits JSON or exits non-zero",
+    "ffx credits --json returns credits JSON or exits non-zero",
     async () => {
       const r = await runFx(["credits", "--json"], { timeoutMs: 30_000 });
       if (r.code === 0 && r.stdout.trim()) {
@@ -3719,9 +3664,9 @@ describe("cli: credits", () => {
 
 describe("cli: replay failures", () => {
   test(
-    "fx replay --json preserves structured failures for missing and malformed tapes",
+    "ffx replay --json preserves structured failures for missing and malformed tapes",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-replay-json-errors-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-replay-json-errors-"));
       try {
         const missing = await runFx(["replay", join(root, "missing.fxtape"), "--json"]);
         expect(missing.code).toBe(1);
@@ -3749,9 +3694,9 @@ describe("cli: replay failures", () => {
 
 describe("cli: ask input validation", () => {
   test(
-    "fx ask rejects invalid UTF-8 stdin before Gateway or session effects",
+    "ffx ask rejects invalid UTF-8 stdin before Gateway or session effects",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-invalid-utf8-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-ask-invalid-utf8-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       mkdirSync(home);
@@ -3787,7 +3732,7 @@ describe("cli: ask input validation", () => {
           error: "InvalidPromptText",
         });
         expect(requests).toEqual([]);
-        expect(existsSync(join(home, ".fx"))).toBe(false);
+        expect(existsSync(join(home, ".ffx"))).toBe(false);
       } finally {
         server.stop(true);
         rmSync(root, { recursive: true, force: true });
@@ -3799,7 +3744,7 @@ describe("cli: ask input validation", () => {
 
 describe("cli: session", () => {
   test(
-    "fx session with no id exits non-zero or shows usage",
+    "ffx session with no id exits non-zero or shows usage",
     async () => {
       const r = await runFx(["session"]);
       expect(r.code).not.toBe(0);
@@ -3808,13 +3753,13 @@ describe("cli: session", () => {
   );
 
   test(
-    "fx session exact id hides managed child detail",
+    "ffx session exact id hides managed child detail",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-private-child-detail-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-private-child-detail-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
-        mkdirSync(join(home, ".fx", "sessions"), {
+        mkdirSync(join(home, ".ffx", "sessions"), {
           recursive: true,
           mode: 0o700,
         });
@@ -3827,7 +3772,7 @@ describe("cli: session", () => {
         writeLegacySession(home, workspaceRoot, childId);
         const childControl = join(
           home,
-          ".fx",
+          ".ffx",
           "sessions",
           childId,
           "subagent",
@@ -3888,12 +3833,12 @@ describe("cli: interactive startup", () => {
       ];
 
       for (const args of cases) {
-        const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-no-tty-")));
+        const home = realpathSync(mkdtempSync(join(tmpdir(), "ffx-e2e-no-tty-")));
         try {
           const r = await runFx(args, { env: { HOME: home } });
           expect(r.code).toBe(1);
           expect(r.stdout).toBe("");
-          expect(r.stderr).toBe("fx requires an interactive terminal (TTY).\n");
+          expect(r.stderr).toBe("ffx requires an interactive terminal (TTY).\n");
           expect(readdirSync(home)).toEqual([]);
         } finally {
           rmSync(home, { recursive: true, force: true });
@@ -3906,9 +3851,9 @@ describe("cli: interactive startup", () => {
 
 describe("cli: pr", () => {
   test(
-    "fx pr without gateway auth exits non-zero",
+    "ffx pr without gateway auth exits non-zero",
     async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-e2e-noauth-"));
+      const home = mkdtempSync(join(tmpdir(), "ffx-e2e-noauth-"));
       try {
         const r = await runFx(["pr"], {
           env: { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" },
@@ -3925,9 +3870,9 @@ describe("cli: pr", () => {
 
 describe("cli: issue", () => {
   test(
-    "fx issue without gateway auth exits non-zero",
+    "ffx issue without gateway auth exits non-zero",
     async () => {
-      const home = mkdtempSync(join(tmpdir(), "fx-e2e-noauth-"));
+      const home = mkdtempSync(join(tmpdir(), "ffx-e2e-noauth-"));
       try {
         const r = await runFx(["issue"], {
           env: { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" },
@@ -3944,12 +3889,12 @@ describe("cli: issue", () => {
 
 describe("cli: ask success", () => {
   test(
-    "fx ask binds an explicitly invoked skill into the prompt",
+    "ffx ask binds an explicitly invoked skill into the prompt",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-explicit-skill-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-ask-explicit-skill-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
-      const skillDirectory = join(home, ".fx", "skills", "cli-explicit");
+      const skillDirectory = join(home, ".ffx", "skills", "cli-explicit");
       const skillBody = "CLI_EXPLICIT_SKILL_BODY";
       const gateway = startFakeGateway([
         fakeGatewayFinalText("explicit skill ask complete"),
@@ -4010,9 +3955,9 @@ describe("cli: ask success", () => {
   );
 
   test(
-    "fx ask stdin prompts above the old 1 MiB limit reach Gateway byte-for-byte",
+    "ffx ask stdin prompts above the old 1 MiB limit reach Gateway byte-for-byte",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-large-stdin-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-ask-large-stdin-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const sizes = [1024 * 1024 - 1, 1024 * 1024, 1024 * 1024 + 1, 3 * 1024 * 1024];
@@ -4028,9 +3973,9 @@ describe("cli: ask success", () => {
         }] },
       );
       try {
-        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
         mkdirSync(workspace);
-        writeFileSync(join(home, ".fx", "settings.json"), "{}\n");
+        writeFileSync(join(home, ".ffx", "settings.json"), "{}\n");
 
         for (const [index, size] of sizes.entries()) {
           const prompt = `B${"x".repeat(size - 2)}E`;
@@ -4072,7 +4017,7 @@ describe("cli: ask success", () => {
   );
 
   test(
-    "fx ask stdin resource overflow has distinct text and JSON errors",
+    "ffx ask stdin resource overflow has distinct text and JSON errors",
     async () => {
       const oversized = Buffer.alloc(8 * 1024 * 1024 + 1, 0x78);
 
@@ -4084,7 +4029,7 @@ describe("cli: ask success", () => {
       expect(textResult.code).toBe(1);
       expect(textResult.stdout).toBe("");
       expect(textResult.stderr).toBe(
-        "fx ask: prompt exceeds the local input safety limit\n",
+        "ffx ask: prompt exceeds the local input safety limit\n",
       );
 
       const jsonResult = await runFx(["ask", "--json", "--auto", "--no-save"], {
@@ -4102,9 +4047,9 @@ describe("cli: ask success", () => {
   );
 
   test(
-    "fx ask sends catalog-backed portable reasoning",
+    "ffx ask sends catalog-backed portable reasoning",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-portable-reasoning-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-ask-portable-reasoning-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const model = "provider/new-reasoning-model";
@@ -4122,10 +4067,10 @@ describe("cli: ask success", () => {
         },
       );
       try {
-        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
         mkdirSync(workspace);
         writeFileSync(
-          join(home, ".fx", "settings.json"),
+          join(home, ".ffx", "settings.json"),
           `${JSON.stringify({ model, effort: "high" })}\n`,
         );
 
@@ -4149,7 +4094,7 @@ describe("cli: ask success", () => {
         expect(
           result.stderr
             .replace(
-              /fx ask: warning: skipped \d+ invalid or unreadable skill candidates?; relaunch with FX_TRACE=1 to write a trace log\n/g,
+              /ffx ask: warning: skipped \d+ invalid or unreadable skill candidates?; relaunch with FX_TRACE=1 to write a trace log\n/g,
               "",
             )
             .replace(
@@ -4182,15 +4127,15 @@ describe("cli: ask success", () => {
   test.skipIf(!HAS_API_KEY)(
     "live Gateway accepts catalog-backed portable reasoning",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-live-portable-reasoning-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-live-portable-reasoning-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const tracePath = join(root, "trace.log");
       try {
-        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
         mkdirSync(workspace);
         writeFileSync(
-          join(home, ".fx", "settings.json"),
+          join(home, ".ffx", "settings.json"),
           `${JSON.stringify({
             model: "openai/gpt-5.6-sol",
             effort: "high",
@@ -4265,9 +4210,9 @@ describe("cli: ask success", () => {
       json: false,
     },
   ])(
-    "fx ask usage $name",
+    "ffx ask usage $name",
     async ({ reportedUsage, expectedUsage, toolLoop, json }) => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-usage-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-ask-usage-"));
       const answer = "Usage fixture complete.\n";
       const gateway = startFakeGateway([
         fakeGatewaySse([
@@ -4344,7 +4289,7 @@ describe("cli: ask success", () => {
         }
         expect(gateway.requests).toHaveLength(toolLoop ? 2 : 1);
         expect(gateway.classifierRequests).toHaveLength(0);
-        expect(existsSync(join(home, ".fx"))).toBe(false);
+        expect(existsSync(join(home, ".ffx"))).toBe(false);
       } finally {
         gateway.stop();
         rmSync(root, { recursive: true, force: true });
@@ -4356,7 +4301,7 @@ describe("cli: ask success", () => {
   test(
     "saved ask resumes the exact session while no-save creates no durable state",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-persistence-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-ask-persistence-"));
       const gateway = startFakeGateway([
         fakeGatewayFinalText("orange triangle"),
         fakeGatewayFinalText("blue circle"),
@@ -4405,7 +4350,7 @@ describe("cli: ask success", () => {
         ).toBe("true");
         expect(
           existsSync(
-            join(savedHome, ".fx", "sessions", firstJson.session_id),
+            join(savedHome, ".ffx", "sessions", firstJson.session_id),
           ),
         ).toBe(true);
 
@@ -4479,7 +4424,7 @@ describe("cli: ask success", () => {
         expect(noSaveJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
         expect(gateway.requests[2]?.headers.get("x-session-id")).toBeNull();
         expect(gateway.requests[2]?.headers.get("x-session-affinity")).toBeNull();
-        expect(existsSync(join(noSaveHome, ".fx"))).toBe(false);
+        expect(existsSync(join(noSaveHome, ".ffx"))).toBe(false);
         expect(gateway.requests).toHaveLength(3);
       } finally {
         gateway.stop();
@@ -4492,7 +4437,7 @@ describe("cli: ask success", () => {
   test(
     "saved ask converts a legacy session once and continues after restart",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-legacy-convert-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-ask-legacy-convert-"));
       const gateway = startFakeGateway([
         fakeGatewayFinalText("LEGACY_CONVERTED_OK"),
         fakeGatewayFinalText("LEGACY_RESTART_OK"),
@@ -4505,7 +4450,7 @@ describe("cli: ask success", () => {
         const workspaceRoot = realpathSync(workspace);
         const sessionId = "legacy-ask-convert";
         writeLegacySession(home, workspaceRoot, sessionId);
-        const sessionDir = join(home, ".fx", "sessions", sessionId);
+        const sessionDir = join(home, ".ffx", "sessions", sessionId);
         const legacyPath = join(sessionDir, "session.json");
         const legacy = JSON.parse(readFileSync(legacyPath, "utf8"));
         const legacyOutput = "LEGACY_AVAILABLE_RESULT_BYTES";
@@ -4621,7 +4566,7 @@ describe("cli: ask success", () => {
   test(
     "saved asks remain discoverable and resumable without session caches",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-cache-free-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-session-cache-free-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const unrelatedReply = `unrelated saved turn ${"x".repeat(64 * 1024)}`;
@@ -4666,7 +4611,7 @@ describe("cli: ask success", () => {
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
         const sessionId = JSON.parse(first.stdout).session_id as string;
-        const sessionsDir = join(home, ".fx", "sessions");
+        const sessionsDir = join(home, ".ffx", "sessions");
         expect(existsSync(join(sessionsDir, "index.json"))).toBe(false);
         expect(existsSync(join(sessionsDir, "latest"))).toBe(false);
         expect(existsSync(join(sessionsDir, "latest.lock"))).toBe(false);
@@ -4793,7 +4738,7 @@ describe("cli: ask success", () => {
   );
 
   test.skipIf(!HAS_API_KEY)(
-    "fx ask --json --no-save --auto returns valid JSON with output",
+    "ffx ask --json --no-save --auto returns valid JSON with output",
     async () => {
       const r = await runFx(
         ["ask", "--json", "--no-save", "--auto", "Say exactly: hello world"],
@@ -4815,9 +4760,9 @@ describe("cli: ask success", () => {
 
 describe("cli: error handling", () => {
   test(
-    "fx ask rejects unknown options before a model turn and -- preserves literal prompt text",
+    "ffx ask rejects unknown options before a model turn and -- preserves literal prompt text",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-options-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-ask-options-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const gateway = startFakeGateway([
@@ -4842,7 +4787,7 @@ describe("cli: error handling", () => {
           timeoutMs: TIMEOUT,
         });
         expect(rejected.code).toBe(1);
-        expect(rejected.stderr).toContain("usage: fx ask");
+        expect(rejected.stderr).toContain("usage: ffx ask");
         expect(gateway.requests).toHaveLength(0);
 
         const literal = await runFx(
@@ -4877,7 +4822,7 @@ describe("cli: error handling", () => {
   );
 
   test(
-    "fx ask with no prompt exits 1",
+    "ffx ask with no prompt exits 1",
     async () => {
       const r = await runFx(["ask"]);
       expect(r.code).toBe(1);
@@ -4887,7 +4832,7 @@ describe("cli: error handling", () => {
   );
 
   test(
-    "fx unknown-command exits 1",
+    "ffx unknown-command exits 1",
     async () => {
       const r = await runFx(["unknown-command"]);
       expect(r.code).toBe(1);
@@ -4896,9 +4841,9 @@ describe("cli: error handling", () => {
   );
 
   test(
-    "fx ask explains no-save resume conflicts before a model turn",
+    "ffx ask explains no-save resume conflicts before a model turn",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-resume-no-save-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-e2e-ask-resume-no-save-"));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const gateway = startFakeGateway([]);
@@ -4927,10 +4872,10 @@ describe("cli: error handling", () => {
           expect(rejected.code).toBe(1);
           expect(rejected.stdout).toBe("");
           expect(rejected.stderr).toContain(
-            "fx ask: --no-save cannot be used with --resume or --resume-id",
+            "ffx ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--full-access] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: ffx ask [--auto|--full-access] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
@@ -4956,7 +4901,7 @@ describe("cli: workspace access", () => {
         { env: enabled },
       );
       expect(help.code).toBe(0);
-      expect(help.stdout.startsWith("fx ask\n\n")).toBe(true);
+      expect(help.stdout.startsWith("ffx ask\n\n")).toBe(true);
       expect(help.stderr).toBe("");
 
       const missing = await runFx(["--add-dir"], { env: enabled });
@@ -4982,15 +4927,15 @@ describe("cli: workspace access", () => {
   test(
     "workspace commands persist per-primary roots and track availability",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-workspace-access-cli-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-workspace-access-cli-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
         const shared = join(root, "shared");
         const unknown = join(root, "unknown");
         const missing = join(root, "missing");
-        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
-        chmodSync(join(home, ".fx"), 0o700);
+        mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
+        chmodSync(join(home, ".ffx"), 0o700);
         mkdirSync(workspace);
         mkdirSync(shared);
         mkdirSync(unknown);
@@ -5026,7 +4971,7 @@ describe("cli: workspace access", () => {
         ]);
 
         const stored = JSON.parse(
-          readFileSync(join(home, ".fx", "settings.json"), "utf8"),
+          readFileSync(join(home, ".ffx", "settings.json"), "utf8"),
         );
         expect(stored.workspaces[workspaceRoot].additional_directories).toEqual([
           sharedRoot,
@@ -5105,7 +5050,7 @@ describe("cli: workspace access", () => {
           additional_directories: [],
         });
         const removedSettings = JSON.parse(
-          readFileSync(join(home, ".fx", "settings.json"), "utf8"),
+          readFileSync(join(home, ".ffx", "settings.json"), "utf8"),
         );
         expect(
           removedSettings.workspaces?.[workspaceRoot]?.additional_directories,
@@ -5138,7 +5083,7 @@ describe("cli: workspace access", () => {
   test(
     "workspace commands mutate persisted aliases by workspace identity",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-workspace-alias-cli-"));
+      const root = mkdtempSync(join(tmpdir(), "ffx-workspace-alias-cli-"));
       try {
         const home = join(root, "home");
         const workspace = join(root, "workspace");
@@ -5147,8 +5092,8 @@ describe("cli: workspace access", () => {
         const missing = join(root, "missing");
         const realParent = join(root, "real-parent");
         const parentLink = join(root, "parent-link");
-        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
-        chmodSync(join(home, ".fx"), 0o700);
+        mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
+        chmodSync(join(home, ".ffx"), 0o700);
         mkdirSync(workspace);
         mkdirSync(shared);
         mkdirSync(realParent);
@@ -5156,7 +5101,7 @@ describe("cli: workspace access", () => {
         symlinkSync(realParent, parentLink, "dir");
         const workspaceRoot = realpathSync(workspace);
         const sharedRoot = realpathSync(shared);
-        const settingsPath = join(home, ".fx", "settings.json");
+        const settingsPath = join(home, ".ffx", "settings.json");
         const baseEnv = {
           ...NO_GATEWAY_AUTH,
           HOME: realpathSync(home),
@@ -5270,15 +5215,15 @@ describe("cli: workspace access", () => {
 
 describe("cli: MCP profile add", () => {
   test("status and doctor inspect MCP without transport while list --connect discovers it", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-inspect-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-cli-mcp-inspect-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const pidPath = join(root, "mcp.pid");
-    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    mkdirSync(join(home, ".ffx"), { recursive: true, mode: 0o700 });
     mkdirSync(workspace);
-    writeFileSync(join(home, ".fx", "settings.json"), "{}\n", { mode: 0o600 });
+    writeFileSync(join(home, ".ffx", "settings.json"), "{}\n", { mode: 0o600 });
     writeFileSync(
-      join(home, ".fx", "mcp.json"),
+      join(home, ".ffx", "mcp.json"),
       JSON.stringify({
         mcp: {
           fixture: {
@@ -5332,16 +5277,16 @@ describe("cli: MCP profile add", () => {
   }, 30_000);
 
   test("lists paths and removes profile servers without launching MCP transport", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-manage-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-cli-mcp-manage-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     const profileMarker = join(root, "profile-launched");
     const workspaceMarker = join(root, "workspace-launched");
-    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(join(home, ".ffx"), { recursive: true });
     mkdirSync(workspace, { recursive: true });
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
+    writeFileSync(join(home, ".ffx", "settings.json"), JSON.stringify({}));
     writeFileSync(
-      join(home, ".fx", "mcp.json"),
+      join(home, ".ffx", "mcp.json"),
       JSON.stringify({
         mcp: {
           shared: {
@@ -5373,7 +5318,7 @@ describe("cli: MCP profile add", () => {
       const path = await runFx(["mcp", "path"], { cwd: workspace, env });
       expect(path.code).toBe(0);
       expect(path.stderr).toBe("");
-      expect(path.stdout.trim()).toBe(join(home, ".fx", "mcp.json"));
+      expect(path.stdout.trim()).toBe(join(home, ".ffx", "mcp.json"));
 
       const before = await runFx(["mcp", "list"], { cwd: workspace, env });
       expect(before.code).toBe(0);
@@ -5394,7 +5339,7 @@ describe("cli: MCP profile add", () => {
       expect(removed.code).toBe(0);
       expect(removed.stderr).toBe("");
       expect(removed.stdout).toContain("Removed MCP server 'shared'");
-      expect(JSON.parse(readFileSync(join(home, ".fx", "mcp.json"), "utf8")))
+      expect(JSON.parse(readFileSync(join(home, ".ffx", "mcp.json"), "utf8")))
         .toEqual({ mcp: {} });
 
       const after = await runFx(["mcp", "list"], { cwd: workspace, env });
@@ -5415,7 +5360,7 @@ describe("cli: MCP profile add", () => {
   });
 
   test("adds local and HTTP servers without launching either server", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-add-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-cli-mcp-add-")));
     const home = join(root, "home");
     const marker = join(root, "launched");
     mkdirSync(home, { recursive: true });
@@ -5425,14 +5370,14 @@ describe("cli: MCP profile add", () => {
       });
       expect(help.code).toBe(0);
       for (const command of [
-        "fx mcp add NAME COMMAND [ARGS...]",
-        "fx mcp auth NAME",
-        "fx mcp list",
-        "fx mcp logout NAME",
-        "fx mcp path",
-        "fx mcp remove NAME",
-        "fx mcp trust approve|reject NAME",
-        "fx mcp trust approve-all|reset",
+        "ffx mcp add NAME COMMAND [ARGS...]",
+        "ffx mcp auth NAME",
+        "ffx mcp list",
+        "ffx mcp logout NAME",
+        "ffx mcp path",
+        "ffx mcp remove NAME",
+        "ffx mcp trust approve|reject NAME",
+        "ffx mcp trust approve-all|reset",
       ]) expect(help.stdout).toContain(command);
 
       const local = await runFx(
@@ -5447,7 +5392,7 @@ describe("cli: MCP profile add", () => {
         env: { HOME: home, ...NO_GATEWAY_AUTH },
       });
       expect(missingAuthName.code).toBe(1);
-      expect(missingAuthName.stderr).toBe("usage: fx mcp auth NAME\n");
+      expect(missingAuthName.stderr).toBe("usage: ffx mcp auth NAME\n");
       expect(existsSync(marker)).toBe(false);
       expect(local.code).toBe(0);
       expect(local.stderr).toBe("");
@@ -5469,7 +5414,7 @@ describe("cli: MCP profile add", () => {
       expect(remote.stderr).toBe("");
 
       const profile = JSON.parse(
-        readFileSync(join(home, ".fx", "mcp.json"), "utf8"),
+        readFileSync(join(home, ".ffx", "mcp.json"), "utf8"),
       );
       expect(profile).not.toHaveProperty("mcpServers");
       expect(profile.mcp.local.command).toEqual([
@@ -5487,9 +5432,9 @@ describe("cli: MCP profile add", () => {
   });
 
   test("canonicalizes alias input and refuses ambiguous server-like keys", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-alias-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-cli-mcp-alias-")));
     const home = join(root, "home");
-    const fxDir = join(home, ".fx");
+    const fxDir = join(home, ".ffx");
     mkdirSync(fxDir, { recursive: true, mode: 0o700 });
     const profilePath = join(fxDir, "mcp.json");
     try {
@@ -5526,7 +5471,7 @@ describe("cli: MCP profile add", () => {
   });
 
   test("serializes concurrent different-name additions", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-race-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ffx-cli-mcp-race-")));
     const home = join(root, "home");
     mkdirSync(home, { recursive: true });
     try {
@@ -5541,7 +5486,7 @@ describe("cli: MCP profile add", () => {
       expect(first.code).toBe(0);
       expect(second.code).toBe(0);
       const profile = JSON.parse(
-        readFileSync(join(home, ".fx", "mcp.json"), "utf8"),
+        readFileSync(join(home, ".ffx", "mcp.json"), "utf8"),
       );
       expect(Object.keys(profile.mcp).sort()).toEqual(["first", "second"]);
     } finally {
